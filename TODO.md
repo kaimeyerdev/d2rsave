@@ -55,7 +55,37 @@ Rough sub-plan:
 
 ## Chronicle reporting
 
+### Item display: embellishments
+
+A single `formatItem(name, type, location)` helper (in `src/main.cpp`)
+now renders per-item lines uniformly across `items`, `chronicle`, and
+`reconcile`. The three visible fields are deliberately minimal. Ideas
+worth adding later, most requesting a `--verbose` / `--fields=...` /
+`--no-color` style knob rather than changing the default:
+
+  * **Catalog id.** Previously chronicle showed `[#297 Steel Shade]`;
+    handy for cross-referencing `uniqueitems.txt` / `setitems.txt` rows
+    and grep-friendly. Reintroduce as `--show-ids`.
+  * **Quality colour.** Terminal colour on the name column keyed by
+    quality (grey=normal, blue=magic, gold=unique, green=set,
+    orange=rune, yellow=craft). Gate behind `isatty(stdout)` so pipes
+    stay clean, plus `--color=always|never|auto`.
+  * **Item level / character level.** Useful when scanning for
+    twinkable finds. Column or trailing `(ilvl 92)` note.
+  * **Sockets / ethereal / runeword indicator.** The current `items`
+    diagnostic flags column (`ISERC`) is decent but cryptic; consider
+    replacing with named suffixes (`+3 sockets, ethereal, runeword`).
+  * **Location for chronicle "found" rows.** `chronicle` currently
+    shows no location because it doesn't fully scan `.d2s` files for
+    every item -- only for bit-29 blobs. Extending the scan to record
+    per-id locations (like `reconcile` does) would let a `--full`
+    listing show WHERE each `[X]` item lives.
+  * **Chronicle timestamp column for `reconcile` discrepancy B.** The
+    date is currently in a trailing note; a `--sort-by=date` view would
+    want it as a proper field so it sorts sensibly.
+
 ### Runewords: name mapping is missing
+
 
 The runewords section in `cmdChronicle` is gated behind the
 `D2R_ENABLE_RUNEWORDS_WIP` CMake option because it can only tell you

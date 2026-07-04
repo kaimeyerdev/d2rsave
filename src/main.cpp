@@ -114,6 +114,40 @@ bool parseU32(std::string_view s, std::uint32_t& out) {
     return ec == std::errc{} && ptr == last;
 }
 
+// Uniform per-item display line used by every command that prints items
+// (items, chronicle, reconcile). Three logical fields; each may be empty:
+//   name     -- proper item name (e.g. "Steel Shade"), or the base type
+//               for items without a distinct name.
+//   type     -- base item type (e.g. "Armet"). Omitted when equal to name
+//               or empty (e.g. runewords).
+//   location -- where the item currently lives (e.g. "Kai.d2s",
+//               "stash tab 3"). Empty when unknown or not applicable.
+//
+// Format: 'Name  [Type]  @ Location', columnar-ish so operators can scan
+// by eye. See TODO.md for planned embellishments (id, quality, ilvl,
+// colour, verbosity flag, ...).
+std::string formatItem(std::string_view name,
+                       std::string_view type,
+                       std::string_view location = {}) {
+    std::string_view primary = name.empty() ? type : name;
+    std::string line;
+    line.reserve(96);
+    line += primary.empty() ? "?" : primary;
+    if (line.size() < 32) line.resize(32, ' ');
+    const bool showType = !type.empty() && type != primary;
+    if (showType) {
+        line += "  [";
+        line += type;
+        line += ']';
+    }
+    if (!location.empty()) {
+        if (line.size() < 60) line.resize(60, ' ');
+        line += "  @ ";
+        line += location;
+    }
+    return line;
+}
+
 int cmdVerify(const std::string& path) {
     auto bytes = d2r::readFile(path);
     const bool magicOk = d2r::hasValidMagic(bytes);
@@ -296,28 +330,36 @@ int cmdItems(const std::filesystem::path& exePath, const std::string& savePath) 
     std::string failMsg;
     const auto items = parser.parseItems(bytes, ch.itemsOffset, &failIdx, &failMsg);
 
+    // Resolve the base type for a 3-char item code from armor/weapons/misc.
+    auto baseTypeFor = [&](std::string_view code) -> std::string {
+        if (code.empty()) return {};
+        auto st = db.prepare(
+            "SELECT COALESCE(inm.en_us, b.name) "
+            "FROM (SELECT code, name, namestr FROM armor "
+            "      UNION ALL SELECT code, name, namestr FROM weapons "
+            "      UNION ALL SELECT code, name, namestr FROM misc) b "
+            "LEFT JOIN item_names inm ON inm.\"key\" = b.namestr "
+            "WHERE b.code = ? LIMIT 1");
+        st.bind(1, code);
+        if (st.step()) return st.columnText(0);
+        return std::string(code);
+    };
+
+    const auto srcName = std::filesystem::path(savePath).filename().string();
     std::printf("file:   %s (character=%u, decoded=%zu)\n",
                 savePath.c_str(), ch.itemCount, items.size());
     if (!failMsg.empty()) {
         std::printf("parse-failure: item #%zu: %s\n", failIdx, failMsg.c_str());
     }
-    std::printf("%-4s %-6s %-4s %-8s %-6s %-20s %-24s %s\n",
-                "#", "@bit", "code", "qual", "ilvl", "name", "affix/set/unique", "flags");
+    // Diagnostic prefix (index / bit offset / code / quality / ilvl) followed
+    // by the uniform formatItem block. Location is omitted from each row --
+    // it's redundant with the file: header above -- but the resolved name
+    // still makes for a scannable listing when compared across characters.
+    (void) srcName;
+    std::printf("%-4s %-6s %-4s %-8s %-4s %s\n",
+                "#", "@bit", "code", "qual", "ilvl", "item");
     for (std::size_t i = 0; i < items.size(); ++i) {
         const auto& it = items[i];
-        std::string extra;
-        if (it.quality == d2r::ItemQuality::Unique) {
-            const auto* row = db.lookupUnique(it.uniqueId);
-            extra = "unique#" + std::to_string(it.uniqueId);
-            if (row) extra += " (" + row->index + ")";
-        } else if (it.quality == d2r::ItemQuality::Set) {
-            const auto* row = db.lookupSetItem(it.setItemId);
-            extra = "set#" + std::to_string(it.setItemId);
-            if (row) extra += " (" + row->index + ")";
-        } else if (!it.prefixIds.empty() || !it.suffixIds.empty()) {
-            extra = "prefix=" + std::to_string(it.prefixIds.size())
-                  + " suffix=" + std::to_string(it.suffixIds.size());
-        }
         std::string flags;
         if (it.identified)       flags += "I";
         if (it.socketed)         flags += "S";
@@ -325,11 +367,13 @@ int cmdItems(const std::filesystem::path& exePath, const std::string& savePath) 
         if (it.personalized)     flags += "P";
         if (it.runeword)         flags += "R";
         if (it.hasChronicleData) flags += "C";
-        std::printf("%-4zu %-6zu %-4s %-8.*s %-6u %-20.20s %-24s %s\n",
+        const auto type = baseTypeFor(it.code);
+        std::printf("%-4zu %-6zu %-4s %-8.*s %-4u %s  %s\n",
                     i, it.startBitOffset, it.code.c_str(),
                     static_cast<int>(d2r::toString(it.quality).size()),
                     d2r::toString(it.quality).data(),
-                    it.itemLevel, it.itemName.c_str(), extra.c_str(),
+                    it.itemLevel,
+                    formatItem(it.itemName, type).c_str(),
                     flags.c_str());
     }
     return 0;
@@ -626,15 +670,11 @@ int cmdChronicle(const std::filesystem::path& exePath,
                 break;
         }
         for (const auto& r : shown) {
+            const auto line = formatItem(r.display, r.base);
             if (mode == ChronicleMode::Default) {
-                std::printf("  %-24s  [#%u %s]\n",
-                            r.base.empty() ? "?" : r.base.c_str(),
-                            r.id, r.display.c_str());
+                std::printf("  %s\n", line.c_str());
             } else {
-                std::printf("  [%c] %-24s  [#%u %s]\n",
-                            r.have ? 'X' : ' ',
-                            r.base.empty() ? "?" : r.base.c_str(),
-                            r.id, r.display.c_str());
+                std::printf("  [%c] %s\n", r.have ? 'X' : ' ', line.c_str());
             }
         }
     };
@@ -717,15 +757,12 @@ int cmdChronicle(const std::filesystem::path& exePath,
         for (const auto& [setName, items] : shownBySet) {
             std::printf("  %s\n", setName.c_str());
             for (const auto& r : items) {
+                const auto line = formatItem(r.display, r.base);
                 if (mode == ChronicleMode::Default) {
-                    std::printf("      %-22s  [#%u %s]\n",
-                                r.base.empty() ? "?" : r.base.c_str(),
-                                r.id, r.display.c_str());
+                    std::printf("      %s\n", line.c_str());
                 } else {
-                    std::printf("      [%c] %-22s  [#%u %s]\n",
-                                r.have ? 'X' : ' ',
-                                r.base.empty() ? "?" : r.base.c_str(),
-                                r.id, r.display.c_str());
+                    std::printf("      [%c] %s\n",
+                                r.have ? 'X' : ' ', line.c_str());
                 }
             }
         }
@@ -780,10 +817,11 @@ int cmdChronicle(const std::filesystem::path& exePath,
                 break;
         }
         for (const auto& rw : shown) {
+            const auto line = formatItem(rw, "");
             if (mode == ChronicleMode::Default) {
-                std::printf("  %s\n", rw.c_str());
+                std::printf("  %s\n", line.c_str());
             } else {
-                std::printf("  [?] %s\n", rw.c_str());
+                std::printf("  [?] %s\n", line.c_str());
             }
         }
     }
@@ -842,6 +880,23 @@ std::string lookupUniqueName(const d2r::RefDb& db, std::uint32_t id) {
 std::string lookupSetName(const d2r::RefDb& db, std::uint32_t id) {
     if (const auto* r = db.lookupSetItem(static_cast<std::uint16_t>(id))) return r->index;
     return "set#" + std::to_string(id);
+}
+
+// Resolve a 3-char base item code (from armor/weapons/misc) to its display
+// name. Returns the code itself if the lookup misses, so output degrades
+// gracefully rather than showing a blank column.
+std::string lookupBaseName(d2r::RefDb& db, std::string_view code) {
+    if (code.empty()) return {};
+    auto st = db.prepare(
+        "SELECT COALESCE(inm.en_us, b.name) "
+        "FROM (SELECT code, name, namestr FROM armor "
+        "      UNION ALL SELECT code, name, namestr FROM weapons "
+        "      UNION ALL SELECT code, name, namestr FROM misc) b "
+        "LEFT JOIN item_names inm ON inm.\"key\" = b.namestr "
+        "WHERE b.code = ? LIMIT 1");
+    st.bind(1, code);
+    if (st.step()) return st.columnText(0);
+    return std::string(code);
 }
 
 } // namespace
@@ -957,8 +1012,8 @@ int cmdReconcile(const std::filesystem::path& exePath,
     for (auto& [id, listp] : sortedU) {
         if (uniqueChronicled(id)) continue;
         for (const auto& o : *listp) {
-            std::printf("  unique#%-4u %-30s  in %s\n",
-                        id, o.name.c_str(), o.location.c_str());
+            std::printf("  %s\n",
+                formatItem(o.name, lookupBaseName(db, o.code), o.location).c_str());
         }
         ++missingA;
     }
@@ -967,8 +1022,8 @@ int cmdReconcile(const std::filesystem::path& exePath,
     for (auto& [id, listp] : sortedS) {
         if (setChronicled(id)) continue;
         for (const auto& o : *listp) {
-            std::printf("  set#%-7u %-30s  in %s\n",
-                        id, o.name.c_str(), o.location.c_str());
+            std::printf("  %s\n",
+                formatItem(o.name, lookupBaseName(db, o.code), o.location).c_str());
         }
         ++missingA;
     }
@@ -991,8 +1046,12 @@ int cmdReconcile(const std::filesystem::path& exePath,
     for (const auto& e : chron.uniques)  sortedCU[e.itemId] = &e;
     for (const auto& [id, ep] : sortedCU) {
         if (uniqueOwned(id)) continue;
-        std::printf("  unique#%-4u %-30s  found %s UTC  (mon=%u)\n",
-                    id, lookupUniqueName(db, id).c_str(),
+        // Item type is unknown here (the chronicle entry has only an id);
+        // resolving it would require joining uniqueitems -> armor/weapons/misc.
+        // Left blank for now -- captured under item-display embellishments in
+        // TODO.md.
+        std::printf("  %s  (chronicled %s UTC, mon=%u)\n",
+                    formatItem(lookupUniqueName(db, id), "").c_str(),
                     formatTimestamp(ep->timestampMinutes).c_str(),
                     ep->monsterId);
         ++missingB;
@@ -1001,8 +1060,8 @@ int cmdReconcile(const std::filesystem::path& exePath,
     for (const auto& e : chron.setItems) sortedCS[e.itemId] = &e;
     for (const auto& [id, ep] : sortedCS) {
         if (setOwned(id)) continue;
-        std::printf("  set#%-7u %-30s  found %s UTC  (mon=%u)\n",
-                    id, lookupSetName(db, id).c_str(),
+        std::printf("  %s  (chronicled %s UTC, mon=%u)\n",
+                    formatItem(lookupSetName(db, id), "").c_str(),
                     formatTimestamp(ep->timestampMinutes).c_str(),
                     ep->monsterId);
         ++missingB;
