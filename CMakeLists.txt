@@ -114,6 +114,63 @@ if(D2R_USE_VCPKG)
 
     if(D2R_BUILD_TESTS)
         find_package(Catch2 3 CONFIG QUIET)
+    endif()
+
+    # -----------------------------------------------------------------------
+    # Reference-DB regenerator (CascLib + nlohmann-json).
+    # Declared BEFORE add_subdirectory(tests) so the test binary can pick up
+    # d2rsave_refdbgen when it exists.
+    # -----------------------------------------------------------------------
+    find_package(CascLib CONFIG QUIET)
+    find_package(nlohmann_json CONFIG QUIET)
+
+    if(TARGET CascLib::casc OR TARGET CascLib::casc_static)
+        if(TARGET CascLib::casc_static)
+            set(D2R_CASC_TARGET CascLib::casc_static)
+        else()
+            set(D2R_CASC_TARGET CascLib::casc)
+        endif()
+    endif()
+
+    if(D2R_CASC_TARGET AND TARGET nlohmann_json::nlohmann_json)
+        message(STATUS "d2rsave: CascLib + nlohmann-json available; enabling d2r_refdb_gen.")
+
+        # Excel / SQL emitter core: no CASC or JSON dep for the pure-parse
+        # sources, so unit tests can exercise them without a D2R install.
+        add_library(d2rsave_refdbgen STATIC
+            src/excel_table.cpp
+            src/sql_emitter.cpp
+            src/casc_storage.cpp
+            src/string_table.cpp
+        )
+        target_include_directories(d2rsave_refdbgen PUBLIC include)
+        target_compile_features(d2rsave_refdbgen PUBLIC cxx_std_20)
+        target_link_libraries(d2rsave_refdbgen PUBLIC
+            ${D2R_CASC_TARGET}
+            nlohmann_json::nlohmann_json
+        )
+
+        add_executable(d2r_refdb_gen src/refdb_gen_main.cpp)
+        target_link_libraries(d2r_refdb_gen PRIVATE d2rsave_refdbgen)
+
+        # Optional maintainer target: regenerate committed data/sql/ against a
+        # user-supplied D2R install. Guarded on -DD2R_D2R_INSTALL=<path>; the
+        # default build never touches the install path.
+        if(D2R_D2R_INSTALL)
+            add_custom_target(regen-refdb-sql
+                COMMAND d2r_refdb_gen
+                        --d2r-install "${D2R_D2R_INSTALL}"
+                        --out "${CMAKE_SOURCE_DIR}/data/sql"
+                DEPENDS d2r_refdb_gen
+                COMMENT "Regenerating data/sql/*.sql from ${D2R_D2R_INSTALL}"
+                VERBATIM
+            )
+        endif()
+    else()
+        message(STATUS "d2rsave: CascLib or nlohmann-json missing; d2r_refdb_gen disabled.")
+    endif()
+
+    if(D2R_BUILD_TESTS)
         if(Catch2_FOUND)
             enable_testing()
             add_subdirectory(tests)

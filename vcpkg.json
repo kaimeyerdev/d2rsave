@@ -4,6 +4,8 @@
   "dependencies": [
     "sqlite3",
     "fmt",
+    "casclib",
+    "nlohmann-json",
     {
       "name": "catch2",
       "features": []

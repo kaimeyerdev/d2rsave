@@ -1031,6 +1031,19 @@ int cmdChronicle(const std::filesystem::path& exePath,
 
         while (st.step()) {
             const auto setName = st.columnText(0);
+
+            // Sets whose items are defined in setitems.txt but which the
+            // game currently never drops. Excluded so they don't show up
+            // as "remaining" in every chronicle report.
+            static constexpr std::string_view kUnobtainableSets[] = {
+                "Warlord's Glory",
+            };
+            bool skipSet = false;
+            for (auto s : kUnobtainableSets) {
+                if (setName == s) { skipSet = true; break; }
+            }
+            if (skipSet) continue;
+
             Row r;
             r.id      = static_cast<std::uint32_t>(st.columnInt64(1));
             r.display = st.columnText(2);
