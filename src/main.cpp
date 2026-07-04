@@ -983,14 +983,15 @@ int cmdChronicle(const std::filesystem::path& exePath,
         sql.append(table).append(" t ").append(join).append(
             " LEFT JOIN item_names inm_idx ON inm_idx.\"key\" = t.\"index\" "
             "WHERE t.id IS NOT NULL AND t.id != '' "
+            // Same three-flag mod-txt filter that the coverage
+            // catalog and the set-item listing use. Both the
+            // uniqueitems and setitems tables carry these columns,
+            // so this listing works for either table.
+            "AND CAST(t.spawnable AS INT)=1 "
+            "AND (t.disablechronicle IS NULL OR t.disablechronicle != '1') "
+            "AND (t.disabled IS NULL OR t.disabled != '1') "
             // Base item must not be a quest item.
             "AND (b.quest IS NULL OR b.quest = '') ");
-        if (std::string_view(table) == "uniqueitems") {
-            sql +=
-                "AND CAST(t.spawnable AS INT)=1 "
-                "AND (t.disablechronicle IS NULL OR t.disablechronicle != '1') "
-                "AND (t.disabled IS NULL OR t.disabled != '1') ";
-        }
         sql += "ORDER BY base_name COLLATE NOCASE, t.\"index\" COLLATE NOCASE";
 
         struct Row {
