@@ -70,7 +70,10 @@ int usage(const char* prog) {
         "  items    <name>              List every item on the character.\n"
         "\n"
         "Account commands (auto-discovers stash + scans every .d2s in --path):\n"
-        "  chronicle                    Report chronicle progress and missing items.\n"
+        "  chronicle [--uniques] [--sets] [--runewords]\n"
+        "                               Chronicle progress + missing items.\n"
+        "                               Selector flags restrict to those categories;\n"
+        "                               with none, all three are shown.\n"
         "  reconcile                    Diff owned uniques/sets against the chronicle.\n"
         "\n"
         "Diagnostic commands:\n"
@@ -314,7 +317,8 @@ int cmdItems(const std::filesystem::path& exePath, const std::string& savePath) 
 
 int cmdChronicle(const std::filesystem::path& exePath,
                  const std::string& stashPath,
-                 const std::string& scanDir) {
+                 const std::string& scanDir,
+                 bool showUniques, bool showSets, bool showRunewords) {
     const auto dbPath = d2r::findReferenceDb(exePath);
     if (!dbPath) { std::fprintf(stderr, "error: reference DB not found\n"); return 1; }
     d2r::RefDb db(*dbPath);
@@ -542,14 +546,16 @@ int cmdChronicle(const std::filesystem::path& exePath,
         std::printf("  ... %zu missing of %zu collectable\n", shown, total);
     };
 
-    dumpMissing("not yet found (uniques, sorted by base type)",
-                "uniqueitems", "code",  foundUniqueIds, totalUniques);
+    if (showUniques) {
+        dumpMissing("not yet found (uniques, sorted by base type)",
+                    "uniqueitems", "code",  foundUniqueIds, totalUniques);
+    }
 
     // Missing set items: nested by parent set. The in-game chronicle shows an
     // alphabetically-sorted list of set names; each set expands to its
     // constituent items (also alphabetised). Only sets with at least one
     // missing item are printed.
-    {
+    if (showSets) {
         auto st = db.prepare(
             "SELECT COALESCE(inm_set.en_us, t.\"set\")   AS set_name, "
             "       t.id, "
@@ -594,6 +600,32 @@ int cmdChronicle(const std::filesystem::path& exePath,
         }
         std::printf("  ... %zu missing of %zu collectable\n",
                     totalMissing, totalCollectable);
+    }
+
+    // Runewords. Chronicle entries store a numeric itemId whose meaning comes
+    // from D2R's item-runes.json string-table (not in our snapshot), so we
+    // cannot say WHICH runewords are still missing -- just how many. The list
+    // below enumerates every completed runeword from runes.txt as a reference
+    // for what exists in the game.
+    if (showRunewords) {
+        auto st = db.prepare(
+            "SELECT COALESCE(inm.en_us, rune_name) AS display_name "
+            "FROM runes "
+            "LEFT JOIN item_names inm ON inm.\"key\" = runes.rune_name "
+            "WHERE complete = '1' AND rune_name IS NOT NULL AND rune_name != '' "
+            "ORDER BY display_name COLLATE NOCASE");
+
+        std::vector<std::string> runewords;
+        while (st.step()) runewords.push_back(st.columnText(0));
+
+        std::printf("\n== all runewords (sorted alphabetically) ==\n");
+        std::printf("(chronicle records %zu of %zu; per-runeword found/missing\n"
+                    " mapping requires D2R's item-runes.json string-table extract\n"
+                    " which is not currently loaded)\n",
+                    chron.runewords.size(), runewords.size());
+        for (const auto& rw : runewords) {
+            std::printf("  %s\n", rw.c_str());
+        }
     }
     return 0;
 }
@@ -930,10 +962,30 @@ int main(int argc, char** argv) {
     else if (cmd == "items")     { requirePath(); requireArgs(1);
         runCommand = [exe = std::string(argv[0]),
                       p = resolveCharacter(savePath, positional[1]).string()]{ return cmdItems(exe, p); }; }
-    else if (cmd == "chronicle") { requirePath(); requireArgs(0);
-        runCommand = [exe = std::string(argv[0]), sp = savePath.string()]{
-            return cmdChronicle(exe, findStashFile(sp).string(), sp);
-        }; }
+    else if (cmd == "chronicle") { requirePath();
+        // Chronicle accepts --uniques / --sets / --runewords selector flags.
+        // Any other positional is an error. If none selected, show all three.
+        bool showU = false, showS = false, showR = false;
+        for (std::size_t i = 1; i < positional.size(); ++i) {
+            const auto a = positional[i];
+            if      (a == "--uniques")   showU = true;
+            else if (a == "--sets")      showS = true;
+            else if (a == "--runewords") showR = true;
+            else {
+                std::fprintf(stderr,
+                    "error: 'chronicle' does not accept '%.*s' (allowed: "
+                    "--uniques, --sets, --runewords)\n",
+                    static_cast<int>(a.size()), a.data());
+                return 2;
+            }
+        }
+        if (!showU && !showS && !showR) { showU = showS = showR = true; }
+        runCommand = [exe = std::string(argv[0]), sp = savePath.string(),
+                      showU, showS, showR]{
+            return cmdChronicle(exe, findStashFile(sp).string(), sp,
+                                showU, showS, showR);
+        };
+    }
     else if (cmd == "reconcile") { requirePath(); requireArgs(0);
         runCommand = [exe = std::string(argv[0]), sp = savePath.string()]{
             return cmdReconcile(exe, findStashFile(sp).string(), sp);
