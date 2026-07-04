@@ -74,13 +74,19 @@ int usage(const char* prog) {
         "  items   [--character NAME]... [--shared-stash]\n"
         "          [--inferior] [--normal] [--superior] [--magic]\n"
         "          [--set] [--rare] [--unique] [--craft]\n"
+        "          [--tier-normal] [--tier-exceptional] [--tier-elite]\n"
         "          [STR STR ...]\n"
         "                               List items across the selected scope.\n"
         "                               Scope: --character (repeatable) and\n"
         "                               --shared-stash pick sources; absence of\n"
         "                               both means every character + every\n"
-        "                               stash tab. Quality flags OR together;\n"
-        "                               with none, every quality passes.\n"
+        "                               stash tab. Quality and tier flags each\n"
+        "                               OR together within their group and AND\n"
+        "                               across groups; with none of either,\n"
+        "                               that filter is disabled. Tier applies\n"
+        "                               only to armor/weapons -- misc items\n"
+        "                               (charms, potions, gems) are excluded\n"
+        "                               whenever any --tier-* flag is set.\n"
         "                               Trailing positionals are case-\n"
         "                               insensitive substring queries matched\n"
         "                               against each item's name and base type.\n"
@@ -234,6 +240,30 @@ bool tryConsumeQualityFlag(std::string_view a, QualityFilter& qf) {
     else if (a == "--rare")     { qf.enable(d2r::ItemQuality::Rare);     return true; }
     else if (a == "--unique")   { qf.enable(d2r::ItemQuality::Unique);   return true; }
     else if (a == "--craft")    { qf.enable(d2r::ItemQuality::Craft);    return true; }
+    return false;
+}
+
+// Tier of the item's *base type* (independent of quality). Only armor and
+// weapons have tiered variants; misc items (charms, potions, gems, runes,
+// etc.) have no tier and are excluded whenever any tier filter is active.
+enum class ItemTier : std::uint8_t { None = 0, Normal = 1, Exceptional = 2, Elite = 3 };
+
+// Bitmask filter over ItemTier. Same shape as QualityFilter: mask==0
+// disables the filter, otherwise a bit at position tier passes items of
+// that tier.
+struct TierFilter {
+    std::uint32_t mask = 0;
+    bool active() const noexcept { return mask != 0; }
+    void enable(ItemTier t) noexcept { mask |= 1u << static_cast<int>(t); }
+    bool allows(ItemTier t) const noexcept {
+        return !active() || ((mask >> static_cast<int>(t)) & 1u);
+    }
+};
+
+bool tryConsumeTierFlag(std::string_view a, TierFilter& tf) {
+    if      (a == "--tier-normal")      { tf.enable(ItemTier::Normal);      return true; }
+    else if (a == "--tier-exceptional") { tf.enable(ItemTier::Exceptional); return true; }
+    else if (a == "--tier-elite")       { tf.enable(ItemTier::Elite);       return true; }
     return false;
 }
 
@@ -422,6 +452,7 @@ int cmdItems(const std::filesystem::path& exePath,
              const std::string& scanDir,
              const ItemScope& scope,
              const QualityFilter& qf,
+             const TierFilter& tf,
              const std::vector<std::string>& queries) {
     const auto dbPath = d2r::findReferenceDb(exePath);
     if (!dbPath) {
@@ -430,6 +461,37 @@ int cmdItems(const std::filesystem::path& exePath,
     }
     d2r::RefDb db(*dbPath);
     db.loadItemTables();
+
+    // Precompute the tier of every base item code. Only armor/weapons have
+    // tiered variants (normal / exceptional / elite); misc items are absent
+    // from the map and treated as ItemTier::None. When a tier filter is
+    // active, ItemTier::None items are excluded -- charms/potions/gems
+    // don't have a meaningful tier and don't belong in queries like
+    // "unique exceptional".
+    std::unordered_map<std::string, ItemTier> tierByCode;
+    {
+        auto st = db.prepare(
+            "SELECT code, normcode, ubercode, ultracode FROM armor "
+            "UNION ALL "
+            "SELECT code, normcode, ubercode, ultracode FROM weapons");
+        while (st.step()) {
+            const auto code = st.columnText(0);
+            const auto norm = st.columnText(1);
+            const auto uber = st.columnText(2);
+            const auto ultra = st.columnText(3);
+            if (code.empty()) continue;
+            ItemTier t = ItemTier::None;
+            if      (code == norm)  t = ItemTier::Normal;
+            else if (code == uber)  t = ItemTier::Exceptional;
+            else if (code == ultra) t = ItemTier::Elite;
+            tierByCode.emplace(code, t);
+        }
+    }
+    auto tierFor = [&](std::string_view code) -> ItemTier {
+        if (code.empty()) return ItemTier::None;
+        auto it = tierByCode.find(std::string(code));
+        return it == tierByCode.end() ? ItemTier::None : it->second;
+    };
 
     struct Row {
         std::string       name;
@@ -441,7 +503,8 @@ int cmdItems(const std::filesystem::path& exePath,
     std::vector<Row> rows;
 
     auto pushIfMatches = [&](const d2r::Item& it, const std::string& location) {
-        if (!qf.allows(it.quality)) return;
+        if (!qf.allows(it.quality))     return;
+        if (!tf.allows(tierFor(it.code))) return;
         // Primary display name: unique/set items expose a real name; other
         // qualities take the base item name as their primary label.
         auto type = lookupBaseName(db, it.code);
@@ -569,11 +632,32 @@ int cmdItems(const std::filesystem::path& exePath,
         }
         return out;
     };
+    auto tierNames = [&]() -> std::string {
+        if (!tf.active()) return {};
+        static constexpr std::pair<ItemTier, const char*> kNames[] = {
+            {ItemTier::Normal,      "normal"},
+            {ItemTier::Exceptional, "exceptional"},
+            {ItemTier::Elite,       "elite"},
+        };
+        std::string out;
+        for (const auto& [t, name] : kNames) {
+            if (!tf.allows(t)) continue;
+            if (!out.empty()) out += ", ";
+            out += name;
+        }
+        return out;
+    };
 
     std::string header = "items";
     if (const auto s = scopeNames();   !s.empty()) header += " on " + s;
     if (!queries.empty())                          header += " matching " + quoteQueries(queries);
-    if (const auto q = qualityNames(); !q.empty()) header += " (" + q + ")";
+    std::string parens;
+    if (const auto t = tierNames();    !t.empty()) parens = "tier: " + t;
+    if (const auto q = qualityNames(); !q.empty()) {
+        if (!parens.empty()) parens += "; ";
+        parens += q;
+    }
+    if (!parens.empty()) header += " (" + parens + ")";
     std::printf("== %s -- %zu shown ==\n", header.c_str(), rows.size());
     for (const auto& r : rows) {
         std::printf("  %s\n", formatItem(r.name, r.type, r.location).c_str());
@@ -1349,6 +1433,7 @@ int main(int argc, char** argv) {
         //     name OR its base type.
         ItemScope scope;
         QualityFilter qf;
+        TierFilter tf;
         std::vector<std::string> queries;
         for (std::size_t i = 1; i < positional.size(); ++i) {
             const auto a = positional[i];
@@ -1369,11 +1454,15 @@ int main(int argc, char** argv) {
             else if (tryConsumeQualityFlag(a, qf)) {
                 // Enabled inside the helper.
             }
+            else if (tryConsumeTierFlag(a, tf)) {
+                // Enabled inside the helper.
+            }
             else if (!a.empty() && a[0] == '-') {
                 std::fprintf(stderr,
                     "error: 'items' does not accept flag '%.*s' (allowed: "
                     "--character NAME, --shared-stash, --inferior, --normal, "
-                    "--superior, --magic, --set, --rare, --unique, --craft)\n",
+                    "--superior, --magic, --set, --rare, --unique, --craft, "
+                    "--tier-normal, --tier-exceptional, --tier-elite)\n",
                     static_cast<int>(a.size()), a.data());
                 return 2;
             }
@@ -1384,7 +1473,7 @@ int main(int argc, char** argv) {
         runCommand = [exe   = std::string(argv[0]),
                       sp    = savePath.string(),
                       scope = std::move(scope),
-                      qf,
+                      qf, tf,
                       queries = std::move(queries)]{
             std::string stashPath;
             try { stashPath = findStashFile(sp).string(); }
@@ -1392,7 +1481,7 @@ int main(int argc, char** argv) {
                 // No stash file is fine when the user has scoped away from it
                 // via --character (or when they simply have a bare save dir).
             }
-            return cmdItems(exe, stashPath, sp, scope, qf, queries);
+            return cmdItems(exe, stashPath, sp, scope, qf, tf, queries);
         };
     }
     else if (cmd == "chronicle") { requirePath();
