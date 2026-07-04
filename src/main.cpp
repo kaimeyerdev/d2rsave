@@ -148,6 +148,25 @@ std::string formatItem(std::string_view name,
     return line;
 }
 
+#if D2R_HAVE_SQLITE
+// Resolve a 3-char base item code (from armor/weapons/misc) to its display
+// name. Returns the code itself if the lookup misses, so output degrades
+// gracefully rather than showing a blank column.
+std::string lookupBaseName(d2r::RefDb& db, std::string_view code) {
+    if (code.empty()) return {};
+    auto st = db.prepare(
+        "SELECT COALESCE(inm.en_us, b.name) "
+        "FROM (SELECT code, name, namestr FROM armor "
+        "      UNION ALL SELECT code, name, namestr FROM weapons "
+        "      UNION ALL SELECT code, name, namestr FROM misc) b "
+        "LEFT JOIN item_names inm ON inm.\"key\" = b.namestr "
+        "WHERE b.code = ? LIMIT 1");
+    st.bind(1, code);
+    if (st.step()) return st.columnText(0);
+    return std::string(code);
+}
+#endif
+
 int cmdVerify(const std::string& path) {
     auto bytes = d2r::readFile(path);
     const bool magicOk = d2r::hasValidMagic(bytes);
@@ -330,51 +349,26 @@ int cmdItems(const std::filesystem::path& exePath, const std::string& savePath) 
     std::string failMsg;
     const auto items = parser.parseItems(bytes, ch.itemsOffset, &failIdx, &failMsg);
 
-    // Resolve the base type for a 3-char item code from armor/weapons/misc.
-    auto baseTypeFor = [&](std::string_view code) -> std::string {
-        if (code.empty()) return {};
-        auto st = db.prepare(
-            "SELECT COALESCE(inm.en_us, b.name) "
-            "FROM (SELECT code, name, namestr FROM armor "
-            "      UNION ALL SELECT code, name, namestr FROM weapons "
-            "      UNION ALL SELECT code, name, namestr FROM misc) b "
-            "LEFT JOIN item_names inm ON inm.\"key\" = b.namestr "
-            "WHERE b.code = ? LIMIT 1");
-        st.bind(1, code);
-        if (st.step()) return st.columnText(0);
-        return std::string(code);
-    };
-
-    const auto srcName = std::filesystem::path(savePath).filename().string();
     std::printf("file:   %s (character=%u, decoded=%zu)\n",
                 savePath.c_str(), ch.itemCount, items.size());
     if (!failMsg.empty()) {
         std::printf("parse-failure: item #%zu: %s\n", failIdx, failMsg.c_str());
     }
-    // Diagnostic prefix (index / bit offset / code / quality / ilvl) followed
-    // by the uniform formatItem block. Location is omitted from each row --
-    // it's redundant with the file: header above -- but the resolved name
-    // still makes for a scannable listing when compared across characters.
-    (void) srcName;
-    std::printf("%-4s %-6s %-4s %-8s %-4s %s\n",
-                "#", "@bit", "code", "qual", "ilvl", "item");
-    for (std::size_t i = 0; i < items.size(); ++i) {
-        const auto& it = items[i];
-        std::string flags;
-        if (it.identified)       flags += "I";
-        if (it.socketed)         flags += "S";
-        if (it.ethereal)         flags += "E";
-        if (it.personalized)     flags += "P";
-        if (it.runeword)         flags += "R";
-        if (it.hasChronicleData) flags += "C";
-        const auto type = baseTypeFor(it.code);
-        std::printf("%-4zu %-6zu %-4s %-8.*s %-4u %s  %s\n",
-                    i, it.startBitOffset, it.code.c_str(),
-                    static_cast<int>(d2r::toString(it.quality).size()),
-                    d2r::toString(it.quality).data(),
-                    it.itemLevel,
-                    formatItem(it.itemName, type).c_str(),
-                    flags.c_str());
+    // Uniform per-item output shared with chronicle/reconcile. For unique
+    // and set items the proper name (e.g. "Steel Shade") goes into the
+    // name slot and the base type (e.g. "Armet") into the type slot; for
+    // everything else the base type IS the name and the type slot is
+    // suppressed by formatItem's dedupe rule. Location is omitted -- the
+    // 'file:' header already names the source.
+    for (const auto& it : items) {
+        const auto type = lookupBaseName(db, it.code);
+        const bool named = it.quality == d2r::ItemQuality::Unique
+                        || it.quality == d2r::ItemQuality::Set;
+        if (named) {
+            std::printf("  %s\n", formatItem(it.itemName, type).c_str());
+        } else {
+            std::printf("  %s\n", formatItem(type, {}).c_str());
+        }
     }
     return 0;
 }
@@ -416,23 +410,6 @@ std::string quoteQueries(const std::vector<std::string>& queries) {
         out += '"';
     }
     return out;
-}
-
-// Resolve a 3-char base item code (from armor/weapons/misc) to its display
-// name. Returns the code itself if the lookup misses, so output degrades
-// gracefully rather than showing a blank column.
-std::string lookupBaseName(d2r::RefDb& db, std::string_view code) {
-    if (code.empty()) return {};
-    auto st = db.prepare(
-        "SELECT COALESCE(inm.en_us, b.name) "
-        "FROM (SELECT code, name, namestr FROM armor "
-        "      UNION ALL SELECT code, name, namestr FROM weapons "
-        "      UNION ALL SELECT code, name, namestr FROM misc) b "
-        "LEFT JOIN item_names inm ON inm.\"key\" = b.namestr "
-        "WHERE b.code = ? LIMIT 1");
-    st.bind(1, code);
-    if (st.step()) return st.columnText(0);
-    return std::string(code);
 }
 
 } // namespace
