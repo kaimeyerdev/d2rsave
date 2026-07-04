@@ -74,7 +74,7 @@ int usage(const char* prog) {
         "  items   [--character NAME]... [--shared-stash]\n"
         "          [--inferior] [--normal] [--superior] [--magic]\n"
         "          [--set] [--rare] [--unique] [--craft]\n"
-        "          [--tier-normal] [--tier-exceptional] [--tier-elite]\n"
+        "          [--tier-normal] [--tier-exceptional] [--tier-elite] [--tier-misc]\n"
         "          [STR STR ...]\n"
         "                               List items across the selected scope.\n"
         "                               Scope: --character (repeatable) and\n"
@@ -84,9 +84,12 @@ int usage(const char* prog) {
         "                               OR together within their group and AND\n"
         "                               across groups; with none of either,\n"
         "                               that filter is disabled. Tier applies\n"
-        "                               only to armor/weapons -- misc items\n"
-        "                               (charms, potions, gems) are excluded\n"
-        "                               whenever any --tier-* flag is set.\n"
+        "                               to armor/weapons (normal/exceptional/\n"
+        "                               elite) and to misc-table bases\n"
+        "                               (--tier-misc: amulets, rings, jewels,\n"
+        "                               charms). Items whose base is in none\n"
+        "                               of those tables are excluded whenever\n"
+        "                               any --tier-* flag is set.\n"
         "                               Trailing positionals are case-\n"
         "                               insensitive substring queries matched\n"
         "                               against each item's name and base type.\n"
@@ -98,7 +101,7 @@ int usage(const char* prog) {
         "  chronicle [--uniques] [--sets]\n"
 #endif
         "            [--remaining] [--discovered]\n"
-        "            [--tier-normal] [--tier-exceptional] [--tier-elite]\n"
+        "            [--tier-normal] [--tier-exceptional] [--tier-elite] [--tier-misc]\n"
         "            [--query STR ...]\n"
         "                               Chronicle progress + item lists.\n"
         "                               Category selectors restrict the report;\n"
@@ -107,10 +110,12 @@ int usage(const char* prog) {
         "                               chronicled; --discovered shows those\n"
         "                               already chronicled. Neither, or both,\n"
         "                               shows every item with a [X]/[ ] marker.\n"
-        "                               --tier-* restricts by base-item tier\n"
-        "                               (misc items and runewords have no tier\n"
-        "                               and are suppressed whenever a tier\n"
-        "                               filter is active). --query STR ...\n"
+        "                               --tier-* restricts by base-item tier:\n"
+        "                               normal/exceptional/elite for armor and\n"
+        "                               weapons, and misc for amulets, rings,\n"
+        "                               jewels, and charms. Runewords have no\n"
+        "                               base code and are suppressed whenever\n"
+        "                               a tier filter is active). --query STR ...\n"
         "                               is a case-insensitive substring filter\n"
         "                               over item name / base type / set name;\n"
         "                               it consumes ALL remaining arguments so\n"
@@ -248,10 +253,15 @@ bool tryConsumeQualityFlag(std::string_view a, QualityFilter& qf) {
     return false;
 }
 
-// Tier of the item's *base type* (independent of quality). Only armor and
-// weapons have tiered variants; misc items (charms, potions, gems, runes,
-// etc.) have no tier and are excluded whenever any tier filter is active.
-enum class ItemTier : std::uint8_t { None = 0, Normal = 1, Exceptional = 2, Elite = 3 };
+// Tier of the item's *base type* (independent of quality). Armor and
+// weapons come in three tiers (normal / exceptional / elite); items whose
+// base lives in misc.txt (amulets, rings, jewels, charms) have no tier
+// concept and are reported under Misc. Items with a base that isn't in
+// any of the three tables (should not happen for real chronicle rows)
+// stay as None and are excluded whenever any tier filter is active.
+enum class ItemTier : std::uint8_t {
+    None = 0, Normal = 1, Exceptional = 2, Elite = 3, Misc = 4
+};
 
 // Bitmask filter over ItemTier. Same shape as QualityFilter: mask==0
 // disables the filter, otherwise a bit at position tier passes items of
@@ -269,6 +279,7 @@ bool tryConsumeTierFlag(std::string_view a, TierFilter& tf) {
     if      (a == "--tier-normal")      { tf.enable(ItemTier::Normal);      return true; }
     else if (a == "--tier-exceptional") { tf.enable(ItemTier::Exceptional); return true; }
     else if (a == "--tier-elite")       { tf.enable(ItemTier::Elite);       return true; }
+    else if (a == "--tier-misc")        { tf.enable(ItemTier::Misc);        return true; }
     return false;
 }
 
@@ -467,12 +478,12 @@ int cmdItems(const std::filesystem::path& exePath,
     d2r::RefDb db(*dbPath);
     db.loadItemTables();
 
-    // Precompute the tier of every base item code. Only armor/weapons have
-    // tiered variants (normal / exceptional / elite); misc items are absent
-    // from the map and treated as ItemTier::None. When a tier filter is
-    // active, ItemTier::None items are excluded -- charms/potions/gems
-    // don't have a meaningful tier and don't belong in queries like
-    // "unique exceptional".
+    // Precompute the tier of every base item code. Armor/weapons have three
+    // tiers (normal / exceptional / elite); misc-table bases (amulets,
+    // rings, jewels, charms) map to ItemTier::Misc. When a tier filter is
+    // active, only tiers in the filter set are kept, so
+    // `unique exceptional` still hides charms but `unique misc` or a
+    // multi-select like `unique normal misc` includes them.
     std::unordered_map<std::string, ItemTier> tierByCode;
     {
         auto st = db.prepare(
@@ -490,6 +501,11 @@ int cmdItems(const std::filesystem::path& exePath,
             else if (code == uber)  t = ItemTier::Exceptional;
             else if (code == ultra) t = ItemTier::Elite;
             tierByCode.emplace(code, t);
+        }
+        auto stMisc = db.prepare("SELECT code FROM misc");
+        while (stMisc.step()) {
+            const auto code = stMisc.columnText(0);
+            if (!code.empty()) tierByCode.emplace(code, ItemTier::Misc);
         }
     }
     auto tierFor = [&](std::string_view code) -> ItemTier {
@@ -643,6 +659,7 @@ int cmdItems(const std::filesystem::path& exePath,
             {ItemTier::Normal,      "normal"},
             {ItemTier::Exceptional, "exceptional"},
             {ItemTier::Elite,       "elite"},
+            {ItemTier::Misc,        "misc"},
         };
         std::string out;
         for (const auto& [t, name] : kNames) {
@@ -862,9 +879,11 @@ int cmdChronicle(const std::filesystem::path& exePath,
         "  ON b.code = t.{code_col} "
         " LEFT JOIN item_names inm ON inm.\"key\" = b.namestr ";
 
-    // Precompute base-item tier for filtering (armor + weapons only; misc
-    // bases have no tier). Runewords and misc-based items are suppressed
-    // when a tier filter is active.
+    // Precompute base-item tier for filtering. Armor + weapons map to one
+    // of the three tiers (normal / exceptional / elite); misc bases
+    // (amulets, rings, jewels, charms) map to Misc so `--tier-misc`
+    // can surface them. Runewords still have no base code available and
+    // remain suppressed whenever any tier filter is active.
     std::unordered_map<std::string, ItemTier> tierByCode;
     if (tf.active()) {
         auto st = db.prepare(
@@ -882,6 +901,11 @@ int cmdChronicle(const std::filesystem::path& exePath,
             else if (code == uber)  t = ItemTier::Exceptional;
             else if (code == ultra) t = ItemTier::Elite;
             tierByCode.emplace(code, t);
+        }
+        auto stMisc = db.prepare("SELECT code FROM misc");
+        while (stMisc.step()) {
+            const auto code = stMisc.columnText(0);
+            if (!code.empty()) tierByCode.emplace(code, ItemTier::Misc);
         }
     }
     auto tierAllows = [&](std::string_view baseCode) {
@@ -905,6 +929,7 @@ int cmdChronicle(const std::filesystem::path& exePath,
             {ItemTier::Normal,      "normal"},
             {ItemTier::Exceptional, "exceptional"},
             {ItemTier::Elite,       "elite"},
+            {ItemTier::Misc,        "misc"},
         };
         std::string out = "; tier: ";
         bool first = true;
@@ -1495,7 +1520,7 @@ int main(int argc, char** argv) {
                     "error: 'items' does not accept flag '%.*s' (allowed: "
                     "--character NAME, --shared-stash, --inferior, --normal, "
                     "--superior, --magic, --set, --rare, --unique, --craft, "
-                    "--tier-normal, --tier-exceptional, --tier-elite)\n",
+                    "--tier-normal, --tier-exceptional, --tier-elite, --tier-misc)\n",
                     static_cast<int>(a.size()), a.data());
                 return 2;
             }
@@ -1552,7 +1577,7 @@ int main(int argc, char** argv) {
                     ", --runewords"
 #endif
                     ", --remaining, --discovered, "
-                    "--tier-normal, --tier-exceptional, --tier-elite, --query)\n",
+                    "--tier-normal, --tier-exceptional, --tier-elite, --tier-misc, --query)\n",
                     static_cast<int>(a.size()), a.data());
                 return 2;
             }
