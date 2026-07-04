@@ -8,13 +8,15 @@ add_executable(d2rsave_tests
     test_items.cpp
     test_stash.cpp
     test_sunder.cpp
+    test_vendor.cpp
 )
 target_link_libraries(d2rsave_tests PRIVATE
     d2rsave_core
     Catch2::Catch2WithMain
 )
 target_compile_definitions(d2rsave_tests PRIVATE
-    D2R_TEST_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures"
+    D2R_TEST_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures/live-snapshot"
+    D2R_TEST_VENDOR_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures/vendor"
     D2R_TEST_REFERENCE_DB="${D2R_REFERENCE_DB}"
 )
 add_dependencies(d2rsave_tests reference_db)
