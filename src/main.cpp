@@ -699,14 +699,6 @@ namespace {
 // elite); runewords and misc bases have no tier so those categories are
 // suppressed when any --tier-* is active.
 
-// Sets whose items are defined in setitems.txt but which the game currently
-// never drops. Excluded from both the collectable-set total and the
-// per-set item listing so they don't inflate coverage numbers or appear
-// as "remaining" in every chronicle report.
-inline constexpr std::string_view kUnobtainableSets[] = {
-    "Warlord's Glory",
-};
-
 } // namespace
 
 int cmdChronicle(const std::filesystem::path& exePath,
@@ -808,48 +800,39 @@ int cmdChronicle(const std::filesystem::path& exePath,
     // We build the full set of collectable IDs (rather than a scalar
     // count) so the coverage "found" number reflects only chronicled
     // items that are actually visible in the section listings below.
-    // Without this, D2R uniques with disablechronicle=1 (e.g. Sunder
-    // Charm base entries recorded via the bit-29 blob) inflate the
-    // "found" count relative to what the user can see, and Warlord's
-    // Glory set items — hidden from the set listing because the game
-    // no longer drops them — would inflate the set total.
-    std::unordered_set<std::uint32_t> collectableUniqueIds;
-    {
-        auto st = db.prepare(
-            "SELECT t.id FROM uniqueitems t "
+    // Without this, entries excluded from the chronicle by mod-txt flags
+    // (e.g. Sunder Charm unique bases with disablechronicle=1 recorded
+    // via the bit-29 blob, or the Warlord's Glory set items which
+    // Blizzard marked disablechronicle=1) inflate the "found" or
+    // "total" counts relative to what the section listings show.
+    //
+    // Both uniqueitems and setitems use the same three mod-txt flags
+    // (spawnable / disablechronicle / disabled) so the queries here are
+    // structurally identical apart from the base-code column name.
+    auto loadCollectable = [&](const char* table, const char* codeCol) {
+        std::unordered_set<std::uint32_t> out;
+        std::string sql =
+            "SELECT t.id FROM ";
+        sql += table;
+        sql += " t "
             "LEFT JOIN (SELECT code, quest FROM armor "
             "           UNION ALL SELECT code, quest FROM weapons "
-            "           UNION ALL SELECT code, quest FROM misc) b ON b.code = t.code "
+            "           UNION ALL SELECT code, quest FROM misc) b ON b.code = t.\"";
+        sql += codeCol;
+        sql += "\" "
             "WHERE t.id IS NOT NULL AND t.id != '' "
             "AND CAST(t.spawnable AS INT)=1 "
             "AND (t.disablechronicle IS NULL OR t.disablechronicle != '1') "
             "AND (t.disabled IS NULL OR t.disabled != '1') "
-            "AND (b.quest IS NULL OR b.quest = '')");
+            "AND (b.quest IS NULL OR b.quest = '')";
+        auto st = db.prepare(sql);
         while (st.step()) {
-            collectableUniqueIds.insert(
-                static_cast<std::uint32_t>(st.columnInt64(0)));
+            out.insert(static_cast<std::uint32_t>(st.columnInt64(0)));
         }
-    }
-    std::unordered_set<std::uint32_t> collectableSetIds;
-    {
-        auto st = db.prepare(
-            "SELECT t.id, t.\"set\" FROM setitems t "
-            "LEFT JOIN (SELECT code, quest FROM armor "
-            "           UNION ALL SELECT code, quest FROM weapons "
-            "           UNION ALL SELECT code, quest FROM misc) b ON b.code = t.item "
-            "WHERE t.id IS NOT NULL AND t.id != '' "
-            "AND (b.quest IS NULL OR b.quest = '')");
-        while (st.step()) {
-            const auto setName = st.columnText(1);
-            bool skip = false;
-            for (auto s : kUnobtainableSets) {
-                if (setName == s) { skip = true; break; }
-            }
-            if (skip) continue;
-            collectableSetIds.insert(
-                static_cast<std::uint32_t>(st.columnInt64(0)));
-        }
-    }
+        return out;
+    };
+    const auto collectableUniqueIds = loadCollectable("uniqueitems", "code");
+    const auto collectableSetIds    = loadCollectable("setitems",    "item");
     const auto totalUniques = static_cast<std::int64_t>(collectableUniqueIds.size());
     const auto totalSets    = static_cast<std::int64_t>(collectableSetIds.size());
 
@@ -1081,6 +1064,9 @@ int cmdChronicle(const std::filesystem::path& exePath,
             "LEFT JOIN item_names inm_idx  ON inm_idx.\"key\"  = t.\"index\" "
             "LEFT JOIN item_names inm_set  ON inm_set.\"key\"  = t.\"set\" "
             "WHERE t.id IS NOT NULL AND t.id != '' "
+            "AND CAST(t.spawnable AS INT)=1 "
+            "AND (t.disablechronicle IS NULL OR t.disablechronicle != '1') "
+            "AND (t.disabled IS NULL OR t.disabled != '1') "
             "AND (b.quest IS NULL OR b.quest = '') "
             "ORDER BY set_name COLLATE NOCASE, base_name COLLATE NOCASE, "
             "         display_name COLLATE NOCASE");
@@ -1097,14 +1083,6 @@ int cmdChronicle(const std::filesystem::path& exePath,
 
         while (st.step()) {
             const auto setName = st.columnText(0);
-
-            // Skip sets whose items the game currently never drops (see
-            // kUnobtainableSets at file scope for the full list and why).
-            bool skipSet = false;
-            for (auto s : kUnobtainableSets) {
-                if (setName == s) { skipSet = true; break; }
-            }
-            if (skipSet) continue;
 
             Row r;
             r.id      = static_cast<std::uint32_t>(st.columnInt64(1));
