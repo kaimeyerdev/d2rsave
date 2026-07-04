@@ -13,6 +13,8 @@
 
 #include <charconv>
 #include <chrono>
+#include <algorithm>
+#include <cctype>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -71,16 +73,25 @@ int usage(const char* prog) {
         "\n"
         "Account commands (auto-discovers stash + scans every .d2s in --path):\n"
 #if D2R_ENABLE_RUNEWORDS_WIP
-        "  chronicle [--uniques] [--sets] [--runewords]\n"
-        "                               Chronicle progress + missing items.\n"
-        "                               Selectors restrict to those categories;\n"
-        "                               with none, all three are shown.\n"
+        "  chronicle [--uniques] [--sets] [--runewords] [--full | --query STR ...]\n"
 #else
-        "  chronicle [--uniques] [--sets]\n"
-        "                               Chronicle progress + missing items.\n"
-        "                               Selectors restrict to those categories;\n"
-        "                               with none, both are shown. Runewords\n"
-        "                               are compiled out (build with\n"
+        "  chronicle [--uniques] [--sets] [--full | --query STR ...]\n"
+#endif
+        "                               Chronicle progress + item lists.\n"
+        "                               Category selectors restrict the report;\n"
+        "                               with none, all available categories are\n"
+        "                               shown. Without --full or --query only\n"
+        "                               items you have NOT yet chronicled are\n"
+        "                               listed. --full prints every item with a\n"
+        "                               [X]/[ ] found marker. --query filters to\n"
+        "                               items whose base/display/set name\n"
+        "                               contains any of the supplied strings\n"
+        "                               (case-insensitive substring); --query\n"
+        "                               consumes ALL remaining arguments so it\n"
+        "                               must come last. --full and --query are\n"
+        "                               mutually exclusive.\n"
+#if !D2R_ENABLE_RUNEWORDS_WIP
+        "                               Runewords are compiled out (build with\n"
         "                               -DD2R_ENABLE_RUNEWORDS_WIP=ON to enable).\n"
 #endif
         "  reconcile                    Diff owned uniques/sets against the chronicle.\n"
@@ -324,10 +335,53 @@ int cmdItems(const std::filesystem::path& exePath, const std::string& savePath) 
     return 0;
 }
 
+namespace {
+
+// How the chronicle command formats its item lists.
+//   Default -- print only items not yet chronicled ("remaining").
+//   Full    -- print every collectable item with a [X]/[ ] found marker.
+//   Query   -- print items whose base/display/set name substring-matches
+//              any of the caller-supplied query strings; also with a
+//              [X]/[ ] found marker.
+enum class ChronicleMode { Default, Full, Query };
+
+// Case-insensitive substring match: does haystack contain any needle?
+// An empty needles list matches everything (defensive; Query mode is
+// only entered when at least one non-empty needle is present).
+bool containsAnyCI(std::string_view haystack,
+                   const std::vector<std::string>& needles) {
+    if (needles.empty()) return true;
+    auto lc = [](unsigned char c) { return std::tolower(c); };
+    for (const auto& n : needles) {
+        if (n.empty()) continue;
+        auto it = std::search(haystack.begin(), haystack.end(),
+                              n.begin(), n.end(),
+                              [&](char a, char b) { return lc(a) == lc(b); });
+        if (it != haystack.end()) return true;
+    }
+    return false;
+}
+
+// Format the query list as e.g. '"sword", "axe"' for section headers.
+std::string quoteQueries(const std::vector<std::string>& queries) {
+    std::string out;
+    for (std::size_t i = 0; i < queries.size(); ++i) {
+        if (i) out += ", ";
+        out += '"';
+        out += queries[i];
+        out += '"';
+    }
+    return out;
+}
+
+} // namespace
+
 int cmdChronicle(const std::filesystem::path& exePath,
                  const std::string& stashPath,
                  const std::string& scanDir,
-                 bool showUniques, bool showSets, bool showRunewords) {
+                 bool showUniques, bool showSets, bool showRunewords,
+                 ChronicleMode mode,
+                 const std::vector<std::string>& queries) {
     const auto dbPath = d2r::findReferenceDb(exePath);
     if (!dbPath) { std::fprintf(stderr, "error: reference DB not found\n"); return 1; }
     d2r::RefDb db(*dbPath);
@@ -499,10 +553,9 @@ int cmdChronicle(const std::filesystem::path& exePath,
         "  ON b.code = t.{code_col} "
         " LEFT JOIN item_names inm ON inm.\"key\" = b.namestr ";
 
-    auto dumpMissing = [&](const char* label, const char* table,
-                           const char* code_col,
-                           const std::unordered_set<std::uint32_t>& found,
-                           std::int64_t /*totalCollectable*/) {
+    auto dumpItems = [&](const char* label, const char* table,
+                         const char* code_col,
+                         const std::unordered_set<std::uint32_t>& found) {
         std::string join = kBaseJoin;
         const auto placeholder = std::string("{code_col}");
         if (auto pos = join.find(placeholder); pos != std::string::npos) {
@@ -526,30 +579,74 @@ int cmdChronicle(const std::filesystem::path& exePath,
         }
         sql += "ORDER BY base_name COLLATE NOCASE, t.\"index\" COLLATE NOCASE";
 
-        // Collect first so we can print the section header with the count.
-        struct Row { std::uint32_t id; std::string display; std::string base; };
-        std::vector<Row> missing;
+        struct Row {
+            std::uint32_t id;
+            std::string   display;
+            std::string   base;
+            bool          have;
+        };
+        std::vector<Row> shown;
+        std::size_t      foundCount = 0;
+
         auto st = db.prepare(sql);
         while (st.step()) {
-            const auto id       = static_cast<std::uint32_t>(st.columnInt64(0));
-            if (found.contains(id)) continue;
-            missing.push_back({id, st.columnText(1), st.columnText(2)});
+            Row r;
+            r.id      = static_cast<std::uint32_t>(st.columnInt64(0));
+            r.display = st.columnText(1);
+            r.base    = st.columnText(2);
+            r.have    = found.contains(r.id);
+
+            bool include = false;
+            switch (mode) {
+                case ChronicleMode::Default: include = !r.have; break;
+                case ChronicleMode::Full:    include = true;    break;
+                case ChronicleMode::Query:
+                    include = containsAnyCI(r.display, queries)
+                           || containsAnyCI(r.base,    queries);
+                    break;
+            }
+            if (!include) continue;
+            if (r.have) ++foundCount;
+            shown.push_back(std::move(r));
         }
-        std::printf("\n=== Remaining %s Items (%zu) ===\n", label, missing.size());
-        for (const auto& r : missing) {
-            std::printf("  %-24s  [#%u %s]\n",
-                        r.base.empty() ? "?" : r.base.c_str(),
-                        r.id, r.display.c_str());
+
+        switch (mode) {
+            case ChronicleMode::Default:
+                std::printf("\n=== Remaining %s Items (%zu) ===\n",
+                            label, shown.size());
+                break;
+            case ChronicleMode::Full:
+                std::printf("\n=== All %s Items (%zu/%zu found) ===\n",
+                            label, foundCount, shown.size());
+                break;
+            case ChronicleMode::Query:
+                std::printf("\n=== %s Items matching %s (%zu/%zu found) ===\n",
+                            label, quoteQueries(queries).c_str(),
+                            foundCount, shown.size());
+                break;
+        }
+        for (const auto& r : shown) {
+            if (mode == ChronicleMode::Default) {
+                std::printf("  %-24s  [#%u %s]\n",
+                            r.base.empty() ? "?" : r.base.c_str(),
+                            r.id, r.display.c_str());
+            } else {
+                std::printf("  [%c] %-24s  [#%u %s]\n",
+                            r.have ? 'X' : ' ',
+                            r.base.empty() ? "?" : r.base.c_str(),
+                            r.id, r.display.c_str());
+            }
         }
     };
 
     if (showUniques) {
-        dumpMissing("Unique", "uniqueitems", "code", foundUniqueIds, totalUniques);
+        dumpItems("Unique", "uniqueitems", "code", foundUniqueIds);
     }
 
-    // Missing set items: nested by parent set. Only sets with at least one
-    // missing item are printed. The count in the section header is the number
-    // of missing set items (matches the uniques convention).
+    // Set items are grouped by parent set in every mode. In Default only
+    // sets with a missing item show up; in Full every set shows; in Query
+    // only sets with at least one row matching the query are printed. The
+    // query matches on set_name / base_name / display_name.
     if (showSets) {
         auto st = db.prepare(
             "SELECT COALESCE(inm_set.en_us, t.\"set\")   AS set_name, "
@@ -569,31 +666,67 @@ int cmdChronicle(const std::filesystem::path& exePath,
             "ORDER BY set_name COLLATE NOCASE, base_name COLLATE NOCASE, "
             "         display_name COLLATE NOCASE");
 
-        // Group missing rows by set name.
-        std::map<std::string, std::vector<std::tuple<std::string, std::uint32_t, std::string>>> missingBySet;
-        std::size_t totalCollectable = 0;
+        struct Row {
+            std::string   base;
+            std::uint32_t id;
+            std::string   display;
+            bool          have;
+        };
+        std::map<std::string, std::vector<Row>> shownBySet;
+        std::size_t foundCount = 0;
+        std::size_t totalShown = 0;
+
         while (st.step()) {
-            ++totalCollectable;
-            const auto setName   = st.columnText(0);
-            const auto id        = static_cast<std::uint32_t>(st.columnInt64(1));
-            const auto display   = st.columnText(2);
-            const auto baseName  = st.columnText(3);
-            if (foundSetIds.contains(id)) continue;
-            missingBySet[setName].emplace_back(baseName, id, display);
+            const auto setName = st.columnText(0);
+            Row r;
+            r.id      = static_cast<std::uint32_t>(st.columnInt64(1));
+            r.display = st.columnText(2);
+            r.base    = st.columnText(3);
+            r.have    = foundSetIds.contains(r.id);
+
+            bool include = false;
+            switch (mode) {
+                case ChronicleMode::Default: include = !r.have; break;
+                case ChronicleMode::Full:    include = true;    break;
+                case ChronicleMode::Query:
+                    include = containsAnyCI(setName,   queries)
+                           || containsAnyCI(r.display, queries)
+                           || containsAnyCI(r.base,    queries);
+                    break;
+            }
+            if (!include) continue;
+            if (r.have) ++foundCount;
+            ++totalShown;
+            shownBySet[setName].push_back(std::move(r));
         }
 
-        // Precompute the total missing count so the section header can
-        // display it (matches the uniques section's convention).
-        std::size_t totalMissing = 0;
-        for (const auto& [_, items] : missingBySet) totalMissing += items.size();
-
-        std::printf("\n=== Remaining Set Items (%zu) ===\n", totalMissing);
-        for (const auto& [setName, items] : missingBySet) {
+        switch (mode) {
+            case ChronicleMode::Default:
+                std::printf("\n=== Remaining Set Items (%zu) ===\n", totalShown);
+                break;
+            case ChronicleMode::Full:
+                std::printf("\n=== All Set Items (%zu/%zu found) ===\n",
+                            foundCount, totalShown);
+                break;
+            case ChronicleMode::Query:
+                std::printf("\n=== Set Items matching %s (%zu/%zu found) ===\n",
+                            quoteQueries(queries).c_str(),
+                            foundCount, totalShown);
+                break;
+        }
+        for (const auto& [setName, items] : shownBySet) {
             std::printf("  %s\n", setName.c_str());
-            for (const auto& [baseName, id, display] : items) {
-                std::printf("      %-22s  [#%u %s]\n",
-                            baseName.empty() ? "?" : baseName.c_str(),
-                            id, display.c_str());
+            for (const auto& r : items) {
+                if (mode == ChronicleMode::Default) {
+                    std::printf("      %-22s  [#%u %s]\n",
+                                r.base.empty() ? "?" : r.base.c_str(),
+                                r.id, r.display.c_str());
+                } else {
+                    std::printf("      [%c] %-22s  [#%u %s]\n",
+                                r.have ? 'X' : ' ',
+                                r.base.empty() ? "?" : r.base.c_str(),
+                                r.id, r.display.c_str());
+                }
             }
         }
     }
@@ -602,8 +735,7 @@ int cmdChronicle(const std::filesystem::path& exePath,
     // Runewords are a work-in-progress: the chronicle stores a numeric itemId
     // whose meaning comes from D2R's item-runes.json string-table (not in our
     // snapshot), so we cannot say WHICH runewords are still missing -- just
-    // how many. The list below enumerates every completed runeword from
-    // runes.txt as a reference for what exists in the game.
+    // how many. Per-runeword state is displayed as [?] in Full/Query modes.
     if (showRunewords) {
         auto st = db.prepare(
             "SELECT COALESCE(inm.en_us, rune_name) AS display_name "
@@ -612,17 +744,47 @@ int cmdChronicle(const std::filesystem::path& exePath,
             "WHERE complete = '1' AND rune_name IS NOT NULL AND rune_name != '' "
             "ORDER BY display_name COLLATE NOCASE");
 
-        std::vector<std::string> runewords;
-        while (st.step()) runewords.push_back(st.columnText(0));
+        std::vector<std::string> allRunewords;
+        while (st.step()) allRunewords.push_back(st.columnText(0));
 
-        std::printf("\n=== Remaining Runewords (%zu) ===\n",
-                    runewords.size() - chron.runewords.size());
-        std::printf("(chronicle records %zu of %zu; per-runeword found/missing\n"
-                    " mapping requires D2R's item-runes.json string-table extract\n"
-                    " which is not currently loaded)\n",
-                    chron.runewords.size(), runewords.size());
-        for (const auto& rw : runewords) {
-            std::printf("  %s\n", rw.c_str());
+        std::vector<std::string> shown;
+        for (const auto& rw : allRunewords) {
+            bool include = false;
+            switch (mode) {
+                case ChronicleMode::Default: include = true; break;
+                case ChronicleMode::Full:    include = true; break;
+                case ChronicleMode::Query:
+                    include = containsAnyCI(rw, queries);
+                    break;
+            }
+            if (include) shown.push_back(rw);
+        }
+
+        switch (mode) {
+            case ChronicleMode::Default:
+                std::printf("\n=== Remaining Runewords (%zu) ===\n",
+                            allRunewords.size() - chron.runewords.size());
+                std::printf("(chronicle records %zu of %zu; per-runeword found/missing\n"
+                            " mapping requires D2R's item-runes.json string-table extract\n"
+                            " which is not currently loaded)\n",
+                            chron.runewords.size(), allRunewords.size());
+                break;
+            case ChronicleMode::Full:
+                std::printf("\n=== All Runewords (%zu total, %zu chronicled -- state unknown) ===\n",
+                            allRunewords.size(), chron.runewords.size());
+                break;
+            case ChronicleMode::Query:
+                std::printf("\n=== Runewords matching %s (%zu of %zu total) ===\n",
+                            quoteQueries(queries).c_str(),
+                            shown.size(), allRunewords.size());
+                break;
+        }
+        for (const auto& rw : shown) {
+            if (mode == ChronicleMode::Default) {
+                std::printf("  %s\n", rw.c_str());
+            } else {
+                std::printf("  [?] %s\n", rw.c_str());
+            }
         }
     }
 #else
@@ -964,18 +1126,25 @@ int main(int argc, char** argv) {
         runCommand = [exe = std::string(argv[0]),
                       p = resolveCharacter(savePath, positional[1]).string()]{ return cmdItems(exe, p); }; }
     else if (cmd == "chronicle") { requirePath();
-        // Chronicle accepts --uniques / --sets / --runewords selector flags.
-        // (--runewords only when D2R_ENABLE_RUNEWORDS_WIP was set at build.)
-        // Any other positional is an error. With none selected, show all
-        // available categories.
+        // Chronicle selectors:
+        //   --uniques / --sets / --runewords  category filters (any subset)
+        //   --full                            print every item with [X]/[ ]
+        //   --query STR STR ...               substring-filter every item
+        // --full and --query are mutually exclusive. --query MUST come last:
+        // every subsequent positional is consumed as a search string.
         bool showU = false, showS = false, showR = false;
+        bool full = false, sawQuery = false;
+        std::vector<std::string> queries;
         for (std::size_t i = 1; i < positional.size(); ++i) {
             const auto a = positional[i];
-            if      (a == "--uniques") showU = true;
-            else if (a == "--sets")    showS = true;
+            if (sawQuery) { queries.emplace_back(a); continue; }
+            if      (a == "--uniques")   showU = true;
+            else if (a == "--sets")      showS = true;
 #if D2R_ENABLE_RUNEWORDS_WIP
             else if (a == "--runewords") showR = true;
 #endif
+            else if (a == "--full")      full = true;
+            else if (a == "--query")     sawQuery = true;
             else {
                 std::fprintf(stderr,
                     "error: 'chronicle' does not accept '%.*s' (allowed: "
@@ -983,11 +1152,25 @@ int main(int argc, char** argv) {
 #if D2R_ENABLE_RUNEWORDS_WIP
                     ", --runewords"
 #endif
-                    ")\n",
+                    ", --full, --query)\n",
                     static_cast<int>(a.size()), a.data());
                 return 2;
             }
         }
+        if (full && sawQuery) {
+            std::fprintf(stderr,
+                "error: 'chronicle --full' and '--query' are mutually exclusive\n");
+            return 2;
+        }
+        if (sawQuery && queries.empty()) {
+            std::fprintf(stderr,
+                "error: '--query' requires at least one search string\n");
+            return 2;
+        }
+        ChronicleMode mode = ChronicleMode::Default;
+        if (full)          mode = ChronicleMode::Full;
+        else if (sawQuery) mode = ChronicleMode::Query;
+
         if (!showU && !showS && !showR) {
             showU = showS = true;
 #if D2R_ENABLE_RUNEWORDS_WIP
@@ -995,9 +1178,9 @@ int main(int argc, char** argv) {
 #endif
         }
         runCommand = [exe = std::string(argv[0]), sp = savePath.string(),
-                      showU, showS, showR]{
+                      showU, showS, showR, mode, queries]{
             return cmdChronicle(exe, findStashFile(sp).string(), sp,
-                                showU, showS, showR);
+                                showU, showS, showR, mode, queries);
         };
     }
     else if (cmd == "reconcile") { requirePath(); requireArgs(0);
