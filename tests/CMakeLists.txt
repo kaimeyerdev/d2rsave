@@ -14,7 +14,7 @@ target_link_libraries(d2rsave_tests PRIVATE
     Catch2::Catch2WithMain
 )
 target_compile_definitions(d2rsave_tests PRIVATE
-    D2R_TEST_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/D2R_Saves"
+    D2R_TEST_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures"
     D2R_TEST_REFERENCE_DB="${D2R_REFERENCE_DB}"
 )
 add_dependencies(d2rsave_tests reference_db)

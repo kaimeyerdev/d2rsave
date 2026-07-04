@@ -59,15 +59,15 @@ TEST_CASE("item counts across every save match Java reference", "[items][fixture
     // Numbers captured from the Java parser via WarlockDump.
     struct Case { const char* file; std::size_t count; };
     for (const auto& c : std::array{
-        Case{"Amazon.d2s",       39},
-        Case{"Assassin.d2s",     28},
-        Case{"Barbarian.d2s",    50},
+        Case{"Amazon.d2s",       42},
+        Case{"Assassin.d2s",     29},
+        Case{"Barbarian.d2s",    45},
         Case{"Druid.d2s",        31},
         Case{"Necromancer.d2s",  60},
         Case{"Paladin.d2s",      55},
-        Case{"Sorceress.d2s",    55},
-        Case{"Warlock.d2s",      20},
-        Case{"Kai.d2s",          62},
+        Case{"Sorceress.d2s",    58},
+        Case{"Warlock.d2s",      21},
+        Case{"Kai.d2s",          60},
         Case{"DeadKai.d2s",      19},
     }) {
         INFO(c.file);
@@ -107,7 +107,7 @@ TEST_CASE("Kai's first ten items match the Java parser", "[items][fixtures]") {
 
 TEST_CASE("Warlock fresh character starter items", "[items][fixtures]") {
     const auto items = parseItems("Warlock.d2s");
-    REQUIRE(items.size() == 20);
+    REQUIRE(items.size() == 21);
     // First four items are Minor Healing Potions.
     for (std::size_t i = 0; i < 4; ++i) {
         REQUIRE(items[i].code   == "hp1");

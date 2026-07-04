@@ -58,11 +58,11 @@ TEST_CASE("Kai matches known ground truth", "[character][fixtures]") {
     REQUIRE(k.level == 97);
     REQUIRE(k.attributes.level == 97);
     REQUIRE(k.reignOfTheWarlock);
-    // Hell / Act 5 active per the fixture's game state.
+    // Hell / Act 4 active per the fixture's game state.
     REQUIRE(k.locations[static_cast<int>(d2r::Difficulty::Hell)].active);
-    REQUIRE(k.locations[static_cast<int>(d2r::Difficulty::Hell)].act == 5);
-    // 62 character items observed from build/debug/d2rsave dump.
-    REQUIRE(k.itemCount == 62);
+    REQUIRE(k.locations[static_cast<int>(d2r::Difficulty::Hell)].act == 4);
+    // 60 character items observed from build/debug/d2rsave dump.
+    REQUIRE(k.itemCount == 60);
     // All section markers were located.
     REQUIRE(k.questsOffset    != 0);
     REQUIRE(k.waypointsOffset != 0);
