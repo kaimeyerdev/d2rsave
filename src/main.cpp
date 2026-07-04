@@ -16,8 +16,10 @@
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <filesystem>
+#include <thread>
 #include <functional>
 #include <iostream>
 #include <map>
@@ -37,6 +39,7 @@
 
 #if D2R_HAVE_INOTIFY
 #include "d2r/Watcher.hpp"
+#include <unistd.h>
 #endif
 
 namespace {
@@ -979,15 +982,45 @@ int main(int argc, char** argv) {
     ::sigaction(SIGINT,  &sa, nullptr);
     ::sigaction(SIGTERM, &sa, nullptr);
 
-    std::fprintf(stderr, "[watch] %s in %s (Ctrl-C to exit)\n",
-                 std::string(cmd).c_str(), savePath.c_str());
+    // Resolve the running executable so we can also detect self-relinks and
+    // hot-reload by execv'ing the fresh binary back into place.
+    std::filesystem::path exePath;
+    {
+        char link[4096];
+        const ssize_t n = ::readlink("/proc/self/exe", link, sizeof(link) - 1);
+        if (n > 0) { link[n] = '\0'; exePath = link; }
+    }
+
+    std::fprintf(stderr,
+        "[watch] %s in %s (Ctrl-C to exit%s)\n",
+        std::string(cmd).c_str(), savePath.c_str(),
+        exePath.empty() ? "" : "; will re-exec on self-rebuild");
     try {
         (void) runCommand();  // Initial run.
+
         d2r::DirectoryWatcher watcher(savePath);
-        while (watcher.waitForChange()) {
+        if (!exePath.empty()) {
+            (void) watcher.alsoWatchExecutable(exePath);
+        }
+        while (auto trig = watcher.waitForChange()) {
             char stamp[32] = {};
             const std::time_t now = std::time(nullptr);
             std::strftime(stamp, sizeof(stamp), "%H:%M:%S", std::localtime(&now));
+
+            if (*trig == d2r::DirectoryWatcher::Trigger::Executable) {
+                std::fprintf(stderr,
+                    "\n[watch] %s -- binary changed at %s, re-executing\n",
+                    stamp, exePath.c_str());
+                // Give the linker a moment in case cmake is still mid-link.
+                std::this_thread::sleep_for(std::chrono::milliseconds{100});
+                (void) ::execv(exePath.c_str(), argv);
+                // execv returned -> the new binary wasn't ready. Report and
+                // fall back to the normal re-run so we don't lose the loop.
+                std::fprintf(stderr,
+                    "[watch] execv %s failed (%s); continuing with the old "
+                    "binary\n", exePath.c_str(), std::strerror(errno));
+            }
+
             std::fprintf(stderr, "\n[watch] %s -- change detected, re-running '%.*s'\n"
                                  "----------------------------------------------------\n",
                          stamp, static_cast<int>(cmd.size()), cmd.data());
