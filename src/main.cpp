@@ -418,6 +418,23 @@ std::string quoteQueries(const std::vector<std::string>& queries) {
     return out;
 }
 
+// Resolve a 3-char base item code (from armor/weapons/misc) to its display
+// name. Returns the code itself if the lookup misses, so output degrades
+// gracefully rather than showing a blank column.
+std::string lookupBaseName(d2r::RefDb& db, std::string_view code) {
+    if (code.empty()) return {};
+    auto st = db.prepare(
+        "SELECT COALESCE(inm.en_us, b.name) "
+        "FROM (SELECT code, name, namestr FROM armor "
+        "      UNION ALL SELECT code, name, namestr FROM weapons "
+        "      UNION ALL SELECT code, name, namestr FROM misc) b "
+        "LEFT JOIN item_names inm ON inm.\"key\" = b.namestr "
+        "WHERE b.code = ? LIMIT 1");
+    st.bind(1, code);
+    if (st.step()) return st.columnText(0);
+    return std::string(code);
+}
+
 } // namespace
 
 int cmdChronicle(const std::filesystem::path& exePath,
@@ -449,6 +466,7 @@ int cmdChronicle(const std::filesystem::path& exePath,
         d2r::ItemQuality quality;
         std::uint32_t id;
         std::string  name;
+        std::string  code;
     };
     std::vector<Bit29Item> bit29Items;
     std::unordered_set<std::uint32_t> bit29UniqueIds, bit29SetIds;
@@ -459,6 +477,7 @@ int cmdChronicle(const std::filesystem::path& exePath,
                 Bit29Item b;
                 b.source  = source;
                 b.quality = it.quality;
+                b.code    = it.code;
                 if (it.quality == d2r::ItemQuality::Unique) {
                     b.id = it.uniqueId;
                     bit29UniqueIds.insert(it.uniqueId);
@@ -545,32 +564,30 @@ int cmdChronicle(const std::filesystem::path& exePath,
                 combinedSetCount, static_cast<long long>(totalSets),
                 100.0 * combinedSetCount / std::max<std::int64_t>(1, totalSets));
 
-    // Diagnostic: items with the bit-29 blob that AREN'T in the stash tab.
-    // Silent when everything reconciles; loud (with details) when it doesn't,
-    // because that means the game hasn't finished syncing the item's inline
-    // chronicle blob into the shared chronicle tab.
+    // Notification: items whose bit-29 chronicle blob is stamped but which
+    // haven't propagated into the shared-stash chronicle tab yet. This is a
+    // NORMAL state -- typically an item you just picked up (often
+    // unidentified) still sitting in inventory. Once it's identified,
+    // equipped, or stashed, D2R copies the record into the chronicle tab.
+    // Printed to stdout so it appears in the normal report flow.
     if (!scanDir.empty()) {
-        std::vector<const Bit29Item*> unreconciled;
+        std::vector<const Bit29Item*> pending;
         for (const auto& b : bit29Items) {
             const bool inChron =
                 (b.quality == d2r::ItemQuality::Unique && foundUniqueIds.contains(b.id)) ||
                 (b.quality == d2r::ItemQuality::Set    && foundSetIds.contains(b.id));
-            if (!inChron) unreconciled.push_back(&b);
+            if (!inChron) pending.push_back(&b);
         }
-        if (!unreconciled.empty()) {
-            std::fprintf(stderr,
-                "\nerror: %zu bit-29 chronicle item%s not represented in the shared "
-                "stash chronicle tab. This is a mid-transition state: D2R has "
-                "stamped an inline chronicle blob onto the item but hasn't copied "
-                "the record into the account chronicle. Equip or stash the item "
-                "to force the game to reconcile it, then re-run this scan.\n",
-                unreconciled.size(), unreconciled.size() == 1 ? "" : "s");
-            for (const auto* b : unreconciled) {
-                std::fprintf(stderr, "  %s  quality=%.*s  id=%u  %s\n",
-                    b->source.c_str(),
-                    static_cast<int>(d2r::toString(b->quality).size()),
-                    d2r::toString(b->quality).data(),
-                    b->id, b->name.c_str());
+        if (!pending.empty()) {
+            std::printf("\n== items pending chronicle sync (%zu) ==\n",
+                        pending.size());
+            std::printf("(picked-up items still in inventory; typically "
+                        "unidentified and will\n reconcile once identified, "
+                        "equipped, or stashed)\n");
+            for (const auto* b : pending) {
+                std::printf("  %s\n",
+                    formatItem(b->name, lookupBaseName(db, b->code),
+                               b->source).c_str());
             }
         }
     }
@@ -880,23 +897,6 @@ std::string lookupUniqueName(const d2r::RefDb& db, std::uint32_t id) {
 std::string lookupSetName(const d2r::RefDb& db, std::uint32_t id) {
     if (const auto* r = db.lookupSetItem(static_cast<std::uint16_t>(id))) return r->index;
     return "set#" + std::to_string(id);
-}
-
-// Resolve a 3-char base item code (from armor/weapons/misc) to its display
-// name. Returns the code itself if the lookup misses, so output degrades
-// gracefully rather than showing a blank column.
-std::string lookupBaseName(d2r::RefDb& db, std::string_view code) {
-    if (code.empty()) return {};
-    auto st = db.prepare(
-        "SELECT COALESCE(inm.en_us, b.name) "
-        "FROM (SELECT code, name, namestr FROM armor "
-        "      UNION ALL SELECT code, name, namestr FROM weapons "
-        "      UNION ALL SELECT code, name, namestr FROM misc) b "
-        "LEFT JOIN item_names inm ON inm.\"key\" = b.namestr "
-        "WHERE b.code = ? LIMIT 1");
-    st.bind(1, code);
-    if (st.step()) return st.columnText(0);
-    return std::string(code);
 }
 
 } // namespace
