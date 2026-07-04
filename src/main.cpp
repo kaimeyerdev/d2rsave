@@ -69,9 +69,23 @@ int usage(const char* prog) {
         "  set-seed <name> <u32>        Set the map seed and recompute checksum.\n"
         "  checksum <name>              Recompute and write the checksum.\n"
         "  dump     <name>              Parse the whole file and print all decoded fields.\n"
-        "  items    <name>              List every item on the character.\n"
         "\n"
         "Account commands (auto-discovers stash + scans every .d2s in --path):\n"
+        "  items   [--character NAME]... [--shared-stash]\n"
+        "          [--inferior] [--normal] [--superior] [--magic]\n"
+        "          [--set] [--rare] [--unique] [--craft]\n"
+        "          [STR STR ...]\n"
+        "                               List items across the selected scope.\n"
+        "                               Scope: --character (repeatable) and\n"
+        "                               --shared-stash pick sources; absence of\n"
+        "                               both means every character + every\n"
+        "                               stash tab. Quality flags OR together;\n"
+        "                               with none, every quality passes.\n"
+        "                               Trailing positionals are case-\n"
+        "                               insensitive substring queries matched\n"
+        "                               against each item's name and base type.\n"
+        "                               Rows sorted alphabetically by name;\n"
+        "                               duplicates preserved.\n"
 #if D2R_ENABLE_RUNEWORDS_WIP
         "  chronicle [--uniques] [--sets] [--runewords] [--full | --query STR ...]\n"
 #else
@@ -148,6 +162,35 @@ std::string formatItem(std::string_view name,
     return line;
 }
 
+// Case-insensitive substring: does haystack contain any needle?
+// An empty needles list matches everything (defensive; callers usually
+// gate this call so they only invoke it when there's a real filter).
+bool containsAnyCI(std::string_view haystack,
+                   const std::vector<std::string>& needles) {
+    if (needles.empty()) return true;
+    auto lc = [](unsigned char c) { return std::tolower(c); };
+    for (const auto& n : needles) {
+        if (n.empty()) continue;
+        auto it = std::search(haystack.begin(), haystack.end(),
+                              n.begin(), n.end(),
+                              [&](char a, char b) { return lc(a) == lc(b); });
+        if (it != haystack.end()) return true;
+    }
+    return false;
+}
+
+// Format a query list as e.g. '"sword", "axe"' for section headers.
+std::string quoteQueries(const std::vector<std::string>& queries) {
+    std::string out;
+    for (std::size_t i = 0; i < queries.size(); ++i) {
+        if (i) out += ", ";
+        out += '"';
+        out += queries[i];
+        out += '"';
+    }
+    return out;
+}
+
 #if D2R_HAVE_SQLITE
 // Resolve a 3-char base item code (from armor/weapons/misc) to its display
 // name. Returns the code itself if the lookup misses, so output degrades
@@ -166,6 +209,47 @@ std::string lookupBaseName(d2r::RefDb& db, std::string_view code) {
     return std::string(code);
 }
 #endif
+
+// Bitmask filter over ItemQuality. Absent (mask==0) means "pass everything";
+// otherwise a bit at position q means "pass items of quality q".
+struct QualityFilter {
+    std::uint32_t mask = 0;
+    bool active() const noexcept { return mask != 0; }
+    void enable(d2r::ItemQuality q) noexcept {
+        mask |= 1u << static_cast<int>(q);
+    }
+    bool allows(d2r::ItemQuality q) const noexcept {
+        return !active() || ((mask >> static_cast<int>(q)) & 1u);
+    }
+};
+
+// Recognise a --<quality> flag ("--unique", "--set", "--normal", ...) and
+// enable the corresponding bit. Returns true iff `a` was a quality flag.
+bool tryConsumeQualityFlag(std::string_view a, QualityFilter& qf) {
+    if      (a == "--inferior") { qf.enable(d2r::ItemQuality::Inferior); return true; }
+    else if (a == "--normal")   { qf.enable(d2r::ItemQuality::Normal);   return true; }
+    else if (a == "--superior") { qf.enable(d2r::ItemQuality::Superior); return true; }
+    else if (a == "--magic")    { qf.enable(d2r::ItemQuality::Magic);    return true; }
+    else if (a == "--set")      { qf.enable(d2r::ItemQuality::Set);      return true; }
+    else if (a == "--rare")     { qf.enable(d2r::ItemQuality::Rare);     return true; }
+    else if (a == "--unique")   { qf.enable(d2r::ItemQuality::Unique);   return true; }
+    else if (a == "--craft")    { qf.enable(d2r::ItemQuality::Craft);    return true; }
+    return false;
+}
+
+// Which sources the `items` command should include. Empty characters + no
+// stash flag = every source (implicit "all"). Otherwise restrict to the
+// listed characters and/or the shared stash.
+struct ItemScope {
+    bool                            anyExplicit  = false;
+    std::unordered_set<std::string> characters;   // filename stems, e.g. "Kai"
+    bool                            includeStash = false;
+    bool allowsCharacter(std::string_view stem) const {
+        if (!anyExplicit) return true;
+        return characters.contains(std::string(stem));
+    }
+    bool allowsStash() const { return !anyExplicit || includeStash; }
+};
 
 int cmdVerify(const std::string& path) {
     auto bytes = d2r::readFile(path);
@@ -328,7 +412,17 @@ int cmdDbInfo(const std::filesystem::path& exePath, std::string_view override) {
     return 0;
 }
 
-int cmdItems(const std::filesystem::path& exePath, const std::string& savePath) {
+// Enumerate every item across the requested scope (characters +
+// shared-stash tabs, honouring ItemScope), apply quality and substring
+// filters, sort alphabetically by primary display name, and print via
+// formatItem. Every row carries its own location so the output is
+// grep-friendly and cross-source comparisons are trivial.
+int cmdItems(const std::filesystem::path& exePath,
+             const std::string& stashPath,
+             const std::string& scanDir,
+             const ItemScope& scope,
+             const QualityFilter& qf,
+             const std::vector<std::string>& queries) {
     const auto dbPath = d2r::findReferenceDb(exePath);
     if (!dbPath) {
         std::fprintf(stderr, "error: reference DB not found\n");
@@ -337,38 +431,152 @@ int cmdItems(const std::filesystem::path& exePath, const std::string& savePath) 
     d2r::RefDb db(*dbPath);
     db.loadItemTables();
 
-    const auto bytes = d2r::readFile(savePath);
-    const auto ch = d2r::parseCharacter(bytes);
-    if (!ch.itemsOffset) {
-        std::fprintf(stderr, "error: no JM section in %s\n", savePath.c_str());
-        return 1;
-    }
+    struct Row {
+        std::string       name;
+        std::string       type;
+        std::string       location;
+        d2r::ItemQuality  quality = d2r::ItemQuality::None;
+        std::string       sortKey;  // lowercased name for stable ordering
+    };
+    std::vector<Row> rows;
 
-    d2r::ItemParser parser(db);
-    std::size_t failIdx = 0;
-    std::string failMsg;
-    const auto items = parser.parseItems(bytes, ch.itemsOffset, &failIdx, &failMsg);
-
-    std::printf("file:   %s (character=%u, decoded=%zu)\n",
-                savePath.c_str(), ch.itemCount, items.size());
-    if (!failMsg.empty()) {
-        std::printf("parse-failure: item #%zu: %s\n", failIdx, failMsg.c_str());
-    }
-    // Uniform per-item output shared with chronicle/reconcile. For unique
-    // and set items the proper name (e.g. "Steel Shade") goes into the
-    // name slot and the base type (e.g. "Armet") into the type slot; for
-    // everything else the base type IS the name and the type slot is
-    // suppressed by formatItem's dedupe rule. Location is omitted -- the
-    // 'file:' header already names the source.
-    for (const auto& it : items) {
-        const auto type = lookupBaseName(db, it.code);
+    auto pushIfMatches = [&](const d2r::Item& it, const std::string& location) {
+        if (!qf.allows(it.quality)) return;
+        // Primary display name: unique/set items expose a real name; other
+        // qualities take the base item name as their primary label.
+        auto type = lookupBaseName(db, it.code);
         const bool named = it.quality == d2r::ItemQuality::Unique
                         || it.quality == d2r::ItemQuality::Set;
-        if (named) {
-            std::printf("  %s\n", formatItem(it.itemName, type).c_str());
-        } else {
-            std::printf("  %s\n", formatItem(type, {}).c_str());
+        std::string name = named && !it.itemName.empty() ? it.itemName : type;
+        if (!queries.empty()) {
+            const bool hit = containsAnyCI(name, queries)
+                          || containsAnyCI(type, queries);
+            if (!hit) return;
         }
+        Row r;
+        r.name     = std::move(name);
+        r.type     = std::move(type);
+        r.location = location;
+        r.quality  = it.quality;
+        r.sortKey.reserve(r.name.size());
+        for (unsigned char c : r.name) r.sortKey.push_back(std::tolower(c));
+        rows.push_back(std::move(r));
+    };
+
+    // Shared-stash tabs (numbered from 1 for user output).
+    if (scope.allowsStash() && !stashPath.empty()) {
+        try {
+            const auto bytes = d2r::readFile(stashPath);
+            d2r::SharedStashParser sp(db);
+            const auto stash = sp.parse(bytes);
+            for (std::size_t i = 0; i < stash.tabs.size(); ++i) {
+                const std::string loc = "stash tab " + std::to_string(i + 1);
+                for (const auto& it : stash.tabs[i].items) {
+                    pushIfMatches(it, loc);
+                    for (const auto& s : it.socketedItems) pushIfMatches(s, loc);
+                }
+            }
+        } catch (const std::exception& ex) {
+            std::fprintf(stderr, "  skip stash %s: %s\n",
+                         stashPath.c_str(), ex.what());
+        }
+    }
+
+    // Character .d2s files (+ merc / corpse / iron-golem).
+    if (!scanDir.empty()) {
+        for (const auto& entry : std::filesystem::directory_iterator(scanDir)) {
+            if (entry.path().extension() != ".d2s") continue;
+            const auto stem = entry.path().stem().string();
+            if (!scope.allowsCharacter(stem)) continue;
+            try {
+                const auto bytes = d2r::readFile(entry.path());
+                const auto ch    = d2r::parseCharacter(bytes);
+                if (ch.itemsOffset == 0) continue;
+                d2r::ItemParser p(db);
+                const auto file = entry.path().filename().string();
+                auto record = [&](const std::vector<d2r::Item>& items,
+                                  const std::string& loc) {
+                    for (const auto& it : items) {
+                        pushIfMatches(it, loc);
+                        for (const auto& s : it.socketedItems) pushIfMatches(s, loc);
+                    }
+                };
+                record(p.parseItems(bytes, ch.itemsOffset), file);
+                if (ch.mercItemsJMOffset) {
+                    record(p.parseItems(bytes, ch.mercItemsJMOffset),
+                           file + " (merc)");
+                }
+                if (ch.corpseJMOffset && ch.corpseItemCount == 1) {
+                    record(p.parseItems(bytes, ch.corpseJMOffset + 16),
+                           file + " (corpse)");
+                }
+                if (ch.hasIronGolem && ch.ironGolemItemOffset) {
+                    try {
+                        std::vector<d2r::Item> golem{
+                            p.parseSingleItem(bytes, ch.ironGolemItemOffset)};
+                        record(golem, file + " (iron golem)");
+                    } catch (const std::exception&) {
+                        // Iron-golem parse issues are tolerated -- match reconcile.
+                    }
+                }
+            } catch (const std::exception& ex) {
+                std::fprintf(stderr, "  skip %s: %s\n",
+                             entry.path().filename().c_str(), ex.what());
+            }
+        }
+    }
+
+    std::sort(rows.begin(), rows.end(),
+              [](const Row& a, const Row& b) { return a.sortKey < b.sortKey; });
+
+    // Header echoes the active filters so a scrollback trail is
+    // self-explanatory. Scope, quality, and query clauses each appear only
+    // when the user actually asked for them.
+    auto qualityNames = [&]() -> std::string {
+        if (!qf.active()) return {};
+        static constexpr std::pair<d2r::ItemQuality, const char*> kNames[] = {
+            {d2r::ItemQuality::Inferior, "inferior"},
+            {d2r::ItemQuality::Normal,   "normal"},
+            {d2r::ItemQuality::Superior, "superior"},
+            {d2r::ItemQuality::Magic,    "magic"},
+            {d2r::ItemQuality::Set,      "set"},
+            {d2r::ItemQuality::Rare,     "rare"},
+            {d2r::ItemQuality::Unique,   "unique"},
+            {d2r::ItemQuality::Craft,    "craft"},
+        };
+        std::string out;
+        for (const auto& [q, name] : kNames) {
+            if (!qf.allows(q)) continue;
+            if (!out.empty()) out += ", ";
+            out += name;
+        }
+        return out;
+    };
+    auto scopeNames = [&]() -> std::string {
+        if (!scope.anyExplicit) return {};
+        // Deterministic ordering: characters alphabetical, shared stash last.
+        std::vector<std::string> sorted(scope.characters.begin(),
+                                        scope.characters.end());
+        std::sort(sorted.begin(), sorted.end());
+        std::string out;
+        for (const auto& c : sorted) {
+            if (!out.empty()) out += ", ";
+            out += c;
+        }
+        if (scope.includeStash) {
+            if (!out.empty()) out += ", ";
+            out += "shared stash";
+        }
+        return out;
+    };
+
+    std::string header = "items";
+    if (const auto s = scopeNames();   !s.empty()) header += " on " + s;
+    if (!queries.empty())                          header += " matching " + quoteQueries(queries);
+    if (const auto q = qualityNames(); !q.empty()) header += " (" + q + ")";
+    std::printf("== %s -- %zu shown ==\n", header.c_str(), rows.size());
+    for (const auto& r : rows) {
+        std::printf("  %s\n", formatItem(r.name, r.type, r.location).c_str());
     }
     return 0;
 }
@@ -382,35 +590,6 @@ namespace {
 //              any of the caller-supplied query strings; also with a
 //              [X]/[ ] found marker.
 enum class ChronicleMode { Default, Full, Query };
-
-// Case-insensitive substring match: does haystack contain any needle?
-// An empty needles list matches everything (defensive; Query mode is
-// only entered when at least one non-empty needle is present).
-bool containsAnyCI(std::string_view haystack,
-                   const std::vector<std::string>& needles) {
-    if (needles.empty()) return true;
-    auto lc = [](unsigned char c) { return std::tolower(c); };
-    for (const auto& n : needles) {
-        if (n.empty()) continue;
-        auto it = std::search(haystack.begin(), haystack.end(),
-                              n.begin(), n.end(),
-                              [&](char a, char b) { return lc(a) == lc(b); });
-        if (it != haystack.end()) return true;
-    }
-    return false;
-}
-
-// Format the query list as e.g. '"sword", "axe"' for section headers.
-std::string quoteQueries(const std::vector<std::string>& queries) {
-    std::string out;
-    for (std::size_t i = 0; i < queries.size(); ++i) {
-        if (i) out += ", ";
-        out += '"';
-        out += queries[i];
-        out += '"';
-    }
-    return out;
-}
 
 } // namespace
 
@@ -1158,9 +1337,64 @@ int main(int argc, char** argv) {
     else if (cmd == "dump")     { requirePath(); requireArgs(1);
         runCommand = [p = resolveCharacter(savePath, positional[1]).string()]{ return cmdDump(p); }; }
 #if D2R_HAVE_SQLITE
-    else if (cmd == "items")     { requirePath(); requireArgs(1);
-        runCommand = [exe = std::string(argv[0]),
-                      p = resolveCharacter(savePath, positional[1]).string()]{ return cmdItems(exe, p); }; }
+    else if (cmd == "items")     { requirePath();
+        // items selectors:
+        //   --character NAME (repeatable) or --shared-stash: restrict scope.
+        //     Absence of both = every source (all .d2s + all stash tabs).
+        //   --<quality> flags (--unique, --set, --normal, --magic, --rare,
+        //     --craft, --superior, --inferior): restrict by item quality.
+        //     Absence = all qualities.
+        //   Trailing positionals: case-insensitive substring queries. Each
+        //     candidate item matches if any query string appears in its
+        //     name OR its base type.
+        ItemScope scope;
+        QualityFilter qf;
+        std::vector<std::string> queries;
+        for (std::size_t i = 1; i < positional.size(); ++i) {
+            const auto a = positional[i];
+            if (a == "--character") {
+                if (i + 1 >= positional.size()) {
+                    std::fprintf(stderr,
+                        "error: '--character' requires a character name\n");
+                    return 2;
+                }
+                const auto name = positional[++i];
+                scope.characters.emplace(name);
+                scope.anyExplicit = true;
+            }
+            else if (a == "--shared-stash") {
+                scope.includeStash = true;
+                scope.anyExplicit  = true;
+            }
+            else if (tryConsumeQualityFlag(a, qf)) {
+                // Enabled inside the helper.
+            }
+            else if (!a.empty() && a[0] == '-') {
+                std::fprintf(stderr,
+                    "error: 'items' does not accept flag '%.*s' (allowed: "
+                    "--character NAME, --shared-stash, --inferior, --normal, "
+                    "--superior, --magic, --set, --rare, --unique, --craft)\n",
+                    static_cast<int>(a.size()), a.data());
+                return 2;
+            }
+            else {
+                queries.emplace_back(a);
+            }
+        }
+        runCommand = [exe   = std::string(argv[0]),
+                      sp    = savePath.string(),
+                      scope = std::move(scope),
+                      qf,
+                      queries = std::move(queries)]{
+            std::string stashPath;
+            try { stashPath = findStashFile(sp).string(); }
+            catch (const std::exception&) {
+                // No stash file is fine when the user has scoped away from it
+                // via --character (or when they simply have a bare save dir).
+            }
+            return cmdItems(exe, stashPath, sp, scope, qf, queries);
+        };
+    }
     else if (cmd == "chronicle") { requirePath();
         // Chronicle selectors:
         //   --uniques / --sets / --runewords  category filters (any subset)

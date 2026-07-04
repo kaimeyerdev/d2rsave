@@ -84,6 +84,30 @@ worth adding later, most requesting a `--verbose` / `--fields=...` /
     date is currently in a trailing note; a `--sort-by=date` view would
     want it as a proper field so it sorts sensibly.
 
+### `items` command: additional filters
+
+The `items` command currently supports scope (`--character NAME`,
+`--shared-stash`), quality (`--unique`, `--set`, `--normal`, ...), and
+trailing substring queries that match against name + base type.
+Follow-ups worth adding as opt-in flags rather than default output:
+
+  * **Sort order.** Currently forced alphabetical by name. Add
+    `--sort-by=location|quality|ilvl|name` (default remains name).
+  * **Narrower scope slicing.** When `--character X` is given we
+    include X's merc / corpse / iron-golem too. Add
+    `--exclude-merc`, `--exclude-corpse`, `--exclude-golem` (or
+    `--character-only`) for finer control.
+  * **Narrower stash slicing.** `--shared-stash` currently includes
+    every tab. Add `--stash-tab N` (repeatable) for a single-tab view.
+  * **Per-quality display grouping.** `--group-by=quality` prints one
+    section per quality with its own count, instead of one flat list.
+  * **Split name / type queries.** Trailing positionals currently
+    match both name AND base type (union). Add explicit `--name STR`
+    and `--type STR` (repeatable, AND across families) when a user
+    needs to narrow just one axis.
+  * **Character glob.** `--character "Amazon*"` or `--character
+    "*Kai*"` for wildcarded selection instead of exact stems.
+
 ### Runewords: name mapping is missing
 
 
