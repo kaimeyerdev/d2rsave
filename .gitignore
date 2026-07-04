@@ -1,0 +1,11 @@
+build/
+build-*/
+.vcpkg/
+.cache/
+vcpkg_installed/
+compile_commands.json
+*.o
+*.obj
+build
+D2R_Saves
+*.sqlite

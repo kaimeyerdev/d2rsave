@@ -1,0 +1,100 @@
+cmake_minimum_required(VERSION 3.25)
+project(d2rsave
+    VERSION 0.1.0
+    DESCRIPTION "D2R save-game parser and rename/seed tool"
+    LANGUAGES C CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+option(D2R_USE_VCPKG "Enable features that need vcpkg deps (sqlite3, catch2, fmt)" OFF)
+option(D2R_BUILD_LEGACY "Build the legacy rename_d2r C tool for regression testing" ON)
+option(D2R_BUILD_TESTS "Build unit tests (needs D2R_USE_VCPKG=ON)" ${D2R_USE_VCPKG})
+
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Debug CACHE STRING "" FORCE)
+endif()
+
+add_compile_options(-Wall -Wextra -Wpedantic)
+
+# ---------------------------------------------------------------------------
+# Core library + CLI (no external deps).
+# ---------------------------------------------------------------------------
+add_library(d2rsave_core STATIC
+    src/save.cpp
+    src/bitreader.cpp
+    src/character_parser.cpp
+)
+target_include_directories(d2rsave_core PUBLIC include)
+target_compile_features(d2rsave_core PUBLIC cxx_std_20)
+
+add_executable(d2rsave src/main.cpp)
+target_link_libraries(d2rsave PRIVATE d2rsave_core)
+
+# ---------------------------------------------------------------------------
+# Legacy C tool (kept for regression comparison).
+# ---------------------------------------------------------------------------
+if(D2R_BUILD_LEGACY)
+    add_subdirectory(legacy)
+endif()
+
+# ---------------------------------------------------------------------------
+# Optional deps (vcpkg): sqlite3, fmt, catch2. Later phases.
+# ---------------------------------------------------------------------------
+if(D2R_USE_VCPKG)
+    find_package(unofficial-sqlite3 CONFIG QUIET)
+    find_package(SQLite3 QUIET)
+    find_package(fmt CONFIG QUIET)
+
+    if(TARGET unofficial::sqlite3::sqlite3)
+        set(D2R_SQLITE_TARGET unofficial::sqlite3::sqlite3)
+    elseif(TARGET SQLite::SQLite3)
+        set(D2R_SQLITE_TARGET SQLite::SQLite3)
+    endif()
+
+    if(D2R_SQLITE_TARGET AND TARGET fmt::fmt)
+        message(STATUS "d2rsave: sqlite3 + fmt available; enabling reference DB + query features.")
+        set(D2R_FULL_STACK ON)
+
+        # Reference DB pipeline: cat data/sql/*.sql | sqlite3 <db>.
+        find_program(SQLITE3_BIN sqlite3 REQUIRED)
+        file(GLOB D2R_SQL_FILES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/data/sql/*.sql")
+        set(D2R_REFERENCE_DB "${CMAKE_BINARY_DIR}/reference.sqlite")
+        add_custom_command(
+            OUTPUT "${D2R_REFERENCE_DB}"
+            COMMAND ${CMAKE_COMMAND} -E rm -f "${D2R_REFERENCE_DB}"
+            COMMAND sh -c "cat \"${CMAKE_SOURCE_DIR}/data/sql/\"*.sql | \"${SQLITE3_BIN}\" \"${D2R_REFERENCE_DB}\""
+            DEPENDS ${D2R_SQL_FILES}
+            COMMENT "Building D2R reference database"
+            VERBATIM
+        )
+        add_custom_target(reference_db ALL DEPENDS "${D2R_REFERENCE_DB}")
+
+        # RefDb + related sources are compiled into the core library and linked
+        # against sqlite3.
+        target_sources(d2rsave_core PRIVATE
+            src/refdb.cpp
+            src/item_parser.cpp
+            src/shared_stash_parser.cpp
+        )
+        target_link_libraries(d2rsave_core PUBLIC ${D2R_SQLITE_TARGET} fmt::fmt)
+        target_compile_definitions(d2rsave_core PUBLIC D2R_HAVE_SQLITE=1)
+        target_compile_definitions(d2rsave PRIVATE
+            D2R_REFERENCE_DB_DEFAULT="${D2R_REFERENCE_DB}"
+        )
+        add_dependencies(d2rsave reference_db)
+    else()
+        message(WARNING "d2rsave: D2R_USE_VCPKG=ON but sqlite3/fmt not found. Run ./bootstrap-vcpkg.sh.")
+    endif()
+
+    if(D2R_BUILD_TESTS)
+        find_package(Catch2 3 CONFIG QUIET)
+        if(Catch2_FOUND)
+            enable_testing()
+            add_subdirectory(tests)
+        else()
+            message(WARNING "d2rsave: Catch2 not found; tests disabled.")
+        endif()
+    endif()
+endif()

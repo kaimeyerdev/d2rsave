@@ -1,0 +1,12 @@
+{
+  "name": "d2rsave",
+  "version-string": "0.1.0",
+  "dependencies": [
+    "sqlite3",
+    "fmt",
+    {
+      "name": "catch2",
+      "features": []
+    }
+  ]
+}

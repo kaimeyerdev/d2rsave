@@ -1,0 +1,17 @@
+00_schema.sql
+01_itemstatcost.sql
+02_properties.sql
+03_runes.sql
+04_gems.sql
+05_armor.sql
+06_weapons.sql
+07_misc.sql
+08_uniqueitems.sql
+09_setitems.sql
+10_sets.sql
+11_magicprefix.sql
+12_magicsuffix.sql
+13_rareprefix.sql
+14_raresuffix.sql
+15_hireling.sql
+16_item_names.sql
