@@ -93,23 +93,28 @@ int usage(const char* prog) {
         "                               Rows sorted alphabetically by name;\n"
         "                               duplicates preserved.\n"
 #if D2R_ENABLE_RUNEWORDS_WIP
-        "  chronicle [--uniques] [--sets] [--runewords] [--full | --query STR ...]\n"
+        "  chronicle [--uniques] [--sets] [--runewords]\n"
 #else
-        "  chronicle [--uniques] [--sets] [--full | --query STR ...]\n"
+        "  chronicle [--uniques] [--sets]\n"
 #endif
+        "            [--remaining] [--discovered]\n"
+        "            [--tier-normal] [--tier-exceptional] [--tier-elite]\n"
+        "            [--query STR ...]\n"
         "                               Chronicle progress + item lists.\n"
         "                               Category selectors restrict the report;\n"
         "                               with none, all available categories are\n"
-        "                               shown. Without --full or --query only\n"
-        "                               items you have NOT yet chronicled are\n"
-        "                               listed. --full prints every item with a\n"
-        "                               [X]/[ ] found marker. --query filters to\n"
-        "                               items whose base/display/set name\n"
-        "                               contains any of the supplied strings\n"
-        "                               (case-insensitive substring); --query\n"
-        "                               consumes ALL remaining arguments so it\n"
-        "                               must come last. --full and --query are\n"
-        "                               mutually exclusive.\n"
+        "                               shown. --remaining shows items NOT yet\n"
+        "                               chronicled; --discovered shows those\n"
+        "                               already chronicled. Neither, or both,\n"
+        "                               shows every item with a [X]/[ ] marker.\n"
+        "                               --tier-* restricts by base-item tier\n"
+        "                               (misc items and runewords have no tier\n"
+        "                               and are suppressed whenever a tier\n"
+        "                               filter is active). --query STR ...\n"
+        "                               is a case-insensitive substring filter\n"
+        "                               over item name / base type / set name;\n"
+        "                               it consumes ALL remaining arguments so\n"
+        "                               it must come last.\n"
 #if !D2R_ENABLE_RUNEWORDS_WIP
         "                               Runewords are compiled out (build with\n"
         "                               -DD2R_ENABLE_RUNEWORDS_WIP=ON to enable).\n"
@@ -667,13 +672,15 @@ int cmdItems(const std::filesystem::path& exePath,
 
 namespace {
 
-// How the chronicle command formats its item lists.
-//   Default -- print only items not yet chronicled ("remaining").
-//   Full    -- print every collectable item with a [X]/[ ] found marker.
-//   Query   -- print items whose base/display/set name substring-matches
-//              any of the caller-supplied query strings; also with a
-//              [X]/[ ] found marker.
-enum class ChronicleMode { Default, Full, Query };
+// The chronicle command shows two axes of items:
+//   showRemaining  -- items not yet chronicled ("undiscovered", per D2R).
+//   showDiscovered -- items already in the chronicle.
+// Neither flag set -> both true (default is "show the entire list").
+// A query is an additional case-insensitive substring filter that matches
+// on the item's display name AND its base type (for sets, also the set
+// name). A tier filter restricts by base-item tier (normal/exceptional/
+// elite); runewords and misc bases have no tier so those categories are
+// suppressed when any --tier-* is active.
 
 } // namespace
 
@@ -681,7 +688,8 @@ int cmdChronicle(const std::filesystem::path& exePath,
                  const std::string& stashPath,
                  const std::string& scanDir,
                  bool showUniques, bool showSets, bool showRunewords,
-                 ChronicleMode mode,
+                 bool showRemaining, bool showDiscovered,
+                 const TierFilter& tf,
                  const std::vector<std::string>& queries) {
     const auto dbPath = d2r::findReferenceDb(exePath);
     if (!dbPath) { std::fprintf(stderr, "error: reference DB not found\n"); return 1; }
@@ -854,6 +862,61 @@ int cmdChronicle(const std::filesystem::path& exePath,
         "  ON b.code = t.{code_col} "
         " LEFT JOIN item_names inm ON inm.\"key\" = b.namestr ";
 
+    // Precompute base-item tier for filtering (armor + weapons only; misc
+    // bases have no tier). Runewords and misc-based items are suppressed
+    // when a tier filter is active.
+    std::unordered_map<std::string, ItemTier> tierByCode;
+    if (tf.active()) {
+        auto st = db.prepare(
+            "SELECT code, normcode, ubercode, ultracode FROM armor "
+            "UNION ALL "
+            "SELECT code, normcode, ubercode, ultracode FROM weapons");
+        while (st.step()) {
+            const auto code = st.columnText(0);
+            const auto norm = st.columnText(1);
+            const auto uber = st.columnText(2);
+            const auto ultra = st.columnText(3);
+            if (code.empty()) continue;
+            ItemTier t = ItemTier::None;
+            if      (code == norm)  t = ItemTier::Normal;
+            else if (code == uber)  t = ItemTier::Exceptional;
+            else if (code == ultra) t = ItemTier::Elite;
+            tierByCode.emplace(code, t);
+        }
+    }
+    auto tierAllows = [&](std::string_view baseCode) {
+        if (!tf.active()) return true;
+        if (baseCode.empty()) return false;
+        auto it = tierByCode.find(std::string(baseCode));
+        if (it == tierByCode.end()) return false;
+        return tf.allows(it->second);
+    };
+
+    // Mode word (Remaining/Discovered/All) plus a formatted query clause
+    // shared by all three section headers.
+    const bool showBoth  = showRemaining && showDiscovered;
+    const char* modeWord = showBoth ? "All"
+                                    : (showRemaining ? "Remaining" : "Discovered");
+    auto queryClause = queries.empty() ? std::string()
+                                       : " matching " + quoteQueries(queries);
+    auto tierClause = [&]() -> std::string {
+        if (!tf.active()) return {};
+        static constexpr std::pair<ItemTier, const char*> kNames[] = {
+            {ItemTier::Normal,      "normal"},
+            {ItemTier::Exceptional, "exceptional"},
+            {ItemTier::Elite,       "elite"},
+        };
+        std::string out = "; tier: ";
+        bool first = true;
+        for (const auto& [t, name] : kNames) {
+            if (!tf.allows(t)) continue;
+            if (!first) out += ", ";
+            first = false;
+            out += name;
+        }
+        return out;
+    };
+
     auto dumpItems = [&](const char* label, const char* table,
                          const char* code_col,
                          const std::unordered_set<std::uint32_t>& found) {
@@ -865,8 +928,9 @@ int cmdChronicle(const std::filesystem::path& exePath,
         std::string sql =
             "SELECT t.id, "
             "       COALESCE(inm_idx.en_us, t.\"index\") AS display_name, "
-            "       COALESCE(inm.en_us, b.name)         AS base_name "
-            "FROM ";
+            "       COALESCE(inm.en_us, b.name)         AS base_name, "
+            "       t.\"";
+        sql.append(code_col).append("\" AS base_code FROM ");
         sql.append(table).append(" t ").append(join).append(
             " LEFT JOIN item_names inm_idx ON inm_idx.\"key\" = t.\"index\" "
             "WHERE t.id IS NOT NULL AND t.id != '' "
@@ -888,6 +952,7 @@ int cmdChronicle(const std::filesystem::path& exePath,
         };
         std::vector<Row> shown;
         std::size_t      foundCount = 0;
+        std::size_t      totalCollectable = 0;
 
         auto st = db.prepare(sql);
         while (st.step()) {
@@ -896,44 +961,34 @@ int cmdChronicle(const std::filesystem::path& exePath,
             r.display = st.columnText(1);
             r.base    = st.columnText(2);
             r.have    = found.contains(r.id);
+            const auto baseCode = st.columnText(3);
 
-            bool include = false;
-            switch (mode) {
-                case ChronicleMode::Default: include = !r.have; break;
-                case ChronicleMode::Full:    include = true;    break;
-                case ChronicleMode::Query:
-                    include = containsAnyCI(r.display, queries)
-                           || containsAnyCI(r.base,    queries);
-                    break;
+            if (!tierAllows(baseCode))                       continue;
+            if (r.have  && !showDiscovered)                  continue;
+            if (!r.have && !showRemaining)                   continue;
+            if (!queries.empty()) {
+                const bool hit = containsAnyCI(r.display, queries)
+                              || containsAnyCI(r.base,    queries);
+                if (!hit) continue;
             }
-            if (!include) continue;
+            ++totalCollectable;
             if (r.have) ++foundCount;
             shown.push_back(std::move(r));
         }
 
-        switch (mode) {
-            case ChronicleMode::Default:
-                std::printf("\n=== Remaining %s Items (%zu) ===\n",
-                            label, shown.size());
-                break;
-            case ChronicleMode::Full:
-                std::printf("\n=== All %s Items (%zu/%zu found) ===\n",
-                            label, foundCount, shown.size());
-                break;
-            case ChronicleMode::Query:
-                std::printf("\n=== %s Items matching %s (%zu/%zu found) ===\n",
-                            label, quoteQueries(queries).c_str(),
-                            foundCount, shown.size());
-                break;
-        }
+        // Header. When both remaining and discovered are shown, we print
+        // "F/T found" (matches the pre-change --full output); otherwise a
+        // single count of the surviving rows.
+        std::printf("\n=== %s %s Items%s (", modeWord, label, queryClause.c_str());
+        if (showBoth) std::printf("%zu/%zu found", foundCount, shown.size());
+        else          std::printf("%zu", shown.size());
+        std::printf("%s) ===\n", tierClause().c_str());
         for (const auto& r : shown) {
             const auto line = formatItem(r.display, r.base);
-            if (mode == ChronicleMode::Default) {
-                std::printf("  %s\n", line.c_str());
-            } else {
-                std::printf("  [%c] %s\n", r.have ? 'X' : ' ', line.c_str());
-            }
+            if (showBoth) std::printf("  [%c] %s\n", r.have ? 'X' : ' ', line.c_str());
+            else          std::printf("  %s\n", line.c_str());
         }
+        (void) totalCollectable;
     };
 
     if (showUniques) {
@@ -949,7 +1004,8 @@ int cmdChronicle(const std::filesystem::path& exePath,
             "SELECT COALESCE(inm_set.en_us, t.\"set\")   AS set_name, "
             "       t.id, "
             "       COALESCE(inm_idx.en_us, t.\"index\") AS display_name, "
-            "       COALESCE(inm_base.en_us, b.name)     AS base_name "
+            "       COALESCE(inm_base.en_us, b.name)     AS base_name, "
+            "       t.item                               AS base_code "
             "FROM setitems t "
             "LEFT JOIN (SELECT code, name, namestr, quest FROM armor "
             "           UNION ALL SELECT code, name, namestr, quest FROM weapons "
@@ -980,47 +1036,33 @@ int cmdChronicle(const std::filesystem::path& exePath,
             r.display = st.columnText(2);
             r.base    = st.columnText(3);
             r.have    = foundSetIds.contains(r.id);
+            const auto baseCode = st.columnText(4);
 
-            bool include = false;
-            switch (mode) {
-                case ChronicleMode::Default: include = !r.have; break;
-                case ChronicleMode::Full:    include = true;    break;
-                case ChronicleMode::Query:
-                    include = containsAnyCI(setName,   queries)
-                           || containsAnyCI(r.display, queries)
-                           || containsAnyCI(r.base,    queries);
-                    break;
+            if (!tierAllows(baseCode))                       continue;
+            if (r.have  && !showDiscovered)                  continue;
+            if (!r.have && !showRemaining)                   continue;
+            if (!queries.empty()) {
+                const bool hit = containsAnyCI(setName,   queries)
+                              || containsAnyCI(r.display, queries)
+                              || containsAnyCI(r.base,    queries);
+                if (!hit) continue;
             }
-            if (!include) continue;
             if (r.have) ++foundCount;
             ++totalShown;
             shownBySet[setName].push_back(std::move(r));
         }
 
-        switch (mode) {
-            case ChronicleMode::Default:
-                std::printf("\n=== Remaining Set Items (%zu) ===\n", totalShown);
-                break;
-            case ChronicleMode::Full:
-                std::printf("\n=== All Set Items (%zu/%zu found) ===\n",
-                            foundCount, totalShown);
-                break;
-            case ChronicleMode::Query:
-                std::printf("\n=== Set Items matching %s (%zu/%zu found) ===\n",
-                            quoteQueries(queries).c_str(),
-                            foundCount, totalShown);
-                break;
-        }
+        std::printf("\n=== %s Set Items%s (", modeWord, queryClause.c_str());
+        if (showBoth) std::printf("%zu/%zu found", foundCount, totalShown);
+        else          std::printf("%zu", totalShown);
+        std::printf("%s) ===\n", tierClause().c_str());
         for (const auto& [setName, items] : shownBySet) {
             std::printf("  %s\n", setName.c_str());
             for (const auto& r : items) {
                 const auto line = formatItem(r.display, r.base);
-                if (mode == ChronicleMode::Default) {
-                    std::printf("      %s\n", line.c_str());
-                } else {
-                    std::printf("      [%c] %s\n",
-                                r.have ? 'X' : ' ', line.c_str());
-                }
+                if (showBoth) std::printf("      [%c] %s\n",
+                                          r.have ? 'X' : ' ', line.c_str());
+                else          std::printf("      %s\n", line.c_str());
             }
         }
     }
@@ -1028,9 +1070,12 @@ int cmdChronicle(const std::filesystem::path& exePath,
 #if D2R_ENABLE_RUNEWORDS_WIP
     // Runewords are a work-in-progress: the chronicle stores a numeric itemId
     // whose meaning comes from D2R's item-runes.json string-table (not in our
-    // snapshot), so we cannot say WHICH runewords are still missing -- just
-    // how many. Per-runeword state is displayed as [?] in Full/Query modes.
-    if (showRunewords) {
+    // snapshot), so we cannot map individual entries to per-runeword state.
+    // As a consequence:
+    //   - --tier-* filters suppress the section entirely (no base to check).
+    //   - --remaining/--discovered alone can't be honoured; we skip the
+    //     section unless the caller wants both (the default).
+    if (showRunewords && !tf.active() && showRemaining && showDiscovered) {
         auto st = db.prepare(
             "SELECT COALESCE(inm.en_us, rune_name) AS display_name "
             "FROM runes "
@@ -1043,43 +1088,18 @@ int cmdChronicle(const std::filesystem::path& exePath,
 
         std::vector<std::string> shown;
         for (const auto& rw : allRunewords) {
-            bool include = false;
-            switch (mode) {
-                case ChronicleMode::Default: include = true; break;
-                case ChronicleMode::Full:    include = true; break;
-                case ChronicleMode::Query:
-                    include = containsAnyCI(rw, queries);
-                    break;
-            }
-            if (include) shown.push_back(rw);
+            if (!queries.empty() && !containsAnyCI(rw, queries)) continue;
+            shown.push_back(rw);
         }
 
-        switch (mode) {
-            case ChronicleMode::Default:
-                std::printf("\n=== Remaining Runewords (%zu) ===\n",
-                            allRunewords.size() - chron.runewords.size());
-                std::printf("(chronicle records %zu of %zu; per-runeword found/missing\n"
-                            " mapping requires D2R's item-runes.json string-table extract\n"
-                            " which is not currently loaded)\n",
-                            chron.runewords.size(), allRunewords.size());
-                break;
-            case ChronicleMode::Full:
-                std::printf("\n=== All Runewords (%zu total, %zu chronicled -- state unknown) ===\n",
-                            allRunewords.size(), chron.runewords.size());
-                break;
-            case ChronicleMode::Query:
-                std::printf("\n=== Runewords matching %s (%zu of %zu total) ===\n",
-                            quoteQueries(queries).c_str(),
-                            shown.size(), allRunewords.size());
-                break;
-        }
+        std::printf("\n=== All Runewords%s (%zu of %zu total; %zu chronicled) ===\n",
+                    queryClause.c_str(),
+                    shown.size(), allRunewords.size(), chron.runewords.size());
+        std::printf("(per-runeword found/missing mapping requires D2R's\n"
+                    " item-runes.json string-table extract which is not\n"
+                    " currently loaded; per-item state shown as [?])\n");
         for (const auto& rw : shown) {
-            const auto line = formatItem(rw, "");
-            if (mode == ChronicleMode::Default) {
-                std::printf("  %s\n", line.c_str());
-            } else {
-                std::printf("  [?] %s\n", line.c_str());
-            }
+            std::printf("  [?] %s\n", formatItem(rw, "").c_str());
         }
     }
 #else
@@ -1487,23 +1507,30 @@ int main(int argc, char** argv) {
     else if (cmd == "chronicle") { requirePath();
         // Chronicle selectors:
         //   --uniques / --sets / --runewords  category filters (any subset)
-        //   --full                            print every item with [X]/[ ]
-        //   --query STR STR ...               substring-filter every item
-        // --full and --query are mutually exclusive. --query MUST come last:
-        // every subsequent positional is consumed as a search string.
+        //   --remaining                       show items NOT yet chronicled
+        //   --discovered                      show items already chronicled
+        //   --tier-normal / -exceptional / -elite  filter by base-item tier
+        //   --query STR STR ...               substring filter (last flag;
+        //                                     consumes every remaining arg)
+        // Neither --remaining nor --discovered => show both (the entire list).
         bool showU = false, showS = false, showR = false;
-        bool full = false, sawQuery = false;
+        bool remaining = false, discovered = false, sawQuery = false;
+        TierFilter tf;
         std::vector<std::string> queries;
         for (std::size_t i = 1; i < positional.size(); ++i) {
             const auto a = positional[i];
             if (sawQuery) { queries.emplace_back(a); continue; }
-            if      (a == "--uniques")   showU = true;
-            else if (a == "--sets")      showS = true;
+            if      (a == "--uniques")     showU = true;
+            else if (a == "--sets")        showS = true;
 #if D2R_ENABLE_RUNEWORDS_WIP
-            else if (a == "--runewords") showR = true;
+            else if (a == "--runewords")   showR = true;
 #endif
-            else if (a == "--full")      full = true;
-            else if (a == "--query")     sawQuery = true;
+            else if (a == "--remaining")   remaining = true;
+            else if (a == "--discovered")  discovered = true;
+            else if (tryConsumeTierFlag(a, tf)) {
+                // Enabled inside the helper.
+            }
+            else if (a == "--query")       sawQuery = true;
             else {
                 std::fprintf(stderr,
                     "error: 'chronicle' does not accept '%.*s' (allowed: "
@@ -1511,24 +1538,20 @@ int main(int argc, char** argv) {
 #if D2R_ENABLE_RUNEWORDS_WIP
                     ", --runewords"
 #endif
-                    ", --full, --query)\n",
+                    ", --remaining, --discovered, "
+                    "--tier-normal, --tier-exceptional, --tier-elite, --query)\n",
                     static_cast<int>(a.size()), a.data());
                 return 2;
             }
-        }
-        if (full && sawQuery) {
-            std::fprintf(stderr,
-                "error: 'chronicle --full' and '--query' are mutually exclusive\n");
-            return 2;
         }
         if (sawQuery && queries.empty()) {
             std::fprintf(stderr,
                 "error: '--query' requires at least one search string\n");
             return 2;
         }
-        ChronicleMode mode = ChronicleMode::Default;
-        if (full)          mode = ChronicleMode::Full;
-        else if (sawQuery) mode = ChronicleMode::Query;
+        // Absence of both --remaining and --discovered means "show the
+        // entire list" -- same output as passing both explicitly.
+        if (!remaining && !discovered) { remaining = discovered = true; }
 
         if (!showU && !showS && !showR) {
             showU = showS = true;
@@ -1537,9 +1560,10 @@ int main(int argc, char** argv) {
 #endif
         }
         runCommand = [exe = std::string(argv[0]), sp = savePath.string(),
-                      showU, showS, showR, mode, queries]{
+                      showU, showS, showR, remaining, discovered, tf, queries]{
             return cmdChronicle(exe, findStashFile(sp).string(), sp,
-                                showU, showS, showR, mode, queries);
+                                showU, showS, showR,
+                                remaining, discovered, tf, queries);
         };
     }
     else if (cmd == "reconcile") { requirePath(); requireArgs(0);
