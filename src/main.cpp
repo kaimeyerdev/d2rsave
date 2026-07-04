@@ -12,10 +12,13 @@
 #include "d2r/CharacterParser.hpp"
 
 #include <charconv>
+#include <chrono>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <filesystem>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <span>
@@ -32,17 +35,28 @@
 #include "d2r/SunderCharms.hpp"
 #endif
 
+#if D2R_HAVE_INOTIFY
+#include "d2r/Watcher.hpp"
+#endif
+
 namespace {
 
 int usage(const char* prog) {
     std::fprintf(stderr,
-        "Usage: %s [--path <dir>] [--reference-db <path>] <command> <args...>\n"
+        "Usage: %s [--path <dir>] [--reference-db <path>] [--watch] <command> <args...>\n"
         "\n"
         "Global flags:\n"
         "  --path <dir>              Directory containing D2R save files (.d2s, .d2i).\n"
         "                            Required for every command except 'db-info'.\n"
         "                            Character names below resolve to <dir>/<name>.d2s.\n"
         "  --reference-db <path>     Override the reference SQLite DB location.\n"
+#if D2R_HAVE_INOTIFY
+        "  --watch                   Re-run the command whenever a file in --path\n"
+        "                            changes. Available for read-only commands only.\n"
+        "                            Ctrl-C to exit.\n"
+#else
+        "  --watch                   (unavailable: this build has no inotify support)\n"
+#endif
         "\n"
         "Character commands (<name> is the file stem, e.g. Kai for Kai.d2s):\n"
         "  verify   <name>              Print header info, name, seed, and checksum status.\n"
@@ -849,12 +863,15 @@ int main(int argc, char** argv) {
     std::vector<std::string_view> positional;
     std::filesystem::path savePath;
     std::string_view referenceDbOverride;
+    bool watchRequested = false;
     for (int i = 1; i < argc; ++i) {
         const std::string_view a = argv[i];
         if (a == "--path" && i + 1 < argc) {
             savePath = argv[++i];
         } else if (a == "--reference-db" && i + 1 < argc) {
             referenceDbOverride = argv[++i];
+        } else if (a == "--watch") {
+            watchRequested = true;
         } else if (a == "-h" || a == "--help") {
             usage(argv[0]);
             return 0;
@@ -865,7 +882,6 @@ int main(int argc, char** argv) {
     if (positional.empty()) return usage(argv[0]);
     const auto cmd = positional[0];
 
-    // Every command below except db-info requires --path.
     auto requirePath = [&]() {
         if (savePath.empty()) {
             std::fprintf(stderr,
@@ -880,7 +896,6 @@ int main(int argc, char** argv) {
             std::exit(2);
         }
     };
-    // Character-command helper: exactly N args after the command name.
     auto requireArgs = [&](std::size_t need) {
         if (positional.size() - 1 != need) {
             std::fprintf(stderr,
@@ -891,41 +906,101 @@ int main(int argc, char** argv) {
         }
     };
 
-    try {
-        if (cmd == "verify")   { requirePath(); requireArgs(1);
-            return cmdVerify  (resolveCharacter(savePath, positional[1]).string()); }
-        if (cmd == "checksum") { requirePath(); requireArgs(1);
-            return cmdChecksum(resolveCharacter(savePath, positional[1]).string()); }
-        if (cmd == "rename")   { requirePath(); requireArgs(2);
-            return cmdRename  (resolveCharacter(savePath, positional[1]).string(),
-                               positional[2]); }
-        if (cmd == "set-seed") { requirePath(); requireArgs(2);
-            return cmdSetSeed (resolveCharacter(savePath, positional[1]).string(),
-                               positional[2]); }
-        if (cmd == "dump")     { requirePath(); requireArgs(1);
-            return cmdDump    (resolveCharacter(savePath, positional[1]).string()); }
+    // Build a re-runnable callable for the subcommand so --watch can invoke
+    // it repeatedly. If the command isn't watch-compatible we bail early.
+    std::function<int()> runCommand;
+    bool watchCompatible = true;
+
+    if (cmd == "verify")   { requirePath(); requireArgs(1);
+        runCommand = [p = resolveCharacter(savePath, positional[1]).string()]{ return cmdVerify(p); }; }
+    else if (cmd == "checksum") { requirePath(); requireArgs(1); watchCompatible = false;
+        runCommand = [p = resolveCharacter(savePath, positional[1]).string()]{ return cmdChecksum(p); }; }
+    else if (cmd == "rename")   { requirePath(); requireArgs(2); watchCompatible = false;
+        runCommand = [p = resolveCharacter(savePath, positional[1]).string(),
+                      n = std::string(positional[2])]{ return cmdRename(p, n); }; }
+    else if (cmd == "set-seed") { requirePath(); requireArgs(2); watchCompatible = false;
+        runCommand = [p = resolveCharacter(savePath, positional[1]).string(),
+                      s = std::string(positional[2])]{ return cmdSetSeed(p, s); }; }
+    else if (cmd == "dump")     { requirePath(); requireArgs(1);
+        runCommand = [p = resolveCharacter(savePath, positional[1]).string()]{ return cmdDump(p); }; }
 #if D2R_HAVE_SQLITE
-        if (cmd == "items")    { requirePath(); requireArgs(1);
-            return cmdItems   (argv[0],
-                               resolveCharacter(savePath, positional[1]).string()); }
-        if (cmd == "chronicle") { requirePath(); requireArgs(0);
-            return cmdChronicle(argv[0],
-                                findStashFile(savePath).string(),
-                                savePath.string()); }
-        if (cmd == "reconcile") { requirePath(); requireArgs(0);
-            return cmdReconcile(argv[0],
-                                findStashFile(savePath).string(),
-                                savePath.string()); }
-        if (cmd == "db-info") {
-            return cmdDbInfo(argv[0], referenceDbOverride);
-        }
+    else if (cmd == "items")     { requirePath(); requireArgs(1);
+        runCommand = [exe = std::string(argv[0]),
+                      p = resolveCharacter(savePath, positional[1]).string()]{ return cmdItems(exe, p); }; }
+    else if (cmd == "chronicle") { requirePath(); requireArgs(0);
+        runCommand = [exe = std::string(argv[0]), sp = savePath.string()]{
+            return cmdChronicle(exe, findStashFile(sp).string(), sp);
+        }; }
+    else if (cmd == "reconcile") { requirePath(); requireArgs(0);
+        runCommand = [exe = std::string(argv[0]), sp = savePath.string()]{
+            return cmdReconcile(exe, findStashFile(sp).string(), sp);
+        }; }
+    else if (cmd == "db-info") {
+        watchCompatible = false;
+        runCommand = [exe = std::string(argv[0]), r = std::string(referenceDbOverride)]{
+            return cmdDbInfo(exe, r);
+        };
+    }
 #endif
+    else {
+        std::fprintf(stderr, "error: unknown command '%.*s'\n\n",
+                     static_cast<int>(cmd.size()), cmd.data());
+        return usage(argv[0]);
+    }
+
+    // Non-watch path: run once and exit.
+    if (!watchRequested) {
+        try { return runCommand(); }
+        catch (const std::exception& ex) {
+            std::fprintf(stderr, "error: %s\n", ex.what());
+            return 1;
+        }
+    }
+
+#if !D2R_HAVE_INOTIFY
+    std::fprintf(stderr,
+        "error: --watch is unavailable on this build (no inotify support was\n"
+        "       detected at CMake configure time).\n");
+    return 2;
+#else
+    if (!watchCompatible) {
+        std::fprintf(stderr,
+            "error: '%.*s' modifies save files; combining it with --watch\n"
+            "       would trigger the watcher on its own write and loop.\n",
+            static_cast<int>(cmd.size()), cmd.data());
+        return 2;
+    }
+
+    // --watch loop. SIGINT interrupts the blocking read() inside the watcher
+    // so the whole thing exits gracefully on Ctrl-C.
+    struct sigaction sa{};
+    sa.sa_handler = [](int){};   // Empty handler: just wake up read() with EINTR.
+    sa.sa_flags   = 0;           // Deliberately no SA_RESTART.
+    ::sigaction(SIGINT,  &sa, nullptr);
+    ::sigaction(SIGTERM, &sa, nullptr);
+
+    std::fprintf(stderr, "[watch] %s in %s (Ctrl-C to exit)\n",
+                 std::string(cmd).c_str(), savePath.c_str());
+    try {
+        (void) runCommand();  // Initial run.
+        d2r::DirectoryWatcher watcher(savePath);
+        while (watcher.waitForChange()) {
+            char stamp[32] = {};
+            const std::time_t now = std::time(nullptr);
+            std::strftime(stamp, sizeof(stamp), "%H:%M:%S", std::localtime(&now));
+            std::fprintf(stderr, "\n[watch] %s -- change detected, re-running '%.*s'\n"
+                                 "----------------------------------------------------\n",
+                         stamp, static_cast<int>(cmd.size()), cmd.data());
+            try { (void) runCommand(); }
+            catch (const std::exception& ex) {
+                std::fprintf(stderr, "[watch] error: %s\n", ex.what());
+            }
+        }
+        std::fprintf(stderr, "\n[watch] exiting\n");
+        return 0;
     } catch (const std::exception& ex) {
         std::fprintf(stderr, "error: %s\n", ex.what());
         return 1;
     }
-
-    std::fprintf(stderr, "error: unknown command '%.*s'\n\n",
-                 static_cast<int>(cmd.size()), cmd.data());
-    return usage(argv[0]);
+#endif
 }

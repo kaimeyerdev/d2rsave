@@ -19,6 +19,12 @@ endif()
 add_compile_options(-Wall -Wextra -Wpedantic)
 
 # ---------------------------------------------------------------------------
+# Optional platform features (probe for inotify to enable --watch on Linux).
+# ---------------------------------------------------------------------------
+include(CheckIncludeFileCXX)
+check_include_file_cxx(sys/inotify.h D2R_HAVE_INOTIFY)
+
+# ---------------------------------------------------------------------------
 # Core library + CLI (no external deps).
 # ---------------------------------------------------------------------------
 add_library(d2rsave_core STATIC
@@ -28,6 +34,11 @@ add_library(d2rsave_core STATIC
 )
 target_include_directories(d2rsave_core PUBLIC include)
 target_compile_features(d2rsave_core PUBLIC cxx_std_20)
+
+if(D2R_HAVE_INOTIFY)
+    target_sources(d2rsave_core PRIVATE src/watcher_inotify.cpp)
+    target_compile_definitions(d2rsave_core PUBLIC D2R_HAVE_INOTIFY=1)
+endif()
 
 add_executable(d2rsave src/main.cpp)
 target_link_libraries(d2rsave PRIVATE d2rsave_core)
