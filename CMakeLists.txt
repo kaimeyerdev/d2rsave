@@ -12,6 +12,15 @@ option(D2R_USE_VCPKG "Enable features that need vcpkg deps (sqlite3, catch2, fmt
 option(D2R_BUILD_LEGACY "Build the legacy rename_d2r C tool for regression testing" ON)
 option(D2R_BUILD_TESTS "Build unit tests (needs D2R_USE_VCPKG=ON)" ${D2R_USE_VCPKG})
 
+# Runewords in the chronicle report are a work-in-progress: we can count how
+# many the account has chronicled but can't map each chronicle entry back to
+# its runeword name without a D2R item-runes.json string-table extract that
+# we don't currently ship. The feature is compiled out by default; opt in
+# with -DD2R_ENABLE_RUNEWORDS_WIP=ON when experimenting.
+option(D2R_ENABLE_RUNEWORDS_WIP
+       "Include runewords in the chronicle report (WIP; name mapping missing)"
+       OFF)
+
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Debug CACHE STRING "" FORCE)
 endif()
@@ -34,6 +43,10 @@ add_library(d2rsave_core STATIC
 )
 target_include_directories(d2rsave_core PUBLIC include)
 target_compile_features(d2rsave_core PUBLIC cxx_std_20)
+
+if(D2R_ENABLE_RUNEWORDS_WIP)
+    target_compile_definitions(d2rsave_core PUBLIC D2R_ENABLE_RUNEWORDS_WIP=1)
+endif()
 
 if(D2R_HAVE_INOTIFY)
     target_sources(d2rsave_core PRIVATE src/watcher_inotify.cpp)

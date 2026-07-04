@@ -70,10 +70,19 @@ int usage(const char* prog) {
         "  items    <name>              List every item on the character.\n"
         "\n"
         "Account commands (auto-discovers stash + scans every .d2s in --path):\n"
+#if D2R_ENABLE_RUNEWORDS_WIP
         "  chronicle [--uniques] [--sets] [--runewords]\n"
         "                               Chronicle progress + missing items.\n"
-        "                               Selector flags restrict to those categories;\n"
+        "                               Selectors restrict to those categories;\n"
         "                               with none, all three are shown.\n"
+#else
+        "  chronicle [--uniques] [--sets]\n"
+        "                               Chronicle progress + missing items.\n"
+        "                               Selectors restrict to those categories;\n"
+        "                               with none, both are shown. Runewords\n"
+        "                               are compiled out (build with\n"
+        "                               -DD2R_ENABLE_RUNEWORDS_WIP=ON to enable).\n"
+#endif
         "  reconcile                    Diff owned uniques/sets against the chronicle.\n"
         "\n"
         "Diagnostic commands:\n"
@@ -324,14 +333,12 @@ int cmdChronicle(const std::filesystem::path& exePath,
     d2r::RefDb db(*dbPath);
     db.loadItemTables();
 
-    // 1) Load the shared-stash chronicle tab.
+    // 1) Load the shared-stash chronicle tab. No stdout status here -- the
+    // interesting summary lives in the "coverage" block below.
     const auto stashBytes = d2r::readFile(stashPath);
     d2r::SharedStashParser stashParser(db);
     const auto chron = stashParser.parseChronicleOnly(stashBytes);
-    std::printf("stash: %s\n", stashPath.c_str());
-    std::printf("  chronicle set items found:  %zu\n", chron.setItems.size());
-    std::printf("  chronicle uniques found:    %zu\n", chron.uniques.size());
-    std::printf("  chronicle runewords found:  %zu\n", chron.runewords.size());
+    (void) showRunewords; // referenced below only when the WIP macro is set
 
     // Collect the found IDs, keyed by quality.
     std::unordered_set<std::uint32_t> foundUniqueIds, foundSetIds;
@@ -397,15 +404,8 @@ int cmdChronicle(const std::filesystem::path& exePath,
                              entry.path().filename().c_str(), ex.what());
             }
         }
-        std::printf("scan:  %s (%zu bit-29 chronicle items across all .d2s)\n",
-                    scanDir.c_str(), bit29Items.size());
-        for (const auto& b : bit29Items) {
-            std::printf("       %s  quality=%.*s  id=%u  %s\n",
-                        b.source.c_str(),
-                        static_cast<int>(d2r::toString(b.quality).size()),
-                        d2r::toString(b.quality).data(),
-                        b.id, b.name.c_str());
-        }
+        // The bit-29 count is a diagnostic; it only appears when there's a
+        // mismatch further below (see "not represented in shared stash").
     }
 
     // 3) Cross-check against the collectable catalog. Filter out section-header
@@ -499,7 +499,7 @@ int cmdChronicle(const std::filesystem::path& exePath,
         "  ON b.code = t.{code_col} "
         " LEFT JOIN item_names inm ON inm.\"key\" = b.namestr ";
 
-    auto dumpMissing = [&](const char* header, const char* table,
+    auto dumpMissing = [&](const char* label, const char* table,
                            const char* code_col,
                            const std::unordered_set<std::uint32_t>& found,
                            std::int64_t /*totalCollectable*/) {
@@ -526,35 +526,30 @@ int cmdChronicle(const std::filesystem::path& exePath,
         }
         sql += "ORDER BY base_name COLLATE NOCASE, t.\"index\" COLLATE NOCASE";
 
+        // Collect first so we can print the section header with the count.
+        struct Row { std::uint32_t id; std::string display; std::string base; };
+        std::vector<Row> missing;
         auto st = db.prepare(sql);
-        std::size_t shown = 0;
-        std::size_t total = 0;
-        std::printf("\n== %s ==\n", header);
         while (st.step()) {
-            ++total;
             const auto id       = static_cast<std::uint32_t>(st.columnInt64(0));
-            const auto index    = st.columnText(1);
-            const auto baseName = st.columnText(2);
             if (found.contains(id)) continue;
-            std::printf("  %-24s  [#%u %s]\n",
-                        baseName.empty() ? "?" : baseName.c_str(),
-                        id, index.c_str());
-            ++shown;
+            missing.push_back({id, st.columnText(1), st.columnText(2)});
         }
-        // 'total' below is the collectable count AFTER quest filter; use that
-        // rather than the pre-filter total so the arithmetic matches the list.
-        std::printf("  ... %zu missing of %zu collectable\n", shown, total);
+        std::printf("\n=== Remaining %s Items (%zu) ===\n", label, missing.size());
+        for (const auto& r : missing) {
+            std::printf("  %-24s  [#%u %s]\n",
+                        r.base.empty() ? "?" : r.base.c_str(),
+                        r.id, r.display.c_str());
+        }
     };
 
     if (showUniques) {
-        dumpMissing("not yet found (uniques, sorted by base type)",
-                    "uniqueitems", "code",  foundUniqueIds, totalUniques);
+        dumpMissing("Unique", "uniqueitems", "code", foundUniqueIds, totalUniques);
     }
 
-    // Missing set items: nested by parent set. The in-game chronicle shows an
-    // alphabetically-sorted list of set names; each set expands to its
-    // constituent items (also alphabetised). Only sets with at least one
-    // missing item are printed.
+    // Missing set items: nested by parent set. Only sets with at least one
+    // missing item are printed. The count in the section header is the number
+    // of missing set items (matches the uniques convention).
     if (showSets) {
         auto st = db.prepare(
             "SELECT COALESCE(inm_set.en_us, t.\"set\")   AS set_name, "
@@ -587,26 +582,28 @@ int cmdChronicle(const std::filesystem::path& exePath,
             missingBySet[setName].emplace_back(baseName, id, display);
         }
 
-        std::printf("\n== not yet found (sets, grouped by set) ==\n");
+        // Precompute the total missing count so the section header can
+        // display it (matches the uniques section's convention).
         std::size_t totalMissing = 0;
+        for (const auto& [_, items] : missingBySet) totalMissing += items.size();
+
+        std::printf("\n=== Remaining Set Items (%zu) ===\n", totalMissing);
         for (const auto& [setName, items] : missingBySet) {
             std::printf("  %s\n", setName.c_str());
             for (const auto& [baseName, id, display] : items) {
                 std::printf("      %-22s  [#%u %s]\n",
                             baseName.empty() ? "?" : baseName.c_str(),
                             id, display.c_str());
-                ++totalMissing;
             }
         }
-        std::printf("  ... %zu missing of %zu collectable\n",
-                    totalMissing, totalCollectable);
     }
 
-    // Runewords. Chronicle entries store a numeric itemId whose meaning comes
-    // from D2R's item-runes.json string-table (not in our snapshot), so we
-    // cannot say WHICH runewords are still missing -- just how many. The list
-    // below enumerates every completed runeword from runes.txt as a reference
-    // for what exists in the game.
+#if D2R_ENABLE_RUNEWORDS_WIP
+    // Runewords are a work-in-progress: the chronicle stores a numeric itemId
+    // whose meaning comes from D2R's item-runes.json string-table (not in our
+    // snapshot), so we cannot say WHICH runewords are still missing -- just
+    // how many. The list below enumerates every completed runeword from
+    // runes.txt as a reference for what exists in the game.
     if (showRunewords) {
         auto st = db.prepare(
             "SELECT COALESCE(inm.en_us, rune_name) AS display_name "
@@ -618,7 +615,8 @@ int cmdChronicle(const std::filesystem::path& exePath,
         std::vector<std::string> runewords;
         while (st.step()) runewords.push_back(st.columnText(0));
 
-        std::printf("\n== all runewords (sorted alphabetically) ==\n");
+        std::printf("\n=== Remaining Runewords (%zu) ===\n",
+                    runewords.size() - chron.runewords.size());
         std::printf("(chronicle records %zu of %zu; per-runeword found/missing\n"
                     " mapping requires D2R's item-runes.json string-table extract\n"
                     " which is not currently loaded)\n",
@@ -627,6 +625,9 @@ int cmdChronicle(const std::filesystem::path& exePath,
             std::printf("  %s\n", rw.c_str());
         }
     }
+#else
+    (void) showRunewords;
+#endif
     return 0;
 }
 
@@ -964,22 +965,35 @@ int main(int argc, char** argv) {
                       p = resolveCharacter(savePath, positional[1]).string()]{ return cmdItems(exe, p); }; }
     else if (cmd == "chronicle") { requirePath();
         // Chronicle accepts --uniques / --sets / --runewords selector flags.
-        // Any other positional is an error. If none selected, show all three.
+        // (--runewords only when D2R_ENABLE_RUNEWORDS_WIP was set at build.)
+        // Any other positional is an error. With none selected, show all
+        // available categories.
         bool showU = false, showS = false, showR = false;
         for (std::size_t i = 1; i < positional.size(); ++i) {
             const auto a = positional[i];
-            if      (a == "--uniques")   showU = true;
-            else if (a == "--sets")      showS = true;
+            if      (a == "--uniques") showU = true;
+            else if (a == "--sets")    showS = true;
+#if D2R_ENABLE_RUNEWORDS_WIP
             else if (a == "--runewords") showR = true;
+#endif
             else {
                 std::fprintf(stderr,
                     "error: 'chronicle' does not accept '%.*s' (allowed: "
-                    "--uniques, --sets, --runewords)\n",
+                    "--uniques, --sets"
+#if D2R_ENABLE_RUNEWORDS_WIP
+                    ", --runewords"
+#endif
+                    ")\n",
                     static_cast<int>(a.size()), a.data());
                 return 2;
             }
         }
-        if (!showU && !showS && !showR) { showU = showS = showR = true; }
+        if (!showU && !showS && !showR) {
+            showU = showS = true;
+#if D2R_ENABLE_RUNEWORDS_WIP
+            showR = true;
+#endif
+        }
         runCommand = [exe = std::string(argv[0]), sp = savePath.string(),
                       showU, showS, showR]{
             return cmdChronicle(exe, findStashFile(sp).string(), sp,
