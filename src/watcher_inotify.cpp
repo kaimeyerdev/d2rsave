@@ -13,6 +13,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/eventfd.h>
 #include <sys/inotify.h>
 #include <thread>
 #include <unistd.h>
@@ -42,11 +43,22 @@ DirectoryWatcher::DirectoryWatcher(const std::filesystem::path& primaryDir) {
     if (fd_ < 0) {
         throw WatcherError(std::string("inotify_init1: ") + std::strerror(errno));
     }
-    primaryWd_ = ::inotify_add_watch(fd_, primaryDir.c_str(), kSaveDirMask);
-    if (primaryWd_ < 0) {
+    // Second fd for cross-thread wake-ups. `poll` sees it as readable once
+    // `shutdown()` writes to it.
+    wakeFd_ = ::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    if (wakeFd_ < 0) {
         const int e = errno;
         ::close(fd_);
         fd_ = -1;
+        throw WatcherError(std::string("eventfd: ") + std::strerror(e));
+    }
+    primaryWd_ = ::inotify_add_watch(fd_, primaryDir.c_str(), kSaveDirMask);
+    if (primaryWd_ < 0) {
+        const int e = errno;
+        ::close(wakeFd_);
+        ::close(fd_);
+        fd_ = -1;
+        wakeFd_ = -1;
         throw WatcherError("inotify_add_watch " + primaryDir.string() + ": " +
                            std::strerror(e));
     }
@@ -55,7 +67,17 @@ DirectoryWatcher::DirectoryWatcher(const std::filesystem::path& primaryDir) {
 DirectoryWatcher::~DirectoryWatcher() {
     if (primaryWd_ >= 0 && fd_ >= 0) ::inotify_rm_watch(fd_, primaryWd_);
     if (exeWd_     >= 0 && fd_ >= 0) ::inotify_rm_watch(fd_, exeWd_);
-    if (fd_ >= 0) ::close(fd_);
+    if (fd_     >= 0) ::close(fd_);
+    if (wakeFd_ >= 0) ::close(wakeFd_);
+}
+
+void DirectoryWatcher::shutdown() noexcept {
+    if (wakeFd_ < 0) return;
+    // Fire the eventfd. `poll` in the watcher thread will wake immediately;
+    // waitForChange returns nullopt. EAGAIN is fine (already signalled).
+    const std::uint64_t one = 1;
+    ssize_t r = ::write(wakeFd_, &one, sizeof(one));
+    (void) r;
 }
 
 bool DirectoryWatcher::alsoWatchExecutable(const std::filesystem::path& exePath) {
@@ -74,12 +96,27 @@ DirectoryWatcher::waitForChange(std::chrono::milliseconds debounce) {
     alignas(alignof(inotify_event)) char buf[8192];
     std::vector<char> events;
 
-    // 1. Block on a single read until the first burst of events arrives.
+    // 1. Poll on both the inotify fd and the shutdown eventfd. Whichever
+    // becomes readable first wakes us. If the eventfd fires we exit early
+    // with nullopt so the caller can join us.
+    struct pollfd pfds[2] = {
+        {fd_,     POLLIN, 0},
+        {wakeFd_, POLLIN, 0},
+    };
+    for (;;) {
+        const int pr = ::poll(pfds, 2, -1);
+        if (pr < 0 && errno == EINTR) continue;
+        if (pr < 0) return std::nullopt;
+        if (pfds[1].revents & POLLIN) return std::nullopt; // shutdown
+        if (pfds[0].revents & POLLIN) break;
+    }
+
+    // 2. Read the first burst of inotify events.
     const ssize_t first = ::read(fd_, buf, sizeof(buf));
-    if (first <= 0) return std::nullopt; // EINTR (signal) or unexpected error
+    if (first <= 0) return std::nullopt;
     events.insert(events.end(), buf, buf + first);
 
-    // 2. Debounce: pause briefly, then drain any additional events that
+    // 3. Debounce: pause briefly, then drain any additional events that
     // arrived during the window. Switch the fd non-blocking so read() will
     // return EAGAIN once the queue is empty; restore the original flags
     // afterwards so signals still interrupt future blocking reads cleanly.
@@ -98,7 +135,12 @@ DirectoryWatcher::waitForChange(std::chrono::milliseconds debounce) {
     }
     (void) ::fcntl(fd_, F_SETFL, origFlags);
 
-    // 3. Classify. Executable wins when both fire in the same window.
+    // 4. Also check the shutdown fd once more before returning a Trigger;
+    // avoids racing with a shutdown that came in during the debounce.
+    struct pollfd wake = {wakeFd_, POLLIN, 0};
+    if (::poll(&wake, 1, 0) > 0 && (wake.revents & POLLIN)) return std::nullopt;
+
+    // 5. Classify. Executable wins when both fire in the same window.
     bool sawPrimary = false;
     bool sawExe     = false;
     for (std::size_t i = 0; i + sizeof(inotify_event) <= events.size();) {

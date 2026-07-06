@@ -39,6 +39,10 @@
 #include "d2r/SunderCharms.hpp"
 #endif
 
+#if D2R_HAVE_DASHBOARD
+#include "d2r/Dashboard.hpp"
+#endif
+
 #if D2R_HAVE_INOTIFY
 #include "d2r/Watcher.hpp"
 #include <unistd.h>
@@ -126,6 +130,18 @@ int usage(const char* prog) {
 #endif
         "  reconcile                    Diff owned uniques/sets against the chronicle.\n"
         "\n"
+#if D2R_HAVE_DASHBOARD
+        "Interactive mode (mutually exclusive with --watch and the modifying\n"
+        "commands rename/set-seed/checksum):\n"
+        "  dashboard                    Launch the interactive TUI dashboard.\n"
+        "                               Panels: active player, Hellfire Torch quest,\n"
+        "                               Colossal Ancients quest, Terror Zones, and a\n"
+        "                               sortable/filterable Chronicle table. Live-\n"
+        "                               refreshes on save-file changes when inotify\n"
+        "                               support is compiled in; otherwise press `r`.\n"
+        "                               Press `?` inside the TUI for keybindings.\n"
+        "\n"
+#endif
         "Diagnostic commands:\n"
         "  db-info                      Show reference DB path and per-table row counts.\n",
         prog);
@@ -1630,6 +1646,33 @@ int main(int argc, char** argv) {
             return cmdDbInfo(exe, r);
         };
     }
+#if D2R_HAVE_DASHBOARD
+    else if (cmd == "dashboard") { requirePath(); requireArgs(0);
+        // The dashboard runs its own inotify watcher inside `runDashboard`,
+        // so the outer --watch machinery is redundant. Emit a note and
+        // fall through to the non-watch code path instead of erroring or
+        // double-watching.
+        if (watchRequested) {
+            std::fprintf(stderr,
+                "note: 'dashboard' already refreshes on save-file changes; "
+                "ignoring --watch\n");
+            watchRequested = false;
+        }
+        runCommand = [exe = std::string(argv[0]),
+                      sp  = savePath,
+                      r   = std::string(referenceDbOverride)]{
+            return d2r::runDashboard(sp, r, exe);
+        };
+    }
+#else
+    else if (cmd == "dashboard") {
+        std::fprintf(stderr,
+            "error: 'dashboard' was compiled out of this build.\n"
+            "       Install the ftxui vcpkg port and re-configure with\n"
+            "       -DD2R_USE_VCPKG=ON.\n");
+        return 2;
+    }
+#endif
 #endif
     else {
         std::fprintf(stderr, "error: unknown command '%.*s'\n\n",
@@ -1654,8 +1697,8 @@ int main(int argc, char** argv) {
 #else
     if (!watchCompatible) {
         std::fprintf(stderr,
-            "error: '%.*s' modifies save files; combining it with --watch\n"
-            "       would trigger the watcher on its own write and loop.\n",
+            "error: '%.*s' is not compatible with --watch (either it modifies\n"
+            "       save files, or it already runs its own watch loop).\n",
             static_cast<int>(cmd.size()), cmd.data());
         return 2;
     }

@@ -46,15 +46,23 @@ public:
 
     // Block until at least one relevant event arrives, then coalesce any
     // additional events within `debounce`. Returns std::nullopt when
-    // interrupted by a signal (e.g. SIGINT). When both an executable event
-    // and a primary-dir event fire in the same window, Executable wins.
+    // interrupted by a signal (e.g. SIGINT) or when `shutdown()` has been
+    // called from another thread. When both an executable event and a
+    // primary-dir event fire in the same window, Executable wins.
     [[nodiscard]] std::optional<Trigger> waitForChange(
         std::chrono::milliseconds debounce = std::chrono::milliseconds{250});
+
+    // Wake any thread currently blocked in `waitForChange` so it returns
+    // std::nullopt. Idempotent; safe to call from any thread. Once
+    // triggered, subsequent `waitForChange` calls also return immediately
+    // with nullopt (there's no way to un-shutdown a watcher).
+    void shutdown() noexcept;
 
 private:
     int fd_          = -1;
     int primaryWd_   = -1;
     int exeWd_       = -1;
+    int wakeFd_      = -1;   // eventfd for cross-thread shutdown wakes
     std::string exeBasename_;
 };
 

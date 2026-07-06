@@ -112,6 +112,33 @@ if(D2R_USE_VCPKG)
         message(WARNING "d2rsave: D2R_USE_VCPKG=ON but sqlite3/fmt not found. Run ./bootstrap-vcpkg.sh.")
     endif()
 
+    # -----------------------------------------------------------------------
+    # Optional TUI dashboard (FTXUI). Cross-platform, MIT. Depends on
+    # D2R_HAVE_SQLITE for the reference DB; also uses the inotify watcher
+    # when available for live refresh.
+    # -----------------------------------------------------------------------
+    if(D2R_FULL_STACK)
+        find_package(ftxui CONFIG QUIET)
+        if(TARGET ftxui::screen AND TARGET ftxui::dom AND TARGET ftxui::component)
+            message(STATUS "d2rsave: ftxui available; enabling 'dashboard' subcommand.")
+            target_sources(d2rsave PRIVATE
+                src/dashboard_model.cpp
+                src/dashboard_ftxui.cpp
+                src/dashboard_config.cpp
+            )
+            target_link_libraries(d2rsave PRIVATE
+                ftxui::screen ftxui::dom ftxui::component)
+            if(TARGET nlohmann_json::nlohmann_json)
+                target_link_libraries(d2rsave PRIVATE nlohmann_json::nlohmann_json)
+            else()
+                message(WARNING "d2rsave: nlohmann_json missing; dashboard config persistence disabled.")
+            endif()
+            target_compile_definitions(d2rsave PRIVATE D2R_HAVE_DASHBOARD=1)
+        else()
+            message(STATUS "d2rsave: ftxui missing; 'dashboard' subcommand disabled.")
+        endif()
+    endif()
+
     if(D2R_BUILD_TESTS)
         find_package(Catch2 3 CONFIG QUIET)
     endif()

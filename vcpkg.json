@@ -6,6 +6,7 @@
     "fmt",
     "casclib",
     "nlohmann-json",
+    "ftxui",
     {
       "name": "catch2",
       "features": []
