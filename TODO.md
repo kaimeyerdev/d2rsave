@@ -174,6 +174,43 @@ Track under this heading as we find them. Currently known:
   fine but their base-item lookup via `code` misses the "crafted"
   qualifier -- cosmetic only, doesn't affect chronicle logic.
 
+## Dashboard
+
+### Named map-seed aliases
+
+The legacy `rename_d2r` C tool exists partly to switch between a handful
+of favourite map seeds (well-rolled maps for a particular character or
+farming route). The TUI dashboard currently shows the seed as a bare
+32-bit decimal you can paste into `d2rsave set-seed`, but the number
+itself is meaningless -- you have to remember which one is "the good
+Baal seed" and which one is "the good cows seed".
+
+Desired shape:
+
+* User-editable table mapping `(name, seed)` -> label. Suggested
+  storage: a `seed_aliases` table in the existing dashboard config DB
+  (`$XDG_DATA_HOME/d2rsave/dashboard.sqlite`), keyed by seed with a
+  free-form label column. Optional character-scoped column so the
+  same seed can be labelled differently per character.
+* Active Player pane: if the current map seed has an alias in the
+  table, render `Map Seed  Cows-2A  (2839181721)` -- alias first, raw
+  number second. Fall back to the raw decimal when no alias exists.
+* Editing UI: pane-config-mode gains an entry for the Active Player
+  panel (currently no config) that opens an inline editor: type an
+  alias for the current seed, Enter to save. Or a global keybind like
+  `A` in the Active Player panel when focused.
+* CLI parity: `d2rsave seed-alias set <NAME> <SEED>` and
+  `d2rsave seed-alias list`; `d2rsave set-seed <NAME>` should accept
+  either an alias or a raw number. Sits alongside the existing
+  `set-seed`, driven from the same SQLite table.
+* Nice-to-have: on Character.d2s save events, if the character's new
+  map seed matches an existing alias, print (or badge in the TUI) the
+  alias so the user knows the current game is on a saved seed.
+
+Interaction with legacy: `rename_d2r` writes seeds directly to the
+.d2s file; the alias table is purely a UI convenience layered on top
+of `d2rsave set-seed`, so nothing about the legacy tool changes.
+
 ## Build / packaging
 
 * Add a top-level `LICENSE` file for this port. Because we vendor

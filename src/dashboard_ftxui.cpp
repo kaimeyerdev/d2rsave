@@ -159,15 +159,29 @@ Element renderActivePlayer(const DashboardSnapshot& s) {
     }();
     const auto expLine = formatWithThousands(p.expInLevel) + " / "
                        + formatWithThousands(p.expForLevel);
+
+    // Status badges: show only asymmetric conditions.
+    // - "Hardcore" appears only when true (softcore is the common case).
+    // - "Has not died" appears only when false (dying is the exceptional
+    //   permanent state on a HC or Warlock character worth flagging).
+    Elements badges;
+    if (p.hardcore) badges.push_back(text(" Hardcore ") | inverted | bold);
+    if (!p.died)    badges.push_back(text(" Has not died ") | inverted);
+    Element badgeLine = badges.empty() ? text("") : hbox(std::move(badges));
+
+    // Map seed formatted as decimal for copy/paste into `d2rsave set-seed`.
+    // The alias-lookup layer described in TODO.md will replace this with a
+    // human-friendly name (e.g. "Cows-2A") when available.
+    const std::string seedStr = std::to_string(p.mapSeed);
+
     return window(
         text(" Active Player "),
         vbox({
             hbox({ text(p.name), text("  "),
                    text("(" + classString(p.characterClass) + ")") | dim }),
-            text(p.file) | dim,
             text(lvlLine),
-            hbox({ text("HC "), text(p.hardcore ? "yes" : "no ") | dim,
-                   text("   Died "), text(p.died ? "yes" : "no ") | dim }),
+            hbox({ text("Map Seed  "), text(seedStr) | bold }),
+            badgeLine,
             separator(),
             hbox({ text("Exp "), text(pctLbl) }),
             gauge(static_cast<float>(pctForBar)),
@@ -391,8 +405,6 @@ Element renderChronicleLeaf(const PaneConfig& c, const DashboardSnapshot& s,
     if (isSet) header.push_back(cellText("Set", w.setLbl));
 
     const int shown = static_cast<int>(rows.size());
-    const int owned = static_cast<int>(std::count_if(
-        rows.begin(), rows.end(), [](auto* r){ return r->discovered; }));
     const int clamped = std::clamp(c.cursor, 0, std::max(0, shown - 1));
 
     Elements body;
@@ -422,9 +434,27 @@ Element renderChronicleLeaf(const PaneConfig& c, const DashboardSnapshot& s,
         status += " | q=\"" + c.searchQuery + "\"";
     }
 
-    // Title line.
+    // Title stats. Anchor the numerator/denominator to the whole category
+    // (kind + tier), ignoring the ownership and search filters -- otherwise
+    // "remaining only" gives a "0/shown" ratio that says nothing about
+    // progress. Label matches the filter: `remaining` when hiding
+    // discovered rows, `discovered` otherwise.
+    int categoryTotal = 0;
+    int categoryDiscovered = 0;
+    for (const auto& r : s.chronicle) {
+        if (r.kind != kt.kind)                                        continue;
+        if (kt.tierMask != 0 && (kt.tierMask & tierBit(r.tier)) == 0) continue;
+        ++categoryTotal;
+        if (r.discovered) ++categoryDiscovered;
+    }
+    const int categoryRemaining = categoryTotal - categoryDiscovered;
+    const bool remainingLabel   = c.ownership == OwnershipFilter::RemainingOnly;
+    const int numerator = remainingLabel ? categoryRemaining : categoryDiscovered;
+
     std::string title = " " + paneTitle(c) + "  "
-                      + std::to_string(owned) + "/" + std::to_string(shown) + " ";
+                      + std::to_string(numerator) + "/"
+                      + std::to_string(categoryTotal) + " "
+                      + (remainingLabel ? "remaining" : "discovered") + " ";
     Element titleEl = text(title);
     if (focused) titleEl = titleEl | inverted;
 

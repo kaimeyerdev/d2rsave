@@ -35,6 +35,7 @@ struct ActivePlayer {
     bool              died           = false;
     std::uint8_t      difficulty     = 0;     // 0=Normal, 1=Nightmare, 2=Hell (highest active)
     std::uint8_t      act            = 0;     // 1..5 in the highest active difficulty
+    std::uint32_t     mapSeed        = 0;     // char header map-seed, usable with `d2rsave set-seed`
 };
 
 // Hellfire Torch side-quest counts. `torchesHellfire` counts the actual

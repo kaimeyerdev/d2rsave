@@ -470,6 +470,7 @@ DashboardSnapshot buildSnapshot(RefDb& db,
         ap.timestamp      = bestChar.timestamp;
         ap.hardcore       = bestChar.hardcore;
         ap.died           = bestChar.died;
+        ap.mapSeed        = bestChar.mapId;
         computeDifficulty(bestChar, ap.difficulty, ap.act);
 
         // Progress within the current level. `expForLevel` is derived
