@@ -340,6 +340,24 @@ DashboardSnapshot buildSnapshot(RefDb& db,
     std::unordered_map<std::uint32_t, std::string> ownedUniqueLocs;
     std::unordered_map<std::uint32_t, std::string> ownedSetLocs;
 
+    // Record ownership for a single parsed Item into the reconcile maps.
+    // Socketed items (uniques like Rainbow Facet, or Defender's Fire type
+    // Colossal Jewels commonly slotted into armour) are just as much
+    // "owned" as the container -- reconcile has to see them or it'll
+    // report a false "discovered, not owned" discrepancy. Mirrors the
+    // recursion in `collectOwned` in src/main.cpp.
+    //
+    // Note: no `id != 0` guard. Both `uniqueitems.txt` and `setitems.txt`
+    // use id 0 for legitimate rows (The Gnasher, Civerb's Ward). The
+    // ItemQuality check is sufficient to know the id field is meaningful.
+    auto recordOwnership = [&](const Item& it, const std::string& loc) {
+        if (it.quality == ItemQuality::Unique) {
+            ownedUniqueLocs.try_emplace(it.uniqueId, loc);
+        } else if (it.quality == ItemQuality::Set) {
+            ownedSetLocs.try_emplace(it.setItemId, loc);
+        }
+    };
+
     // Extend the stash-tab pass above: capture ownership for uniques/sets
     // in stash tabs too. We do this in a second walk over `full.tabs` to
     // keep the change local; parse cost is negligible relative to the
@@ -352,11 +370,8 @@ DashboardSnapshot buildSnapshot(RefDb& db,
             for (std::size_t i = 0; i < full.tabs.size(); ++i) {
                 const std::string loc = "stash tab " + std::to_string(i + 1);
                 for (const auto& it : full.tabs[i].items) {
-                    if (it.quality == ItemQuality::Unique && it.uniqueId != 0) {
-                        ownedUniqueLocs.try_emplace(it.uniqueId, loc);
-                    } else if (it.quality == ItemQuality::Set && it.setItemId != 0) {
-                        ownedSetLocs.try_emplace(it.setItemId, loc);
-                    }
+                    recordOwnership(it, loc);
+                    for (const auto& s : it.socketedItems) recordOwnership(s, loc);
                 }
             }
         } catch (const std::exception&) {}
@@ -405,11 +420,7 @@ DashboardSnapshot buildSnapshot(RefDb& db,
                         }
                         // Reconcile tracking (independent of collectable-catalog
                         // membership so genuinely off-catalog owns still surface).
-                        if (it.quality == ItemQuality::Unique && it.uniqueId != 0) {
-                            ownedUniqueLocs.try_emplace(it.uniqueId, loc);
-                        } else if (it.quality == ItemQuality::Set && it.setItemId != 0) {
-                            ownedSetLocs.try_emplace(it.setItemId, loc);
-                        }
+                        recordOwnership(it, loc);
 
                         for (const auto& s : it.socketedItems) {
                             countQuestItem(s, snap.hellfireTorch,
@@ -420,6 +431,9 @@ DashboardSnapshot buildSnapshot(RefDb& db,
                             sInv.location = loc;
                             sInv.quality  = s.quality;
                             snap.inventory.push_back(std::move(sInv));
+                            // Also track socketed uniques/sets (Rainbow Facets,
+                            // Defender's Fire etc. are usually socketed).
+                            recordOwnership(s, loc);
                         }
                     }
                 };

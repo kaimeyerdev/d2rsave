@@ -23,8 +23,14 @@ namespace d2r {
 
 namespace {
 
+// Events we care about on the primary save directory.
+//
+// IN_MODIFY is included specifically for the shared-stash case: D2R (via
+// Wine) can keep the `.d2i` file open for the whole session and write to
+// it in-place, so IN_CLOSE_WRITE never fires. IN_MODIFY does. Bursty
+// writes are coalesced by the 250 ms debounce in waitForChange().
 constexpr std::uint32_t kSaveDirMask =
-    IN_CLOSE_WRITE | IN_MOVED_TO | IN_MOVED_FROM |
+    IN_MODIFY | IN_CLOSE_WRITE | IN_MOVED_TO | IN_MOVED_FROM |
     IN_CREATE | IN_DELETE | IN_DELETE_SELF | IN_MOVE_SELF;
 
 // For the exe's parent we only care about creates/renames-in — that's how
