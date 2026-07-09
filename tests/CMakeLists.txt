@@ -11,6 +11,8 @@ add_executable(d2rsave_tests
     test_vendor.cpp
     test_excel_table.cpp
     test_sql_emitter.cpp
+    test_terror_zones.cpp
+    tz_oracle_data.cpp
 )
 target_link_libraries(d2rsave_tests PRIVATE
     d2rsave_core

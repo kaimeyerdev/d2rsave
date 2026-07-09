@@ -211,6 +211,196 @@ Interaction with legacy: `rename_d2r` writes seeds directly to the
 .d2s file; the alias table is purely a UI convenience layered on top
 of `d2rsave set-seed`, so nothing about the legacy tool changes.
 
+### Terror Zones -- reverse-engineer the offline schedule
+
+**Status: paused, pending disassembly of D2R.exe.** Everything we
+could learn from oracle observations alone has been extracted; the
+picker function itself is not derivable from black-box data at any
+practical scraping volume. Pick this back up when we're ready to open
+Ghidra.
+
+#### What's in the repo (keep it all)
+
+Public API + placeholder implementation:
+
+* [`include/d2r/TerrorZones.hpp`](include/d2r/TerrorZones.hpp) --
+  API surface, `TerrorZone` struct (with `gameId` matching Blizzard's
+  internal name), `forecastTerrorZones`, `kDefaultTerrorZoneAnchor`,
+  `kDefaultTerrorZoneSeed`, and `kTerrorZoneSlotLength`.
+* [`src/terror_zones.cpp`](src/terror_zones.cpp) -- current placeholder
+  `mix64()` (SplitMix64 finalizer). Slot-alignment / edge-case logic
+  is correct; only the picker call is wrong. Replace `mix64()` with the
+  reversed function.
+* [`data/sql/17_terrorzones.sql`](data/sql/17_terrorzones.sql) --
+  the 34 pool zones with `id` = JSON-order pool index, `game_id` =
+  Blizzard's internal name, `name` = d2tz.info display string. Refresh
+  this from CASC every time the game patches (see below).
+
+Tooling:
+
+* [`src/casc_dump_main.cpp`](src/casc_dump_main.cpp) -- `d2r_casc_dump`
+  CLI. Given a D2R install path and a CASC-side file path, dumps the
+  file to stdout or `--out`. Use this to re-pull
+  `Data\hd\global\excel\desecratedzones.json` after any D2R patch.
+* [`src/tz_forecast_main.cpp`](src/tz_forecast_main.cpp) --
+  `d2r_tz_forecast` CLI. Prints a slot-by-slot forecast (uses the
+  current placeholder). Useful for eyeballing changes to the picker.
+* [`tests/test_terror_zones.cpp`](tests/test_terror_zones.cpp) plus
+  [`tests/tz_oracle_data.cpp`](tests/tz_oracle_data.cpp) /
+  [`tests/tz_oracle_data.hpp`](tests/tz_oracle_data.hpp) -- see
+  "Tests" below.
+
+Everything above should be preserved through the disassembly work; the
+only file whose *contents* will change is `src/terror_zones.cpp` (swap
+the `mix64` for the real function + adjust any per-slot rejection
+loop).
+
+#### Authoritative constants (from `desecratedzones.json`)
+
+Extracted via `d2r_casc_dump --file "data:data\hd\global\excel\desecratedzones.json"`
+and cached in `include/d2r/TerrorZones.hpp` and `data/sql/17_terrorzones.sql`.
+
+| field                    | value                                    |
+|--------------------------|------------------------------------------|
+| `start_time_utc`         | `2025-12-05 00:00:00 UTC`                |
+| `zone_duration_minutes`  | 30                                       |
+| `break_duration_minutes` | 0                                        |
+| `seed`                   | `16665365343970128666` (`0xE747457BC371F31A`) |
+| pool size                | 34                                       |
+| pool order               | matches `zones[i]` array in the JSON     |
+
+Pool internal indices are NON-contiguous (`zones_0..9`, `_11`,
+`_14..36`) -- Blizzard drops zones between patches without renumbering
+existing ones. Keep the SQL file's row order aligned with `zones[i]`
+in the JSON; any reshuffle silently invalidates every forecast.
+
+The JSON also carries `manual_zones` (5 act-scoped pools) and a
+`warnings` table (announcement tiers). We don't need those to forecast
+zone identity, but the disassembly work should look at how they're
+consumed since the picker may read them as part of its loop.
+
+#### Empirical findings from the 2-week oracle
+
+Two weeks (14 days x 48 slots = 672 obs), pasted from
+d2tz.info/offline in America/Denver local time, are encoded in
+[`tests/tz_oracle_data.cpp`](tests/tz_oracle_data.cpp) as a
+`std::vector<d2r::TerrorZoneSlot>` matching the exact shape the
+forecaster returns. Tests compare a forecast directly to a slice of
+this oracle. Structural rules derived from those observations, all
+encoded as `[!mayfail]` tests:
+
+1. **K=1 no-repeat**: 0 self-transitions in 671 pairs.
+   P(0 | uniform iid) = (33/34)^671 ~= 2e-9. Hard rule.
+2. **K=2 no-repeat**: 0 A-B-A patterns in 670 triples. Same rejection
+   window; also hard.
+3. **K=3 suppressed but not zero**: 1 hit in 669. K=4..K=11 also
+   remain well below chance. Interpretation: the picker maintains a
+   ring buffer of the last 2 zones and rejects candidates in it; small
+   K > 2 gets soft-suppressed by the anti-clustering step below.
+4. **Anti-clustering**: zone-frequency variance is 5.89 over 672 obs;
+   Poisson (uniform iid) would give ~19.8. Every one of 34 zones shows
+   up 16..25 times. The picker is picking against a "recent frequency"
+   score, not just a plain modulo.
+5. **Minimum observed gap between same-zone repeats**: 3 slots.
+   1.3% of gaps are <=5. So even with the K=2 rejection, short gaps
+   are rare -- consistent with an "avoid last N" queue where N ~ 4-5,
+   or a weighted picker that penalises very recent zones.
+6. **Mutual information between any slot bit and pool_idx is
+   0.01-0.05 bits** (max possible log2(34) = 5.09). No bit of `slot`
+   alone leaks the output; the RNG is well-mixed.
+
+#### Algorithms already ruled out (chance-level match rate)
+
+Exhausted with two now-deleted Python probing scripts (search this
+file's history under `scripts/tz_rng_search.py`,
+`scripts/tz_rng_iterated.py`, `scripts/tz_2week_analysis.py`). All
+listed candidates scored 5-25 / 672 vs. the ~19.8/672 chance rate
+over 2 weeks of data:
+
+* **Stateless mixers of `(seed, slot)`**: identity, XOR, add, SplitMix64
+  finalizer, wyhash, PCG-style xor-fold, `seed*A + slot*B` sweep over
+  {1, 0x9E37..., 0xBF58..., 0xC6BC..., FNV-64 offset} squared, byte-wise
+  SHA-256 and MD5 over `struct.pack('<QQ', seed, slot)` and
+  `struct.pack('>QQ', ...)` at every 32-bit word offset.
+* **Iterated streams from `seed`**: xorshift64 (13/7/17),
+  `lcg64_pcg` (mult=6364136223846793005, inc=1442695040888963407),
+  `lcg_msvc` (214013/2531011), `lcg_nr` (1664525/1013904223), wyrand,
+  SplitMix64-step, with 1..14 advances per slot and output extractions
+  at bit offsets 0/16/32/xor-fold. Also tried seeding via
+  `splitmix64_finalizer(seed)` and via `seed_low32`, `seed_high32`.
+* **Fisher-Yates block shuffle**: no 34-slot window in 672 slots
+  contains all 34 pool indices; longest strictly-non-repeating run is
+  25. So the picker is NOT drawing without replacement from a deck.
+* **Same but wrapped in K=1 rejection sampling**: adds a "keep drawing
+  until output != last" loop around each of the above iterated
+  candidates. Still chance rate.
+
+None of this rules out RNGs we didn't test (e.g. Storm.dll's PRNG,
+which is a Wichmann-Hill variant plus a lagged Fibonacci generator;
+Blizzard's SFMT wrappers; some proprietary picker with per-slot state
+outside the seed). The set is finite but big enough that guessing is
+worse than looking.
+
+#### Next: disassembly plan
+
+The productive path is Ghidra/IDA on `D2R.exe`:
+
+1. Load D2R.exe.
+2. Grep the static strings for `"desecratedzones"` (there will be at
+   least one hit -- the code that opens the CASC JSON references it by
+   name).
+3. Follow XREFs to the function that parses `desecratedzones.json`
+   into a runtime struct. Note offsets for `zones`, `seed`,
+   `start_time_utc`, `zone_duration_minutes`.
+4. Find the function that reads "current active zone" -- likely called
+   once per minute or on level entry. It's a pure function of
+   `(now, seed, zones[], last_N_history)`. Read it out and translate
+   to C++.
+5. Replace the placeholder `mix64()` in
+   `src/terror_zones.cpp::forecastTerrorZones` with the real picker.
+   The API doesn't need to change.
+6. Drop the `[!mayfail]` tag off each `[terrorzones]` test as it
+   starts passing:
+     * K=1 no-repeat  -- picker's rejection loop is right
+     * K=2 no-repeat  -- history buffer length >= 2
+     * Frequency variance -- anti-clustering weights are right
+     * Big lookup (672/672) -- ALL of the above + the actual RNG
+
+Once the algorithm is in, `d2r_tz_forecast` starts printing the true
+schedule, and the dashboard's `Active Player` pane can populate
+`snap.terrorZones.currentZone` / `.nextZone` directly.
+
+#### Tests
+
+The 6 `[terrorzones]` tests without `!mayfail` are API guard rails and
+should never regress:
+
+* Forecast is deterministic for identical inputs
+* Each slot has zonesPerSlot distinct zones (synthetic-catalog API check)
+* Slots align to :00 / :30 marks
+* Slots exactly on a boundary don't shift
+* Edge cases: empty inputs return empty forecasts
+* Oracle vector is well-formed and every pool_idx is in range
+
+The 5 `[terrorzones][!mayfail]` tests are the reversal signals:
+
+* Forecast matches the 672-slot d2tz.info oracle    (`fcst == kD2tzInfoOracle`)
+* Forecast matches the first 48 slots of the oracle (small-slice variant)
+* No-repeat rule K=1
+* No-repeat rule K=2
+* Zone frequency is tightly bounded
+
+Each `!mayfail` test runs on every build, reports its shortfall via
+`INFO`, and reports "failed as expected" to Catch2 without turning
+the run red. When you plug in the real picker, they'll pass one at a
+time -- delete the `!mayfail` tag off each as it goes green.
+
+To add more oracle weeks: paste the CSV into a scratch file, run the
+one-off generator (see the "Regeneration" comment at the top of
+[`tests/tz_oracle_data.hpp`](tests/tz_oracle_data.hpp)), overwrite
+`tz_oracle_data.cpp`, and update the size / first / last assertions in
+the "Oracle vector is well-formed" test.
+
 ## Build / packaging
 
 * Add a top-level `LICENSE` file for this port. Because we vendor

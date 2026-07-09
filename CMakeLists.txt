@@ -101,6 +101,7 @@ if(D2R_USE_VCPKG)
             src/refdb.cpp
             src/item_parser.cpp
             src/shared_stash_parser.cpp
+            src/terror_zones.cpp
         )
         target_link_libraries(d2rsave_core PUBLIC ${D2R_SQLITE_TARGET} fmt::fmt)
         target_compile_definitions(d2rsave_core PUBLIC D2R_HAVE_SQLITE=1)
@@ -108,6 +109,17 @@ if(D2R_USE_VCPKG)
             D2R_REFERENCE_DB_DEFAULT="${D2R_REFERENCE_DB}"
         )
         add_dependencies(d2rsave reference_db)
+
+        # Standalone forecasting CLI, useful for validating the RNG
+        # anchor + hash against online oracles. Kept separate from the
+        # main d2rsave binary so it can be invoked without touching the
+        # interactive dashboard.
+        add_executable(d2r_tz_forecast src/tz_forecast_main.cpp)
+        target_link_libraries(d2r_tz_forecast PRIVATE d2rsave_core)
+        target_compile_definitions(d2r_tz_forecast PRIVATE
+            D2R_REFERENCE_DB_DEFAULT="${D2R_REFERENCE_DB}"
+        )
+        add_dependencies(d2r_tz_forecast reference_db)
     else()
         message(WARNING "d2rsave: D2R_USE_VCPKG=ON but sqlite3/fmt not found. Run ./bootstrap-vcpkg.sh.")
     endif()
@@ -179,6 +191,12 @@ if(D2R_USE_VCPKG)
 
         add_executable(d2r_refdb_gen src/refdb_gen_main.cpp)
         target_link_libraries(d2r_refdb_gen PRIVATE d2rsave_refdbgen)
+
+        # Minimal read-only CASC dump helper. Used for exploratory work
+        # (e.g. locating desecratedzones.json) without touching the fixed
+        # kCatalogue in d2r_refdb_gen.
+        add_executable(d2r_casc_dump src/casc_dump_main.cpp)
+        target_link_libraries(d2r_casc_dump PRIVATE d2rsave_refdbgen)
 
         # Optional maintainer target: regenerate committed data/sql/ against a
         # user-supplied D2R install. Guarded on -DD2R_D2R_INSTALL=<path>; the
