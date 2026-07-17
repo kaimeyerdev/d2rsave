@@ -12,6 +12,7 @@
 #include "d2r/BackupDb.hpp"
 #include "d2r/BackupScheduler.hpp"
 #include "d2r/Paths.hpp"
+#include "d2r/Recovery.hpp"
 #include "d2r/Watcher.hpp"
 #endif
 
@@ -147,6 +148,34 @@ struct UiState {
     // dimension instead of querying the real tty. Empty in the
     // interactive path.
     std::optional<ftxui::Dimensions>          printSizeOverride;
+
+    // Non-owning: the runDashboard-owned BackupDb. nullptr when the
+    // DB failed to open (or when --print skipped it). renderBackupsLeaf
+    // handles the nullptr case gracefully.
+    BackupDb*                                 backupDb        = nullptr;
+    BackupScheduler*                          backupScheduler = nullptr;
+
+    // Recovery modal state. Populated when the user presses [R] on the
+    // Backups pane detail view; cleared on confirm or cancel.
+    struct RecoveryModal {
+        std::string  filename;        // basename of the file to restore
+        std::int64_t atUnix       = 0;
+        int          destChoice   = 0;   // 0=primary, 1=alt
+        std::string  altPathInput;
+        std::string  status;          // populated after confirm
+    } recoveryModal;
+    bool                                      recoveryModalVisible = false;
+
+    // Retention editor modal (opened by [E] from the Backups summary).
+    // The values are edited in the buffers; on save they're written to
+    // dashboard.sqlite AND the live scheduler's retention config.
+    struct RetentionModal {
+        std::string daysBuf;
+        std::string sessionsBuf;
+        int         focused = 0;  // 0 = days, 1 = sessions
+        std::string status;
+    } retentionModal;
+    bool                                      retentionModalVisible = false;
 };
 
 // ------------------------- top summary panels -------------------------------
@@ -686,6 +715,365 @@ Element renderBlankLeaf(bool focused) {
     }));
 }
 
+// ---- Backups pane ----------------------------------------------------------
+
+namespace {
+
+std::string_view backupStateShortLabel(BackupDb::State s) {
+    switch (s) {
+        case BackupDb::State::Deleted:     return "deleted";
+        case BackupDb::State::SaveAndExit: return "S&E";
+        case BackupDb::State::Autosave:    return "auto";
+        case BackupDb::State::Startup:     return "startup";
+    }
+    return "?";
+}
+
+// Local-timezone-friendly formatter: "YYYY-MM-DD HH:MM:SS". We format in
+// the machine's local zone because the user is comparing against wall-
+// clock events they lived through, not against UTC events they never
+// see.
+std::string formatWallDateTime(std::int64_t unix) {
+    if (unix <= 0) return "-";
+    const std::time_t t = static_cast<std::time_t>(unix);
+    std::tm tm{};
+    localtime_r(&t, &tm);
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm);
+    return buf;
+}
+
+bool isSharedStashName(std::string_view name) {
+    if (name.size() < 4) return false;
+    const auto suffix = name.substr(name.size() - 4);
+    return (suffix == ".d2i" || suffix == ".D2I");
+}
+
+} // namespace
+
+Element renderBackupsSummary(const PaneConfig& config, BackupDb* db,
+                             bool focused,
+                             int daysRetention, int sessionsRetention) {
+    Element titleEl = text(" Backups ");
+    if (focused) titleEl = titleEl | inverted;
+
+    if (!db) {
+        return window(titleEl, vbox({
+            text("The backup DB is not available for this session.") | dim,
+            text("(--print mode or DB init failed; see stderr on startup.)") | dim,
+        }));
+    }
+
+    // Pull the whole summary set. It's one row per known filename and is
+    // small (dozens of rows at most), so no pagination is warranted.
+    std::vector<BackupDb::FileSummary> sums;
+    try {
+        sums = db->summariseFiles();
+    } catch (const std::exception& ex) {
+        return window(titleEl, vbox({
+            text("Backup DB query failed:"),
+            text(std::string("  ") + ex.what()) | dim,
+        }));
+    }
+
+    // Partition: stash (.d2i) rows pinned at top, characters below.
+    std::vector<const BackupDb::FileSummary*> stash;
+    std::vector<const BackupDb::FileSummary*> chars;
+    stash.reserve(sums.size());
+    chars.reserve(sums.size());
+    for (const auto& fs : sums) {
+        if (isSharedStashName(fs.filename)) stash.push_back(&fs);
+        else                                chars.push_back(&fs);
+    }
+
+    // Fixed column widths so the layout doesn't wobble as rows update.
+    constexpr int kNameW = 40;
+    constexpr int kDateW = 20;
+    constexpr int kStateW = 10;
+    constexpr int kNumW = 9;
+
+    auto pad = [](std::string s, int w) {
+        if (static_cast<int>(s.size()) > w) return s.substr(0, w);
+        s.append(w - s.size(), ' ');
+        return s;
+    };
+
+    auto rowFor = [&](const BackupDb::FileSummary& fs, bool selected) {
+        Element name = text(pad(fs.filename, kNameW));
+        Element when = text(pad(formatWallDateTime(fs.lastDate), kDateW));
+        Element st   = text(pad(std::string(backupStateShortLabel(fs.lastState)), kStateW));
+        Element sess = text(pad(std::to_string(fs.sessionCount), kNumW));
+        Element bk   = text(pad(std::to_string(fs.backupCount), kNumW));
+        auto row = hbox({name, when, st, sess, bk});
+        if (selected) row = row | inverted;
+        return row;
+    };
+
+    // Selection cursor: PaneConfig::cursor indexes into (stash + chars).
+    const int totalRows = static_cast<int>(stash.size() + chars.size());
+    const int cursor = totalRows == 0 ? 0
+        : std::clamp(config.cursor, 0, totalRows - 1);
+
+    Element header = hbox({
+        text(pad("filename", kNameW))  | bold,
+        text(pad("last save", kDateW)) | bold,
+        text(pad("state", kStateW))    | bold,
+        text(pad("sessions", kNumW))   | bold,
+        text(pad("backups", kNumW))    | bold,
+    });
+
+    std::vector<Element> body;
+    body.push_back(header);
+    body.push_back(separator());
+    int i = 0;
+
+    // Shared Stash section.
+    if (!stash.empty()) {
+        body.push_back(text("Shared Stash") | bold | dim);
+        for (const auto* fs : stash) {
+            body.push_back(rowFor(*fs, i == cursor));
+            ++i;
+        }
+        body.push_back(text(""));
+    }
+
+    // Characters section.
+    body.push_back(text("Characters") | bold | dim);
+    if (chars.empty()) {
+        body.push_back(text("  (no character backups yet)") | dim);
+    } else {
+        for (const auto* fs : chars) {
+            body.push_back(rowFor(*fs, i == cursor));
+            ++i;
+        }
+    }
+
+    // Footer: hint the user how to drill in / edit retention.
+    body.push_back(filler());
+    const std::string retLine =
+        "retention: " + std::to_string(daysRetention) + " days OR last "
+        + std::to_string(sessionsRetention) + " sessions/char";
+    body.push_back(hbox({
+        text(retLine) | dim,
+        filler(),
+        text("[Enter] detail  [E] retention  ") | dim,
+    }));
+
+    return window(titleEl, vbox(std::move(body)) | yframe);
+}
+
+Element renderBackupsDetail(const PaneConfig& config, BackupDb* db,
+                            bool focused, int pageHeight) {
+    Element titleEl = text(" Backups  " + config.selectedBackupFile + " ");
+    if (focused) titleEl = titleEl | inverted;
+
+    if (!db) {
+        return window(titleEl, text("(backup DB unavailable)") | dim);
+    }
+    if (config.selectedBackupFile.empty()) {
+        return window(titleEl, vbox({
+            text("No file selected.") | dim,
+            text("Press [Esc] to return to the summary view.") | dim,
+        }));
+    }
+
+    std::vector<BackupDb::HistoryRow> hist;
+    try {
+        hist = db->historyFor(config.selectedBackupFile, 2048);
+    } catch (const std::exception& ex) {
+        return window(titleEl, vbox({
+            text("History query failed:"),
+            text(std::string("  ") + ex.what()) | dim,
+        }));
+    }
+    if (hist.empty()) {
+        return window(titleEl, vbox({
+            text("No history for this file.") | dim,
+            text("Press [Esc] to return to the summary view.") | dim,
+        }));
+    }
+
+    // Cursor semantics: PaneConfig::cursor indexes into `hist` (0-based,
+    // reverse-chron). Sessions are demarcated by state=SaveAndExit rows:
+    // that row terminates the session it belongs to; a divider is drawn
+    // ABOVE the next row (which starts the next-older session).
+    const int nRows = static_cast<int>(hist.size());
+    const int cursor = std::clamp(config.cursor, 0, nRows - 1);
+
+    constexpr int kDateW  = 20;
+    constexpr int kStateW = 14;
+    constexpr int kBytesW = 10;
+    constexpr int kSumW   = 12;
+    auto pad = [](std::string s, int w) {
+        if (static_cast<int>(s.size()) > w) return s.substr(0, w);
+        s.append(w - s.size(), ' ');
+        return s;
+    };
+
+    Element header = hbox({
+        text(pad("when",     kDateW))  | bold,
+        text(pad("state",    kStateW)) | bold,
+        text(pad("bytes",    kBytesW)) | bold,
+        text(pad("checksum", kSumW))   | bold,
+    });
+
+    std::vector<Element> body;
+    body.push_back(header);
+    body.push_back(separator());
+
+    // Window rows around the cursor to fit the pane height. Reserve
+    // rows for the header + separator + footer.
+    const int reserved = 4;
+    const int visible = std::max(1, pageHeight - reserved);
+    int start = std::max(0, cursor - visible / 2);
+    if (start + visible > nRows) start = std::max(0, nRows - visible);
+    const int end = std::min(nRows, start + visible);
+
+    // Detect a session boundary between row i and row i-1 (older):
+    // draw a divider when the OLDER row was a state=SaveAndExit and
+    // the NEWER row is not the very-first one shown.
+    for (int i = start; i < end; ++i) {
+        const auto& r = hist[i];
+        // Newer row list; boundary occurs when the CURRENT row is the
+        // one that ends a session (SaveAndExit) -- draw divider AFTER
+        // it. That visually groups newer rows above the divider with
+        // the same session.
+        Element rowEl = hbox({
+            text(pad(formatWallDateTime(r.date), kDateW)),
+            text(pad(std::string(backupStateShortLabel(r.state)), kStateW)),
+            text(pad(std::to_string(r.sizeBytes), kBytesW)),
+        });
+        if (i == cursor) rowEl = rowEl | inverted;
+        body.push_back(rowEl);
+        if (r.state == BackupDb::State::SaveAndExit && i + 1 < end) {
+            body.push_back(separator() | dim);
+        }
+    }
+
+    // Footer.
+    body.push_back(filler());
+    body.push_back(hbox({
+        text("  row " + std::to_string(cursor + 1) + "/" + std::to_string(nRows)) | dim,
+        filler(),
+        text("[Esc] back  [R] recover  ") | dim,
+    }));
+
+    return window(titleEl, vbox(std::move(body)));
+}
+
+Element renderBackupsLeaf(const PaneConfig& config, BackupDb* db,
+                          bool focused, int pageHeight,
+                          int daysRetention, int sessionsRetention) {
+    return config.backupViewMode == BackupViewMode::Detail
+        ? renderBackupsDetail(config, db, focused, pageHeight)
+        : renderBackupsSummary(config, db, focused, daysRetention, sessionsRetention);
+}
+
+// Returns the ordered filename list for the summary view (shared stash
+// pinned at the top, characters below), or empty on DB failure. The
+// order matches the rendered rows, so cursor N indexes into result[N].
+std::vector<std::string> backupsSummaryOrder(BackupDb* db) {
+    std::vector<std::string> out;
+    if (!db) return out;
+    std::vector<BackupDb::FileSummary> sums;
+    try { sums = db->summariseFiles(); }
+    catch (const std::exception&) { return out; }
+    for (const auto& fs : sums) {
+        if (isSharedStashName(fs.filename)) out.push_back(fs.filename);
+    }
+    for (const auto& fs : sums) {
+        if (!isSharedStashName(fs.filename)) out.push_back(fs.filename);
+    }
+    return out;
+}
+
+// ---- Recovery modal --------------------------------------------------------
+
+Element renderRecoveryModal(const UiState::RecoveryModal& m,
+                            const std::string& primaryDir) {
+    const std::string destLine =
+        m.destChoice == 0
+            ? std::string("[X] Restore in place to  ") + primaryDir
+            : std::string("[ ] Restore in place to  ") + primaryDir;
+    const std::string altLine =
+        m.destChoice == 1
+            ? std::string("[X] Restore to a folder  ") + m.altPathInput
+            : std::string("[ ] Restore to a folder  ") + m.altPathInput;
+
+    std::vector<Element> body = {
+        text("Restore  " + m.filename) | bold,
+        text("As of    " + formatWallDateTime(m.atUnix)) | dim,
+        text(""),
+        text("Destination:") | bold,
+        text("  " + destLine),
+        text("  " + altLine),
+        text(""),
+        text("A pre-recovery snapshot of the destination will be taken.") | dim,
+    };
+    if (!m.status.empty()) {
+        body.push_back(text(""));
+        body.push_back(text(m.status) | bold);
+    }
+    body.push_back(text(""));
+    body.push_back(hbox({
+        text("[Tab] switch destination  ") | dim,
+        text("[type] edit alt path  ") | dim,
+        text("[Enter] confirm  ") | dim,
+        text("[Esc] cancel") | dim,
+    }));
+    return window(text(" Backup Recovery "), vbox(std::move(body)) | size(WIDTH, GREATER_THAN, 60));
+}
+
+Element renderRetentionModal(const UiState::RetentionModal& m,
+                             BackupDb* db) {
+    auto fieldBox = [&](std::string_view label, const std::string& buf, bool focused) {
+        std::string content = "[ " + buf + " ]";
+        auto e = hbox({ text(std::string(label) + "  ") | bold, text(content) });
+        return focused ? (e | inverted) : e;
+    };
+
+    std::int64_t rowCount = 0;
+    std::int64_t fileCount = 0;
+    std::int64_t oldestDate = 0;
+    if (db) {
+        try {
+            const auto sums = db->summariseFiles();
+            fileCount = static_cast<std::int64_t>(sums.size());
+            for (const auto& fs : sums) {
+                rowCount += fs.backupCount;
+                if (oldestDate == 0 || fs.lastDate < oldestDate) oldestDate = fs.lastDate;
+            }
+        } catch (const std::exception&) { /* stats optional */ }
+    }
+    // NB: `lastDate` is the newest date per file, not the oldest; we use
+    // it as a rough "how deep does the DB reach" indicator without
+    // adding another accessor for now. Precise oldest-row lookup can be
+    // a follow-up when the retention editor grows a dry-run preview.
+
+    std::vector<Element> body = {
+        text("Backup retention policy") | bold,
+        text("Keep everything within N days OR the last M sessions per character.") | dim,
+        text(""),
+        fieldBox("days:     ", m.daysBuf,     m.focused == 0),
+        fieldBox("sessions: ", m.sessionsBuf, m.focused == 1),
+        text(""),
+        text("Current DB: " + std::to_string(rowCount) + " row(s) across "
+             + std::to_string(fileCount) + " file(s)") | dim,
+    };
+    if (!m.status.empty()) {
+        body.push_back(text(""));
+        body.push_back(text(m.status) | bold);
+    }
+    body.push_back(text(""));
+    body.push_back(hbox({
+        text("[Tab] switch field  ") | dim,
+        text("[type / Backspace] edit  ") | dim,
+        text("[Enter] save  ") | dim,
+        text("[Esc] cancel") | dim,
+    }));
+    return window(text(" Retention "), vbox(std::move(body)) | size(WIDTH, GREATER_THAN, 60));
+}
+
 // ---- Config-mode menu -------------------------------------------------------
 
 struct ConfigMenuItem {
@@ -873,6 +1261,13 @@ Element renderPane(PaneNode& node, const UiState& ui,
             leafEl = renderReconcileLeaf(node.config, s, focused,
                                           focused && ui.searchMode);
             break;
+        case PaneType::Backups: {
+            const int days = ui.backupScheduler ? ui.backupScheduler->retention().days : 30;
+            const int sess = ui.backupScheduler ? ui.backupScheduler->retention().sessionsPerFile : 100;
+            leafEl = renderBackupsLeaf(node.config, ui.backupDb, focused,
+                                        height, days, sess);
+            break;
+        }
         case PaneType::Blank:
             leafEl = renderBlankLeaf(focused);
             break;
@@ -991,12 +1386,17 @@ Enum cycleEnum(Enum current, std::initializer_list<Enum> values) {
 }
 
 void cyclePaneType(PaneNode& leaf) {
-    // Blank -> Chronicle -> Inventory -> Reconcile -> Blank
+    // Blank -> Chronicle -> Inventory -> Reconcile -> Backups -> Blank
     leaf.config.type = leaf.config.type == PaneType::Blank     ? PaneType::Chronicle
                      : leaf.config.type == PaneType::Chronicle ? PaneType::Inventory
                      : leaf.config.type == PaneType::Inventory ? PaneType::Reconcile
+                     : leaf.config.type == PaneType::Reconcile ? PaneType::Backups
                                                                 : PaneType::Blank;
     leaf.config.cursor = 0;
+    // Reset the Backups sub-mode so a freshly-cycled-into pane always
+    // opens on the summary view rather than orphaned detail.
+    leaf.config.backupViewMode     = BackupViewMode::Summary;
+    leaf.config.selectedBackupFile.clear();
 }
 
 void cycleCategory(PaneNode& leaf) {
@@ -1085,22 +1485,34 @@ int runDashboard(const std::filesystem::path& savePath,
     // Backup DB + scheduler. Failure to open is non-fatal (the dashboard
     // still works, just without automatic backups). The startup sweep
     // happens before we enter the FTXUI loop so its writes don't compete
-    // with the first render. Skipped entirely in print-once mode so
-    // `--print` has no on-disk side effects.
+    // with the first render. In --print mode we still open the DB (so
+    // the Backups pane can render live rows) but skip the sweep -- the
+    // schema apply is idempotent, so the on-disk state stays untouched
+    // when nothing needs migrating.
     std::unique_ptr<BackupDb>        backupDb;
     std::unique_ptr<BackupScheduler> backupScheduler;
-    if (!options.printOnce) {
-        try {
-            backupDb = std::make_unique<BackupDb>(backupDbPath());
-            backupScheduler = std::make_unique<BackupScheduler>(*backupDb, savePath);
-            backupScheduler->takeStartupSnapshot();
-        } catch (const std::exception& ex) {
-            std::fprintf(stderr,
-                "warning: backup DB unavailable (%s); no automatic backups this session\n",
-                ex.what());
-            backupScheduler.reset();
-            backupDb.reset();
+    try {
+        backupDb = std::make_unique<BackupDb>(backupDbPath());
+        // Retention: pick up the user's saved values from the config DB
+        // (may be defaults if they've never touched it). Both the
+        // startup sweep and every subsequent burst honour this.
+        RetentionConfig retention;
+        if (configDb) {
+            const auto cfg = loadBackupRetention(configDb);
+            retention.days            = cfg.days;
+            retention.sessionsPerFile = cfg.sessions;
         }
+        backupScheduler = std::make_unique<BackupScheduler>(
+            *backupDb, savePath, retention);
+        if (!options.printOnce) {
+            backupScheduler->takeStartupSnapshot();
+        }
+    } catch (const std::exception& ex) {
+        std::fprintf(stderr,
+            "warning: backup DB unavailable (%s); no automatic backups this session\n",
+            ex.what());
+        backupScheduler.reset();
+        backupDb.reset();
     }
 #endif
 
@@ -1111,6 +1523,10 @@ int runDashboard(const std::filesystem::path& savePath,
         ui.printSizeOverride =
             ftxui::Dimensions{options.printWidth, options.printHeight};
     }
+#if D2R_HAVE_INOTIFY
+    ui.backupDb = backupDb.get();   // may be nullptr; renderers cope
+    ui.backupScheduler = backupScheduler.get();
+#endif
     {
         auto snap = std::make_shared<DashboardSnapshot>(
             buildSnapshot(db, savePath, stashPath));
@@ -1176,6 +1592,14 @@ int runDashboard(const std::filesystem::path& savePath,
         });
 
         if (ui.helpVisible) root = dbox({ root, renderHelpModal() | center });
+        if (ui.recoveryModalVisible) {
+            root = dbox({ root,
+                renderRecoveryModal(ui.recoveryModal, ui.watchedPath) | center });
+        }
+        if (ui.retentionModalVisible) {
+            root = dbox({ root,
+                renderRetentionModal(ui.retentionModal, ui.backupDb) | center });
+        }
         return root;
     });
 
@@ -1205,6 +1629,114 @@ int runDashboard(const std::filesystem::path& savePath,
         if (ui.helpVisible) {
             if (e == Event::Escape || e == Event::Return || e == Event::Character('?')) {
                 ui.helpVisible = false;
+            }
+            return true;
+        }
+
+        // ---- RECOVERY modal ----
+        if (ui.recoveryModalVisible) {            auto& m = ui.recoveryModal;
+            if (e == Event::Escape) {
+                ui.recoveryModalVisible = false;
+                return true;
+            }
+            if (e == Event::Tab) {
+                m.destChoice = m.destChoice == 0 ? 1 : 0;
+                return true;
+            }
+            if (e == Event::Backspace && m.destChoice == 1 && !m.altPathInput.empty()) {
+                m.altPathInput.pop_back();
+                return true;
+            }
+            // Only accept printable characters into the alt path input.
+            if (m.destChoice == 1 && e.is_character()) {
+                const auto& s = e.character();
+                if (!s.empty() && static_cast<unsigned char>(s[0]) >= 32) {
+                    m.altPathInput += s;
+                }
+                return true;
+            }
+            if (e == Event::Return) {
+                if (!ui.backupDb || !ui.backupScheduler) {
+                    m.status = "error: backup DB unavailable";
+                    return true;
+                }
+                std::filesystem::path dest = m.destChoice == 0
+                    ? std::filesystem::path(ui.watchedPath)
+                    : std::filesystem::path(m.altPathInput);
+                if (dest.empty()) {
+                    m.status = "error: destination path is empty";
+                    return true;
+                }
+                d2r::RecoverySpec spec;
+                spec.destDir               = dest;
+                spec.filename              = m.filename;
+                spec.atUnix                = m.atUnix;
+                spec.preRecoveryBackup     = true;
+                spec.allowTombstoneRestore = (m.destChoice == 0);
+                try {
+                    const auto rep = d2r::recoverFile(
+                        *ui.backupDb, *ui.backupScheduler, spec);
+                    if (!rep.restored && !rep.wasTombstone) {
+                        m.status = "no backup exists at or before that moment";
+                        return true;
+                    }
+                    // Success -- close the modal and refresh the snapshot
+                    // so the pane (and any Chronicle/Inventory that read
+                    // the destination) shows the restored state.
+                    ui.recoveryModalVisible = false;
+                    rebuild();
+                } catch (const std::exception& ex) {
+                    m.status = std::string("error: ") + ex.what();
+                }
+                return true;
+            }
+            return true;   // swallow all other events while modal is up
+        }
+
+        // ---- RETENTION modal ----
+        if (ui.retentionModalVisible) {
+            auto& m = ui.retentionModal;
+            if (e == Event::Escape) {
+                ui.retentionModalVisible = false;
+                return true;
+            }
+            if (e == Event::Tab) {
+                m.focused = m.focused == 0 ? 1 : 0;
+                return true;
+            }
+            auto& buf = m.focused == 0 ? m.daysBuf : m.sessionsBuf;
+            if (e == Event::Backspace) {
+                if (!buf.empty()) buf.pop_back();
+                return true;
+            }
+            if (e.is_character()) {
+                const auto& s = e.character();
+                if (!s.empty() && s[0] >= '0' && s[0] <= '9' && buf.size() < 8) {
+                    buf += s;
+                }
+                return true;
+            }
+            if (e == Event::Return) {
+                // Parse + validate.
+                int days = m.daysBuf.empty()     ? 0 : std::atoi(m.daysBuf.c_str());
+                int sess = m.sessionsBuf.empty() ? 0 : std::atoi(m.sessionsBuf.c_str());
+                if (days < 0 || sess < 0) {
+                    m.status = "error: values must be non-negative";
+                    return true;
+                }
+                if (configDb) {
+                    try {
+                        d2r::saveBackupRetention(configDb, {days, sess});
+                    } catch (const std::exception& ex) {
+                        m.status = std::string("error: ") + ex.what();
+                        return true;
+                    }
+                }
+                if (ui.backupScheduler) {
+                    ui.backupScheduler->setRetention({days, sess});
+                }
+                ui.retentionModalVisible = false;
+                return true;
             }
             return true;
         }
@@ -1359,6 +1891,66 @@ int runDashboard(const std::filesystem::path& savePath,
         // Row navigation in focused pane.
         auto* leaf = focusedLeaf();
         if (!leaf) return false;
+
+        // Backups pane: Enter drills from summary into detail for the
+        // filename at the cursor; Escape from detail returns to summary.
+        // Both reset the cursor so the drill-in lands at the newest row.
+        if (leaf->config.type == PaneType::Backups) {
+            if (e == Event::Return &&
+                leaf->config.backupViewMode == BackupViewMode::Summary) {
+                const auto order = backupsSummaryOrder(ui.backupDb);
+                if (!order.empty()) {
+                    const int idx = std::clamp(leaf->config.cursor,
+                                                0, (int)order.size() - 1);
+                    leaf->config.selectedBackupFile = order[idx];
+                    leaf->config.backupViewMode     = BackupViewMode::Detail;
+                    leaf->config.cursor             = 0;
+                }
+                return true;
+            }
+            if (e == Event::Escape &&
+                leaf->config.backupViewMode == BackupViewMode::Detail) {
+                leaf->config.backupViewMode = BackupViewMode::Summary;
+                leaf->config.cursor         = 0;
+                return true;
+            }
+            // R opens the recovery modal for the row currently under the
+            // cursor in the detail view.
+            if ((e == Event::Character('R') || e == Event::Character('r')) &&
+                leaf->config.backupViewMode == BackupViewMode::Detail &&
+                ui.backupDb) {
+                try {
+                    const auto hist = ui.backupDb->historyFor(
+                        leaf->config.selectedBackupFile, 2048);
+                    if (!hist.empty()) {
+                        const int idx = std::clamp(leaf->config.cursor,
+                                                    0, (int)hist.size() - 1);
+                        ui.recoveryModal = UiState::RecoveryModal{};
+                        ui.recoveryModal.filename = leaf->config.selectedBackupFile;
+                        ui.recoveryModal.atUnix   = hist[idx].date;
+                        ui.recoveryModalVisible   = true;
+                    }
+                } catch (const std::exception&) {
+                    // Ignore -- next render shows an empty history view.
+                }
+                return true;
+            }
+            // E on the summary opens the retention editor. Populated
+            // from the live scheduler config so the buffers show what's
+            // currently in effect.
+            if ((e == Event::Character('E') || e == Event::Character('e')) &&
+                leaf->config.backupViewMode == BackupViewMode::Summary) {
+                ui.retentionModal = UiState::RetentionModal{};
+                if (ui.backupScheduler) {
+                    const auto cfg = ui.backupScheduler->retention();
+                    ui.retentionModal.daysBuf     = std::to_string(cfg.days);
+                    ui.retentionModal.sessionsBuf = std::to_string(cfg.sessionsPerFile);
+                }
+                ui.retentionModalVisible = true;
+                return true;
+            }
+        }
+
         const auto shownRows = [&]() -> int {
             auto snap = currentSnapshot();
             if (leaf->config.type == PaneType::Chronicle)
@@ -1384,6 +1976,16 @@ int runDashboard(const std::filesystem::path& savePath,
                     ++n;
                 }
                 return n;
+            }
+            if (leaf->config.type == PaneType::Backups) {
+                if (!ui.backupDb) return 0;
+                if (leaf->config.backupViewMode == BackupViewMode::Detail) {
+                    try {
+                        return (int)ui.backupDb->historyFor(
+                            leaf->config.selectedBackupFile, 2048).size();
+                    } catch (const std::exception&) { return 0; }
+                }
+                return (int)backupsSummaryOrder(ui.backupDb).size();
             }
             return 0;
         };

@@ -406,19 +406,16 @@ the "Oracle vector is well-formed" test.
 The dashboard now writes automatic backups to
 `$XDG_DATA_HOME/d2rsave/backups.sqlite` on watcher events, with a full
 sweep at bootstrap, session-aware retention, and a CLI story for list
-/ show / sessions / recover / prune / snapshot. The following items
-build on that foundation and are all deferred.
+/ show / sessions / recover / prune / snapshot. A `PaneType::Backups`
+renderer covers the interactive summary + detail views plus recovery
+and retention modals. The following items build on that foundation
+and are all deferred.
 
-* **TUI Backups pane.** A `PaneType::Backups` renderer with the
-  summary + detail + recovery dialog + retention editor layout
-  sketched in the plan. Everything is CLI-only today; the pane would
-  bring parity into the interactive UI.
-* **Persist retention config in `dashboard.sqlite`.** Right now the
-  scheduler uses hard-coded defaults (30 days, 100 sessions per
-  character) and the CLI `prune` takes flags at each invocation.
-  A `backup_retention (days, sessions)` table in the dashboard
-  config DB would let a user tune once and have both the dashboard
-  and the CLI honour the same numbers.
+* **CLI parity for retention config.** The dashboard now persists
+  retention edits to a `backup_retention (days, sessions)` table in
+  `dashboard.sqlite`. The `d2rsave backups prune` verb still ignores
+  it and takes flag defaults; teach it (and `snapshot`) to read the
+  stored config when no flags are given.
 * **`.d2s` diff (character-level).** Given two rows for the same
   filename, walk the `Character` structs (level, experience, quests,
   waypoints, items by fingerprint) and emit a typed diff.

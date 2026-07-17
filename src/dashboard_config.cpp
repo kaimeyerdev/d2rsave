@@ -74,8 +74,13 @@ std::string_view toString(PaneType t) {
         case PaneType::Chronicle: return "chronicle";
         case PaneType::Inventory: return "inventory";
         case PaneType::Reconcile: return "reconcile";
+        case PaneType::Backups:   return "backups";
     }
     return "blank";
+}
+
+std::string_view toString(BackupViewMode m) {
+    return m == BackupViewMode::Detail ? "detail" : "summary";
 }
 
 std::string_view toString(ChronicleCategory c) {
@@ -147,6 +152,11 @@ std::string paneTitle(const PaneConfig& c) {
             }
             return t;
         }
+        case PaneType::Backups:
+            if (c.backupViewMode == BackupViewMode::Detail && !c.selectedBackupFile.empty()) {
+                return "Backups  " + c.selectedBackupFile;
+            }
+            return "Backups";
     }
     return "(unconfigured)";
 }
@@ -155,7 +165,12 @@ PaneType paneTypeFromString(std::string_view s) {
     if (s == "chronicle") return PaneType::Chronicle;
     if (s == "inventory") return PaneType::Inventory;
     if (s == "reconcile") return PaneType::Reconcile;
+    if (s == "backups")   return PaneType::Backups;
     return PaneType::Blank;
+}
+
+BackupViewMode backupViewModeFromString(std::string_view s) {
+    return s == "detail" ? BackupViewMode::Detail : BackupViewMode::Summary;
 }
 
 ChronicleCategory chronicleCategoryFromString(std::string_view s) {
@@ -246,6 +261,10 @@ nlohmann::json toJson(const PaneNode& n) {
     if (c.type == PaneType::Reconcile) {
         j["reconcileKind"] = std::string(toString(c.reconcileKind));
     }
+    if (c.type == PaneType::Backups) {
+        j["backupViewMode"]     = std::string(toString(c.backupViewMode));
+        j["selectedBackupFile"] = c.selectedBackupFile;
+    }
     if (c.type == PaneType::Chronicle
      || c.type == PaneType::Inventory
      || c.type == PaneType::Reconcile) {
@@ -283,6 +302,12 @@ PaneNode fromJson(const nlohmann::json& j) {
         if (n.config.type == PaneType::Reconcile) {
             n.config.reconcileKind = reconcileKindFromString(
                 j.value("reconcileKind", std::string("both")));
+        }
+        if (n.config.type == PaneType::Backups) {
+            n.config.backupViewMode = backupViewModeFromString(
+                j.value("backupViewMode", std::string("summary")));
+            n.config.selectedBackupFile = j.value(
+                "selectedBackupFile", std::string());
         }
         if (n.config.type == PaneType::Chronicle
          || n.config.type == PaneType::Inventory
@@ -332,6 +357,58 @@ void savePaneTree(sqlite3* db, const PaneNode& root) {
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) return;
     sqlite3_bind_text(stmt, 1, payload.c_str(),
                       static_cast<int>(payload.size()), SQLITE_TRANSIENT);
+    sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+}
+
+namespace {
+
+// Ensure the backup_retention table exists. Idempotent -- called on every
+// load/save so a fresh DB (or one from before this feature) picks up the
+// schema without a versioning dance.
+void ensureBackupRetentionSchema(sqlite3* db) {
+    static constexpr const char* kSchema =
+        "CREATE TABLE IF NOT EXISTS backup_retention ("
+        "  id INTEGER PRIMARY KEY,"
+        "  days INTEGER NOT NULL,"
+        "  sessions INTEGER NOT NULL"
+        ");";
+    char* err = nullptr;
+    if (sqlite3_exec(db, kSchema, nullptr, nullptr, &err) != SQLITE_OK) {
+        if (err) sqlite3_free(err);
+    }
+}
+
+} // namespace
+
+BackupRetentionConfig loadBackupRetention(sqlite3* db) {
+    BackupRetentionConfig cfg;
+    if (!db) return cfg;
+    ensureBackupRetentionSchema(db);
+    const char* sql = "SELECT days, sessions FROM backup_retention WHERE id=1 LIMIT 1";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) return cfg;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        cfg.days     = static_cast<int>(sqlite3_column_int64(stmt, 0));
+        cfg.sessions = static_cast<int>(sqlite3_column_int64(stmt, 1));
+    }
+    sqlite3_finalize(stmt);
+    return cfg;
+}
+
+void saveBackupRetention(sqlite3* db, BackupRetentionConfig cfg) {
+    if (!db) return;
+    ensureBackupRetentionSchema(db);
+    if (cfg.days < 0)     cfg.days = 0;
+    if (cfg.sessions < 0) cfg.sessions = 0;
+    const char* sql =
+        "INSERT INTO backup_retention (id, days, sessions) VALUES (1, ?, ?) "
+        "ON CONFLICT(id) DO UPDATE SET days = excluded.days, "
+        "                              sessions = excluded.sessions";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) return;
+    sqlite3_bind_int64(stmt, 1, cfg.days);
+    sqlite3_bind_int64(stmt, 2, cfg.sessions);
     sqlite3_step(stmt);
     sqlite3_finalize(stmt);
 }

@@ -26,6 +26,7 @@ enum class PaneType : std::uint8_t {
     Chronicle,  // One category's rows from the chronicle.
     Inventory,  // Global item-search across every parsed source.
     Reconcile,  // Diff owned items vs chronicle entries.
+    Backups,    // Save-file history from the backup DB (see BackupDb.hpp).
 };
 
 enum class ChronicleCategory : std::uint8_t {
@@ -58,6 +59,15 @@ enum class ReconcileKindFilter : std::uint8_t {
     SetsOnly,
 };
 
+// Which view the Backups pane is showing.
+//
+//   Summary -- one row per known file (stash pinned at top).
+//   Detail  -- reverse-chronological history for `selectedBackupFile`.
+enum class BackupViewMode : std::uint8_t {
+    Summary,
+    Detail,
+};
+
 // ---- Leaf configuration -----------------------------------------------------
 
 struct PaneConfig {
@@ -76,6 +86,13 @@ struct PaneConfig {
 
     // Reconcile-only.
     ReconcileKindFilter reconcileKind = ReconcileKindFilter::Both;
+
+    // Backups-only.
+    BackupViewMode    backupViewMode = BackupViewMode::Summary;
+    // Basename (e.g. "Kai.d2s"). Empty in Summary view; set to the row
+    // the user drilled into for Detail view. Also used to remember the
+    // most recently-viewed file across dashboard restarts.
+    std::string       selectedBackupFile;
 
     // Chronicle + Inventory + Reconcile.
     std::string       searchQuery;
@@ -110,6 +127,7 @@ std::string_view toString(OwnershipFilter);
 std::string_view toString(PaneSortKey);
 std::string_view toString(SplitDirection);
 std::string_view toString(ReconcileKindFilter);
+std::string_view toString(BackupViewMode);
 
 std::string categoryLabel(ChronicleCategory);   // "Uniques - Elite", etc.
 std::string paneTitle(const PaneConfig&);       // Full pane title for the window bar.
@@ -120,6 +138,7 @@ OwnershipFilter     ownershipFromString(std::string_view);
 PaneSortKey         sortKeyFromString(std::string_view);
 SplitDirection      splitDirectionFromString(std::string_view);
 ReconcileKindFilter reconcileKindFromString(std::string_view);
+BackupViewMode      backupViewModeFromString(std::string_view);
 
 // ---- Persistence ------------------------------------------------------------
 
@@ -132,6 +151,18 @@ void     closeDashboardConfigDb(sqlite3* db);
 // the stored JSON fails to parse.
 PaneNode loadPaneTree(sqlite3* db);
 void     savePaneTree(sqlite3* db, const PaneNode& root);
+
+// Persisted retention config for the backup subsystem. Loaded from
+// `dashboard.sqlite`; stored back on Save from the Backups pane
+// retention editor. The values map directly to
+// BackupDb::enforceRetention(days, sessionsPerFile, now).
+struct BackupRetentionConfig {
+    int days     = 30;
+    int sessions = 100;
+};
+[[nodiscard]] BackupRetentionConfig loadBackupRetention(sqlite3* db);
+void                                saveBackupRetention(sqlite3* db,
+                                                        BackupRetentionConfig cfg);
 
 // ---- Tree traversal helpers -------------------------------------------------
 
