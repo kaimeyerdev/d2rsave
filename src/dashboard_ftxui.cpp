@@ -20,6 +20,7 @@
 #include <ftxui/component/screen_interactive.hpp>
 #include <ftxui/dom/elements.hpp>
 #include <ftxui/dom/table.hpp>
+#include <ftxui/screen/screen.hpp>
 #include <ftxui/screen/terminal.hpp>
 
 #include <sqlite3.h>
@@ -33,6 +34,7 @@
 #include <ctime>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -140,6 +142,11 @@ struct UiState {
 
     // Signal from watcher to redraw.
     std::atomic<bool>                         shutdown{false};
+
+    // Print-once mode: forces the layout builder to use a fixed
+    // dimension instead of querying the real tty. Empty in the
+    // interactive path.
+    std::optional<ftxui::Dimensions>          printSizeOverride;
 };
 
 // ------------------------- top summary panels -------------------------------
@@ -1037,7 +1044,8 @@ int cyclei(int v, int mod) { if (mod <= 0) return 0; v %= mod; if (v < 0) v += m
 
 int runDashboard(const std::filesystem::path& savePath,
                  const std::string& referenceDbOverride,
-                 const std::filesystem::path& exePath) {
+                 const std::filesystem::path& exePath,
+                 const DashboardOptions& options) {
     const auto dbPath = findReferenceDb(exePath, referenceDbOverride);
     if (!dbPath) {
         std::fprintf(stderr, "error: reference DB not found\n");
@@ -1077,25 +1085,32 @@ int runDashboard(const std::filesystem::path& savePath,
     // Backup DB + scheduler. Failure to open is non-fatal (the dashboard
     // still works, just without automatic backups). The startup sweep
     // happens before we enter the FTXUI loop so its writes don't compete
-    // with the first render.
+    // with the first render. Skipped entirely in print-once mode so
+    // `--print` has no on-disk side effects.
     std::unique_ptr<BackupDb>        backupDb;
     std::unique_ptr<BackupScheduler> backupScheduler;
-    try {
-        backupDb = std::make_unique<BackupDb>(backupDbPath());
-        backupScheduler = std::make_unique<BackupScheduler>(*backupDb, savePath);
-        backupScheduler->takeStartupSnapshot();
-    } catch (const std::exception& ex) {
-        std::fprintf(stderr,
-            "warning: backup DB unavailable (%s); no automatic backups this session\n",
-            ex.what());
-        backupScheduler.reset();
-        backupDb.reset();
+    if (!options.printOnce) {
+        try {
+            backupDb = std::make_unique<BackupDb>(backupDbPath());
+            backupScheduler = std::make_unique<BackupScheduler>(*backupDb, savePath);
+            backupScheduler->takeStartupSnapshot();
+        } catch (const std::exception& ex) {
+            std::fprintf(stderr,
+                "warning: backup DB unavailable (%s); no automatic backups this session\n",
+                ex.what());
+            backupScheduler.reset();
+            backupDb.reset();
+        }
     }
 #endif
 
     UiState ui;
     ui.watchedPath = savePath.string();
     ui.rootPane = configDb ? loadPaneTree(configDb) : makeDefaultLayout();
+    if (options.printOnce) {
+        ui.printSizeOverride =
+            ftxui::Dimensions{options.printWidth, options.printHeight};
+    }
     {
         auto snap = std::make_shared<DashboardSnapshot>(
             buildSnapshot(db, savePath, stashPath));
@@ -1143,7 +1158,7 @@ int runDashboard(const std::filesystem::path& savePath,
         // element with pinned size(W,H) so we don't need `| flex` here --
         // adding flex on top of pinned size lets ftxui expand the outer
         // element and lose our split-symmetry guarantees.
-        const auto dims = ftxui::Terminal::Size();
+        const auto dims = ui.printSizeOverride.value_or(ftxui::Terminal::Size());
         const int paneWidth  = std::max(1, dims.dimx);
         const int paneHeight = std::max(1, dims.dimy - 12 - 1);
         Element panes = renderPane(ui.rootPane, ui, s, leafIdx,
@@ -1163,6 +1178,21 @@ int runDashboard(const std::filesystem::path& savePath,
         if (ui.helpVisible) root = dbox({ root, renderHelpModal() | center });
         return root;
     });
+
+    // Print-once mode: render the layout to a fixed-size Screen, dump
+    // it as ANSI to stdout, and exit. No event loop, no watcher, no
+    // side effects.
+    if (options.printOnce) {
+        auto element = layout->Render();
+        auto screen  = ftxui::Screen::Create(
+            ftxui::Dimension::Fixed(options.printWidth),
+            ftxui::Dimension::Fixed(options.printHeight));
+        ftxui::Render(screen, element);
+        std::fputs(screen.ToString().c_str(), stdout);
+        std::fputc('\n', stdout);
+        if (configDb) closeDashboardConfigDb(configDb);
+        return 0;
+    }
 
     auto postRebuild = [&] { screen.PostEvent(Event::Custom); };
 

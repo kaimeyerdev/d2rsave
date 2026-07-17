@@ -140,13 +140,18 @@ int usage(const char* prog) {
 #if D2R_HAVE_DASHBOARD
         "Interactive mode (mutually exclusive with --watch and the modifying\n"
         "commands rename/set-seed/checksum):\n"
-        "  dashboard                    Launch the interactive TUI dashboard.\n"
+        "  dashboard [--print [--width W] [--height H]]\n"
+        "                               Launch the interactive TUI dashboard.\n"
         "                               Panels: active player, Hellfire Torch quest,\n"
         "                               Colossal Ancients quest, Terror Zones, and a\n"
         "                               sortable/filterable Chronicle table. Live-\n"
         "                               refreshes on save-file changes when inotify\n"
         "                               support is compiled in; otherwise press `r`.\n"
         "                               Press `?` inside the TUI for keybindings.\n"
+        "                               --print renders the current layout once as\n"
+        "                               ANSI to stdout and exits (no watcher, no\n"
+        "                               DB writes). Default size 200x60; override\n"
+        "                               with --width / --height.\n"
         "\n"
 #endif
         "Diagnostic commands:\n"
@@ -2036,7 +2041,30 @@ int main(int argc, char** argv) {
     }
 #endif
 #if D2R_HAVE_DASHBOARD
-    else if (cmd == "dashboard") { requirePath(); requireArgs(0);
+    else if (cmd == "dashboard") { requirePath();
+        // Verb-scoped flags: --print (headless render), --width N,
+        // --height N. Anything else is an error.
+        d2r::DashboardOptions dashOpts;
+        for (std::size_t i = 1; i < positional.size(); ++i) {
+            const auto a = positional[i];
+            auto need = [&](const char* flag) -> std::string {
+                if (i + 1 >= positional.size()) {
+                    std::fprintf(stderr,
+                        "error: dashboard: %s expects a value\n", flag);
+                    std::exit(2);
+                }
+                return std::string(positional[++i]);
+            };
+            if      (a == "--print")   dashOpts.printOnce   = true;
+            else if (a == "--width")   dashOpts.printWidth  = std::atoi(need("--width").c_str());
+            else if (a == "--height")  dashOpts.printHeight = std::atoi(need("--height").c_str());
+            else {
+                std::fprintf(stderr,
+                    "error: dashboard: unknown argument '%.*s'\n",
+                    static_cast<int>(a.size()), a.data());
+                std::exit(2);
+            }
+        }
         // The dashboard runs its own inotify watcher inside `runDashboard`,
         // so the outer --watch machinery is redundant. Emit a note and
         // fall through to the non-watch code path instead of erroring or
@@ -2049,8 +2077,9 @@ int main(int argc, char** argv) {
         }
         runCommand = [exe = std::string(argv[0]),
                       sp  = savePath,
-                      r   = std::string(referenceDbOverride)]{
-            return d2r::runDashboard(sp, r, exe);
+                      r   = std::string(referenceDbOverride),
+                      opts = dashOpts]{
+            return d2r::runDashboard(sp, r, exe, opts);
         };
     }
 #else
