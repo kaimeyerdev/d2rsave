@@ -749,10 +749,50 @@ bool isSharedStashName(std::string_view name) {
     return (suffix == ".d2i" || suffix == ".D2I");
 }
 
+// Compact date-only formatter (falls back for narrow panes). ISO-ish,
+// local zone, same as formatWallDateTime but only YYYY-MM-DD.
+std::string formatWallDate(std::int64_t unix) {
+    if (unix <= 0) return "-";
+    const std::time_t t = static_cast<std::time_t>(unix);
+    std::tm tm{};
+    localtime_r(&t, &tm);
+    char buf[16];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%d", &tm);
+    return buf;
+}
+
+// User-facing label for a backup row:
+//   Kai.d2s                          -> "Kai"
+//   ModernSharedStashSoftCoreV2.d2i  -> "Shared Stash (Modern SC)"
+//   ...
+std::string backupDisplayName(std::string_view filename) {
+    // Character: strip the .d2s / .D2S suffix.
+    auto endsIn = [&](std::string_view suf) {
+        if (filename.size() < suf.size()) return false;
+        const auto off = filename.size() - suf.size();
+        for (std::size_t i = 0; i < suf.size(); ++i) {
+            const char a = static_cast<char>(
+                std::tolower(static_cast<unsigned char>(filename[off + i])));
+            const char b = static_cast<char>(
+                std::tolower(static_cast<unsigned char>(suf[i])));
+            if (a != b) return false;
+        }
+        return true;
+    };
+    if (endsIn(".d2s")) return std::string(filename.substr(0, filename.size() - 4));
+    // Well-known stash variants get a friendly label with mode + ladder tag.
+    if (filename == "ModernSharedStashSoftCoreV2.d2i") return "Shared Stash (Modern SC)";
+    if (filename == "ModernSharedStashHardCoreV2.d2i") return "Shared Stash (Modern HC)";
+    if (filename == "SharedStashSoftCoreV2.d2i")       return "Shared Stash (SC)";
+    if (filename == "SharedStashHardCoreV2.d2i")       return "Shared Stash (HC)";
+    if (endsIn(".d2i")) return "Shared Stash";
+    return std::string(filename);
+}
+
 } // namespace
 
 Element renderBackupsSummary(const PaneConfig& config, BackupDb* db,
-                             bool focused,
+                             bool focused, int paneWidth,
                              int daysRetention, int sessionsRetention) {
     Element titleEl = text(" Backups ");
     if (focused) titleEl = titleEl | inverted;
@@ -786,25 +826,22 @@ Element renderBackupsSummary(const PaneConfig& config, BackupDb* db,
         else                                chars.push_back(&fs);
     }
 
-    // Fixed column widths so the layout doesn't wobble as rows update.
-    constexpr int kNameW = 40;
-    constexpr int kDateW = 20;
-    constexpr int kStateW = 10;
-    constexpr int kNumW = 9;
-
-    auto pad = [](std::string s, int w) {
-        if (static_cast<int>(s.size()) > w) return s.substr(0, w);
-        s.append(w - s.size(), ' ');
-        return s;
+    // Adaptive date column: include the wall-clock time when the pane
+    // is wide enough. Thresholds account for the window border + a
+    // reasonable minimum for the name column.
+    //   ~"YYYY-MM-DD HH:MM:SS" == 19 chars; leave at least 20 for names.
+    //   ~"YYYY-MM-DD"          == 10 chars; leave at least 12 for names.
+    const bool showTime = paneWidth >= (20 + 19 + 3);   // ~42 columns
+    auto formatDate = [&](std::int64_t d) {
+        return showTime ? formatWallDateTime(d) : formatWallDate(d);
     };
 
     auto rowFor = [&](const BackupDb::FileSummary& fs, bool selected) {
-        Element name = text(pad(fs.filename, kNameW));
-        Element when = text(pad(formatWallDateTime(fs.lastDate), kDateW));
-        Element st   = text(pad(std::string(backupStateShortLabel(fs.lastState)), kStateW));
-        Element sess = text(pad(std::to_string(fs.sessionCount), kNumW));
-        Element bk   = text(pad(std::to_string(fs.backupCount), kNumW));
-        auto row = hbox({name, when, st, sess, bk});
+        auto row = hbox({
+            text(backupDisplayName(fs.filename)) | flex,
+            text(" "),
+            text(formatDate(fs.lastDate)),
+        });
         if (selected) row = row | inverted;
         return row;
     };
@@ -814,12 +851,11 @@ Element renderBackupsSummary(const PaneConfig& config, BackupDb* db,
     const int cursor = totalRows == 0 ? 0
         : std::clamp(config.cursor, 0, totalRows - 1);
 
+    // Column header, matching the two-column layout.
     Element header = hbox({
-        text(pad("filename", kNameW))  | bold,
-        text(pad("last save", kDateW)) | bold,
-        text(pad("state", kStateW))    | bold,
-        text(pad("sessions", kNumW))   | bold,
-        text(pad("backups", kNumW))    | bold,
+        text("Name") | bold | flex,
+        text(" "),
+        text(showTime ? "Last Save" : "Last") | bold,
     });
 
     std::vector<Element> body;
@@ -827,25 +863,22 @@ Element renderBackupsSummary(const PaneConfig& config, BackupDb* db,
     body.push_back(separator());
     int i = 0;
 
-    // Shared Stash section.
-    if (!stash.empty()) {
-        body.push_back(text("Shared Stash") | bold | dim);
-        for (const auto* fs : stash) {
-            body.push_back(rowFor(*fs, i == cursor));
-            ++i;
-        }
+    // Shared stash rows (no explicit header -- the naming is
+    // self-documenting).
+    for (const auto* fs : stash) {
+        body.push_back(rowFor(*fs, i == cursor));
+        ++i;
+    }
+    // Blank line separator between stash and characters.
+    if (!stash.empty() && !chars.empty()) {
         body.push_back(text(""));
     }
-
-    // Characters section.
-    body.push_back(text("Characters") | bold | dim);
-    if (chars.empty()) {
-        body.push_back(text("  (no character backups yet)") | dim);
-    } else {
-        for (const auto* fs : chars) {
-            body.push_back(rowFor(*fs, i == cursor));
-            ++i;
-        }
+    if (chars.empty() && stash.empty()) {
+        body.push_back(text("  (no backups yet)") | dim);
+    }
+    for (const auto* fs : chars) {
+        body.push_back(rowFor(*fs, i == cursor));
+        ++i;
     }
 
     // Footer: hint the user how to drill in / edit retention.
@@ -962,11 +995,12 @@ Element renderBackupsDetail(const PaneConfig& config, BackupDb* db,
 }
 
 Element renderBackupsLeaf(const PaneConfig& config, BackupDb* db,
-                          bool focused, int pageHeight,
+                          bool focused, int paneWidth, int pageHeight,
                           int daysRetention, int sessionsRetention) {
     return config.backupViewMode == BackupViewMode::Detail
         ? renderBackupsDetail(config, db, focused, pageHeight)
-        : renderBackupsSummary(config, db, focused, daysRetention, sessionsRetention);
+        : renderBackupsSummary(config, db, focused, paneWidth,
+                                daysRetention, sessionsRetention);
 }
 
 // Returns the ordered filename list for the summary view (shared stash
@@ -1265,7 +1299,7 @@ Element renderPane(PaneNode& node, const UiState& ui,
             const int days = ui.backupScheduler ? ui.backupScheduler->retention().days : 30;
             const int sess = ui.backupScheduler ? ui.backupScheduler->retention().sessionsPerFile : 100;
             leafEl = renderBackupsLeaf(node.config, ui.backupDb, focused,
-                                        height, days, sess);
+                                        width, height, days, sess);
             break;
         }
         case PaneType::Blank:
