@@ -763,8 +763,11 @@ std::string formatWallDate(std::int64_t unix) {
 
 // User-facing label for a backup row:
 //   Kai.d2s                          -> "Kai"
-//   ModernSharedStashSoftCoreV2.d2i  -> "Shared Stash (Modern SC)"
+//   ModernSharedStashSoftCoreV2.d2i  -> "Modern Shared Stash"
+//   SharedStashHardCoreV2.d2i        -> "Shared Stash (Hardcore)"
 //   ...
+// Softcore is the default in D2R, so we don't bother tagging it in the
+// display -- only hardcore stashes carry the "(Hardcore)" qualifier.
 std::string backupDisplayName(std::string_view filename) {
     // Character: strip the .d2s / .D2S suffix.
     auto endsIn = [&](std::string_view suf) {
@@ -780,11 +783,13 @@ std::string backupDisplayName(std::string_view filename) {
         return true;
     };
     if (endsIn(".d2s")) return std::string(filename.substr(0, filename.size() - 4));
-    // Well-known stash variants get a friendly label with mode + ladder tag.
-    if (filename == "ModernSharedStashSoftCoreV2.d2i") return "Shared Stash (Modern SC)";
-    if (filename == "ModernSharedStashHardCoreV2.d2i") return "Shared Stash (Modern HC)";
-    if (filename == "SharedStashSoftCoreV2.d2i")       return "Shared Stash (SC)";
-    if (filename == "SharedStashHardCoreV2.d2i")       return "Shared Stash (HC)";
+    // The four known shared-stash variants. Softcore is unmarked; the
+    // "Modern" era (2.4+ / RotW, 6 tabs + chronicle) is distinct from
+    // the legacy pre-2.4 layout (3 tabs, no chronicle).
+    if (filename == "SharedStashSoftCoreV2.d2i")       return "Shared Stash";
+    if (filename == "SharedStashHardCoreV2.d2i")       return "Shared Stash (Hardcore)";
+    if (filename == "ModernSharedStashSoftCoreV2.d2i") return "Modern Shared Stash";
+    if (filename == "ModernSharedStashHardCoreV2.d2i") return "Modern Shared Stash (Hardcore)";
     if (endsIn(".d2i")) return "Shared Stash";
     return std::string(filename);
 }
