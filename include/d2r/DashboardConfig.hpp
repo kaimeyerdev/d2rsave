@@ -123,10 +123,6 @@ ReconcileKindFilter reconcileKindFromString(std::string_view);
 
 // ---- Persistence ------------------------------------------------------------
 
-// Resolved on-disk path for the dashboard config database. Ensures the
-// parent directory exists.
-[[nodiscard]] std::string dashboardConfigDbPath();
-
 // Open the config DB (create-if-missing) and ensure the schema exists.
 // Caller must release with closeDashboardConfigDb.
 sqlite3* openDashboardConfigDb();

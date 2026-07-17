@@ -13,6 +13,9 @@ add_executable(d2rsave_tests
     test_sql_emitter.cpp
     test_terror_zones.cpp
     tz_oracle_data.cpp
+    test_backup_db.cpp
+    test_backup_scheduler.cpp
+    test_recovery.cpp
 )
 target_link_libraries(d2rsave_tests PRIVATE
     d2rsave_core

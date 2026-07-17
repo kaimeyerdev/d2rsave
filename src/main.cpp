@@ -39,6 +39,13 @@
 #include "d2r/SunderCharms.hpp"
 #endif
 
+#if D2R_HAVE_SQLITE && D2R_HAVE_INOTIFY
+#include "d2r/BackupDb.hpp"
+#include "d2r/BackupScheduler.hpp"
+#include "d2r/Paths.hpp"
+#include "d2r/Recovery.hpp"
+#endif
+
 #if D2R_HAVE_DASHBOARD
 #include "d2r/Dashboard.hpp"
 #endif
@@ -143,7 +150,14 @@ int usage(const char* prog) {
         "\n"
 #endif
         "Diagnostic commands:\n"
-        "  db-info                      Show reference DB path and per-table row counts.\n",
+        "  db-info                      Show reference DB path and per-table row counts.\n"
+#if D2R_HAVE_INOTIFY
+        "\n"
+        "Backup commands (uses $XDG_DATA_HOME/d2rsave/backups.sqlite):\n"
+        "  backups <sub> [flags...]     summary | list | sessions | show | recover | prune\n"
+        "                               Pass 'backups --help' for the full flag list.\n"
+#endif
+        ,
         prog);
     return 2;
 }
@@ -473,6 +487,364 @@ int cmdDbInfo(const std::filesystem::path& exePath, std::string_view override) {
     }
     return 0;
 }
+
+#if D2R_HAVE_INOTIFY
+
+// ---- backups subcommand ---------------------------------------------------
+//
+// Owns its own arg-parsing loop since the shape doesn't fit the top-level
+// dispatcher's positional-only convention: `list --limit N --state K`,
+// `show <file> [--at ISO]`, `recover <file> --at ISO [--to DIR]`, etc.
+// All variants operate on the shared XDG backups.sqlite; recovery uses
+// `primarySavePath` as the default destination when `--to` is omitted.
+
+namespace {
+
+const char* stateName(d2r::BackupDb::State s) {
+    switch (s) {
+        case d2r::BackupDb::State::Deleted:     return "deleted";
+        case d2r::BackupDb::State::SaveAndExit: return "save_and_exit";
+        case d2r::BackupDb::State::Autosave:    return "autosave";
+        case d2r::BackupDb::State::Startup:     return "startup";
+    }
+    return "?";
+}
+
+std::string formatBackupDate(std::int64_t unix) {
+    if (unix <= 0) return "-";
+    const std::time_t t = static_cast<std::time_t>(unix);
+    std::tm tm{};
+    gmtime_r(&t, &tm);
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
+    return buf;
+}
+
+std::int64_t parseIsoUtc(std::string_view iso) {
+    int y = 0, mo = 0, d = 0, h = 0, mi = 0, se = 0;
+    if (std::sscanf(std::string(iso).c_str(),
+                    "%d-%d-%dT%d:%d:%d",
+                    &y, &mo, &d, &h, &mi, &se) < 3) {
+        throw std::runtime_error(
+            "backups: --at expects YYYY-MM-DDTHH:MM:SS (UTC); got '" +
+            std::string(iso) + "'");
+    }
+    std::tm tm{};
+    tm.tm_year = y - 1900; tm.tm_mon = mo - 1; tm.tm_mday = d;
+    tm.tm_hour = h; tm.tm_min = mi; tm.tm_sec = se;
+    return static_cast<std::int64_t>(timegm(&tm));
+}
+
+void printBackupsUsage() {
+    std::fprintf(stderr,
+        "Usage: d2rsave backups <subcommand> [flags]\n"
+        "\n"
+        "Subcommands:\n"
+        "  summary\n"
+        "      One line per known file: last-save time, state, session and\n"
+        "      backup counts. Uses the shared XDG backups.sqlite.\n"
+        "\n"
+        "  list [--filename NAME] [--limit N] [--state K]\n"
+        "      Reverse-chronological rows. --state filters to one of\n"
+        "      0(deleted) 1(save_and_exit) 2(autosave) 3(startup).\n"
+        "\n"
+        "  sessions <filename> [--limit N]\n"
+        "      Print one line per session for a .d2s file. A session ends\n"
+        "      at a save_and_exit row; the current in-progress session (no\n"
+        "      closing save_and_exit yet) is labelled 'in progress'.\n"
+        "\n"
+        "  show <filename> --at YYYY-MM-DDTHH:MM:SSZ\n"
+        "      Print the row that was current at the given UTC moment.\n"
+        "\n"
+        "  recover <filename> --at YYYY-MM-DDTHH:MM:SSZ [--to DIR]\n"
+        "                     [--no-pre-snapshot]\n"
+        "      Restore that row's bytes. --to defaults to the --path save\n"
+        "      dir; a pre-recovery snapshot of the destination is taken\n"
+        "      unless --no-pre-snapshot is passed.\n"
+        "\n"
+        "  prune [--days N] [--sessions M]\n"
+        "      Enforce retention now. Defaults: 30 days, 100 sessions per\n"
+        "      character.\n"
+        "\n"
+        "  snapshot\n"
+        "      Force a startup-style sweep of --path <saves-dir>. Useful\n"
+        "      for seeding or refreshing the backup DB outside the TUI.\n");
+}
+
+int cmdBackupsSummary() {
+    d2r::BackupDb db(d2r::backupDbPath());
+    const auto sums = db.summariseFiles();
+    if (sums.empty()) {
+        std::printf("(no backups yet)\n");
+        return 0;
+    }
+    std::printf("%-40s  %-20s  %-14s  %8s  %8s\n",
+                "filename", "last-save", "state", "sessions", "backups");
+    for (const auto& fs : sums) {
+        std::printf("%-40s  %-20s  %-14s  %8lld  %8lld\n",
+                    fs.filename.c_str(),
+                    formatBackupDate(fs.lastDate).c_str(),
+                    stateName(fs.lastState),
+                    static_cast<long long>(fs.sessionCount),
+                    static_cast<long long>(fs.backupCount));
+    }
+    return 0;
+}
+
+int cmdBackupsList(std::vector<std::string_view> args) {
+    std::string filenameFilter;
+    std::int64_t limit = 50;
+    int stateFilter = -1;
+    for (std::size_t i = 2; i < args.size(); ++i) {
+        const auto a = args[i];
+        auto need = [&](const char* flag) {
+            if (i + 1 >= args.size()) {
+                throw std::runtime_error(std::string("backups list: ") + flag + " expects a value");
+            }
+            return args[++i];
+        };
+        if      (a == "--filename") filenameFilter = need("--filename");
+        else if (a == "--limit")    limit = std::atoll(std::string(need("--limit")).c_str());
+        else if (a == "--state")    stateFilter = std::atoi(std::string(need("--state")).c_str());
+        else {
+            throw std::runtime_error("backups list: unknown flag '" + std::string(a) + "'");
+        }
+    }
+    d2r::BackupDb db(d2r::backupDbPath());
+    if (!filenameFilter.empty()) {
+        const auto hist = db.historyFor(filenameFilter, static_cast<std::size_t>(limit));
+        for (const auto& r : hist) {
+            if (stateFilter >= 0 && static_cast<int>(r.state) != stateFilter) continue;
+            std::printf("%-20s  %-14s  %8lld bytes\n",
+                        formatBackupDate(r.date).c_str(),
+                        stateName(r.state),
+                        static_cast<long long>(r.sizeBytes));
+        }
+        return 0;
+    }
+    // No filter: walk summaries and expand each. Simpler than adding a
+    // whole-DB accessor to BackupDb for this one call site.
+    for (const auto& fs : db.summariseFiles()) {
+        std::printf("== %s ==\n", fs.filename.c_str());
+        const auto hist = db.historyFor(fs.filename, static_cast<std::size_t>(limit));
+        for (const auto& r : hist) {
+            if (stateFilter >= 0 && static_cast<int>(r.state) != stateFilter) continue;
+            std::printf("  %-20s  %-14s  %8lld bytes\n",
+                        formatBackupDate(r.date).c_str(),
+                        stateName(r.state),
+                        static_cast<long long>(r.sizeBytes));
+        }
+    }
+    return 0;
+}
+
+int cmdBackupsSessions(std::vector<std::string_view> args) {
+    if (args.size() < 3) {
+        std::fprintf(stderr, "error: backups sessions: expected <filename>\n");
+        return 2;
+    }
+    const std::string filename(args[2]);
+    std::int64_t limit = 100;
+    for (std::size_t i = 3; i < args.size(); ++i) {
+        if (args[i] == "--limit" && i + 1 < args.size()) {
+            limit = std::atoll(std::string(args[++i]).c_str());
+        } else {
+            throw std::runtime_error("backups sessions: unknown flag '" + std::string(args[i]) + "'");
+        }
+    }
+    d2r::BackupDb db(d2r::backupDbPath());
+    // Load enough history to reconstruct sessions. Ask for many rows;
+    // for a .d2s that's fine.
+    const auto hist = db.historyFor(filename, 10000);
+    if (hist.empty()) {
+        std::printf("(no backups for %s)\n", filename.c_str());
+        return 0;
+    }
+    // hist is date-DESC. Walk backwards (oldest -> newest) so a session's
+    // "start" is naturally the first row in that session's range.
+    struct Session {
+        std::int64_t startDate = 0, endDate = 0;
+        std::int64_t rowCount  = 0;
+        bool inProgress        = false;
+    };
+    std::vector<Session> sessions;
+    Session cur;
+    cur.startDate = hist.back().date;
+    for (auto it = hist.rbegin(); it != hist.rend(); ++it) {
+        cur.rowCount += 1;
+        cur.endDate = it->date;
+        if (it->state == d2r::BackupDb::State::SaveAndExit) {
+            sessions.push_back(cur);
+            cur = Session{};
+            // Next session (if any) begins here.
+            auto next = it + 1;
+            if (next != hist.rend()) cur.startDate = next->date;
+        }
+    }
+    if (cur.rowCount > 0) {
+        cur.inProgress = true;
+        sessions.push_back(cur);
+    }
+    // Sessions are oldest-first; reverse to show newest-first, matching
+    // the summary view.
+    std::reverse(sessions.begin(), sessions.end());
+    std::int64_t printed = 0;
+    std::printf("%-20s  %-20s  %8s  %s\n",
+                "start", "end", "rows", "status");
+    for (const auto& s : sessions) {
+        if (printed++ >= limit) break;
+        std::printf("%-20s  %-20s  %8lld  %s\n",
+                    formatBackupDate(s.startDate).c_str(),
+                    formatBackupDate(s.endDate).c_str(),
+                    static_cast<long long>(s.rowCount),
+                    s.inProgress ? "in progress" : "complete");
+    }
+    return 0;
+}
+
+int cmdBackupsShow(std::vector<std::string_view> args) {
+    if (args.size() < 3) {
+        std::fprintf(stderr, "error: backups show: expected <filename>\n");
+        return 2;
+    }
+    const std::string filename(args[2]);
+    std::int64_t at = std::numeric_limits<std::int64_t>::max();
+    for (std::size_t i = 3; i < args.size(); ++i) {
+        if (args[i] == "--at" && i + 1 < args.size()) {
+            at = parseIsoUtc(args[++i]);
+        } else {
+            throw std::runtime_error("backups show: unknown flag '" + std::string(args[i]) + "'");
+        }
+    }
+    d2r::BackupDb db(d2r::backupDbPath());
+    auto row = db.at(filename, at);
+    if (!row) {
+        std::printf("(no backup for %s at or before %s)\n",
+                    filename.c_str(), formatBackupDate(at).c_str());
+        return 1;
+    }
+    std::printf("file:  %s\n", filename.c_str());
+    std::printf("state: %s\n", stateName(row->state));
+    std::printf("bytes: %zu\n", row->data.size());
+    return 0;
+}
+
+int cmdBackupsRecover(std::vector<std::string_view>       args,
+                      const std::filesystem::path&        primarySavePath) {
+    if (args.size() < 3) {
+        std::fprintf(stderr, "error: backups recover: expected <filename>\n");
+        return 2;
+    }
+    const std::string filename(args[2]);
+    std::optional<std::int64_t> at;
+    std::filesystem::path       to = primarySavePath;
+    bool                        pre = true;
+    for (std::size_t i = 3; i < args.size(); ++i) {
+        if (args[i] == "--at" && i + 1 < args.size()) at = parseIsoUtc(args[++i]);
+        else if (args[i] == "--to" && i + 1 < args.size()) to = args[++i];
+        else if (args[i] == "--no-pre-snapshot") pre = false;
+        else throw std::runtime_error("backups recover: unknown flag '" + std::string(args[i]) + "'");
+    }
+    if (!at) {
+        std::fprintf(stderr, "error: backups recover: --at YYYY-MM-DDTHH:MM:SSZ is required\n");
+        return 2;
+    }
+    if (to.empty()) {
+        std::fprintf(stderr,
+            "error: backups recover: destination unknown. Pass --to <dir>\n"
+            "       or the global --path <saves-dir>.\n");
+        return 2;
+    }
+    d2r::BackupDb db(d2r::backupDbPath());
+    // Scheduler needs a saves-dir; use `to` as the effective one. If it's
+    // the primary saves dir that matches, in-place semantics. If it's an
+    // alt dir, that's also fine -- the scheduler only reads bytes from it
+    // for the pre-recovery snapshot, which is what we want.
+    d2r::BackupScheduler sched(db, to);
+    d2r::RecoverySpec spec;
+    spec.destDir              = to;
+    spec.filename             = filename;
+    spec.atUnix               = *at;
+    spec.preRecoveryBackup    = pre;
+    spec.allowTombstoneRestore = (to == primarySavePath);
+
+    const auto rep = d2r::recoverFile(db, sched, spec);
+    if (!rep.restored && !rep.wasTombstone) {
+        std::fprintf(stderr, "no backup for %s at or before %s\n",
+                     filename.c_str(), formatBackupDate(*at).c_str());
+        return 1;
+    }
+    std::printf("recovered:       %s\n", filename.c_str());
+    std::printf("as-of:           %s (asked %s)\n",
+                formatBackupDate(rep.recoveredDate).c_str(),
+                formatBackupDate(*at).c_str());
+    std::printf("destination:     %s\n", (to / filename).string().c_str());
+    std::printf("bytes-written:   %lld\n", static_cast<long long>(rep.bytesWritten));
+    std::printf("tombstone:       %s\n", rep.wasTombstone ? "yes" : "no");
+    std::printf("pre-snapshot:    %s\n", rep.preSnapshotTaken ? "taken" : "skipped");
+    return 0;
+}
+
+int cmdBackupsPrune(std::vector<std::string_view> args) {
+    int days = 30, sessions = 100;
+    for (std::size_t i = 2; i < args.size(); ++i) {
+        if      (args[i] == "--days"     && i + 1 < args.size()) days = std::atoi(std::string(args[++i]).c_str());
+        else if (args[i] == "--sessions" && i + 1 < args.size()) sessions = std::atoi(std::string(args[++i]).c_str());
+        else throw std::runtime_error("backups prune: unknown flag '" + std::string(args[i]) + "'");
+    }
+    d2r::BackupDb db(d2r::backupDbPath());
+    const auto now = static_cast<std::int64_t>(std::time(nullptr));
+    const auto n   = db.enforceRetention(days, sessions, now);
+    std::printf("pruned %lld rows (days=%d sessions=%d)\n",
+                static_cast<long long>(n), days, sessions);
+    return 0;
+}
+
+int cmdBackupsSnapshot(const std::filesystem::path& savePath) {
+    if (savePath.empty()) {
+        std::fprintf(stderr,
+            "error: backups snapshot: requires --path <saves-dir>\n");
+        return 2;
+    }
+    d2r::BackupDb db(d2r::backupDbPath());
+    d2r::BackupScheduler sched(db, savePath);
+    sched.takeStartupSnapshot();
+    const auto sums = db.summariseFiles();
+    std::printf("snapshot: %zu file%s in %s\n",
+                sums.size(), sums.size() == 1 ? "" : "s",
+                savePath.string().c_str());
+    return 0;
+}
+
+int cmdBackups(std::vector<std::string_view>       args,
+               const std::filesystem::path&        primarySavePath) {
+    if (args.size() < 2) {
+        printBackupsUsage();
+        return 2;
+    }
+    try {
+        const auto sub = args[1];
+        if (sub == "summary")  return cmdBackupsSummary();
+        if (sub == "list")     return cmdBackupsList(args);
+        if (sub == "sessions") return cmdBackupsSessions(args);
+        if (sub == "show")     return cmdBackupsShow(args);
+        if (sub == "recover")  return cmdBackupsRecover(args, primarySavePath);
+        if (sub == "prune")    return cmdBackupsPrune(args);
+        if (sub == "snapshot") return cmdBackupsSnapshot(primarySavePath);
+        if (sub == "-h" || sub == "--help") { printBackupsUsage(); return 0; }
+        std::fprintf(stderr, "error: unknown backups subcommand '%.*s'\n\n",
+                     static_cast<int>(sub.size()), sub.data());
+        printBackupsUsage();
+        return 2;
+    } catch (const std::exception& ex) {
+        std::fprintf(stderr, "error: %s\n", ex.what());
+        return 1;
+    }
+}
+
+} // namespace
+
+#endif // D2R_HAVE_INOTIFY
 
 // Enumerate every item across the requested scope (characters +
 // shared-stash tabs, honouring ItemScope), apply quality and substring
@@ -1646,6 +2018,18 @@ int main(int argc, char** argv) {
             return cmdDbInfo(exe, r);
         };
     }
+#if D2R_HAVE_INOTIFY
+    else if (cmd == "backups") {
+        // Subcommand-style; owns its own arg parsing. --watch is nonsense
+        // here (backups is idempotent + queries), so opt out.
+        watchCompatible = false;
+        std::vector<std::string_view> subArgs(positional.begin(), positional.end());
+        auto sp = savePath;  // may be empty; recover checks
+        runCommand = [subArgs = std::move(subArgs), sp]{
+            return cmdBackups(subArgs, sp);
+        };
+    }
+#endif
 #if D2R_HAVE_DASHBOARD
     else if (cmd == "dashboard") { requirePath(); requireArgs(0);
         // The dashboard runs its own inotify watcher inside `runDashboard`,
@@ -1736,7 +2120,7 @@ int main(int argc, char** argv) {
             const std::time_t now = std::time(nullptr);
             std::strftime(stamp, sizeof(stamp), "%H:%M:%S", std::localtime(&now));
 
-            if (*trig == d2r::DirectoryWatcher::Trigger::Executable) {
+            if (trig->kind == d2r::DirectoryWatcher::Trigger::Kind::Executable) {
                 std::fprintf(stderr,
                     "\n[watch] %s -- binary changed at %s, re-executing\n",
                     stamp, exePath.c_str());

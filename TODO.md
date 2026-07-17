@@ -401,6 +401,40 @@ one-off generator (see the "Regeneration" comment at the top of
 `tz_oracle_data.cpp`, and update the size / first / last assertions in
 the "Oracle vector is well-formed" test.
 
+### Backups -- follow-ups
+
+The dashboard now writes automatic backups to
+`$XDG_DATA_HOME/d2rsave/backups.sqlite` on watcher events, with a full
+sweep at bootstrap, session-aware retention, and a CLI story for list
+/ show / sessions / recover / prune / snapshot. The following items
+build on that foundation and are all deferred.
+
+* **TUI Backups pane.** A `PaneType::Backups` renderer with the
+  summary + detail + recovery dialog + retention editor layout
+  sketched in the plan. Everything is CLI-only today; the pane would
+  bring parity into the interactive UI.
+* **Persist retention config in `dashboard.sqlite`.** Right now the
+  scheduler uses hard-coded defaults (30 days, 100 sessions per
+  character) and the CLI `prune` takes flags at each invocation.
+  A `backup_retention (days, sessions)` table in the dashboard
+  config DB would let a user tune once and have both the dashboard
+  and the CLI honour the same numbers.
+* **`.d2s` diff (character-level).** Given two rows for the same
+  filename, walk the `Character` structs (level, experience, quests,
+  waypoints, items by fingerprint) and emit a typed diff.
+* **`.d2i` diff (shared-stash).** Same idea for
+  `SharedStashParser::parse()` output -- diff by tab, chronicle
+  additions, item movements.
+* **Session-delta dashboard pane.** Uses the backups DB as an anchor
+  ("XP earned since the startup snapshot", levels gained, items added
+  to chronicle). Depends on diff.
+* **File-history browser pane.** Timeline per file with drill-in;
+  overlaps with the Backups pane detail view.
+* **Optional `.ma0` .. `.ma3` backup.** The scheduler currently
+  persists only `.d2s` / `.d2i`. Map state might be worth capturing
+  for waypoint recovery; low-priority.
+* **CLI shell completions** for the new `backups` subcommands.
+
 ## Build / packaging
 
 * Add a top-level `LICENSE` file for this port. Because we vendor

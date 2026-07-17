@@ -40,6 +40,7 @@ add_library(d2rsave_core STATIC
     src/save.cpp
     src/bitreader.cpp
     src/character_parser.cpp
+    src/paths.cpp
 )
 target_include_directories(d2rsave_core PUBLIC include)
 target_compile_features(d2rsave_core PUBLIC cxx_std_20)
@@ -102,7 +103,14 @@ if(D2R_USE_VCPKG)
             src/item_parser.cpp
             src/shared_stash_parser.cpp
             src/terror_zones.cpp
+            src/backup_db.cpp
         )
+        if(D2R_HAVE_INOTIFY)
+            target_sources(d2rsave_core PRIVATE
+                src/backup_scheduler.cpp
+                src/recovery.cpp
+            )
+        endif()
         target_link_libraries(d2rsave_core PUBLIC ${D2R_SQLITE_TARGET} fmt::fmt)
         target_compile_definitions(d2rsave_core PUBLIC D2R_HAVE_SQLITE=1)
         target_compile_definitions(d2rsave PRIVATE

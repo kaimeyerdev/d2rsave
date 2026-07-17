@@ -12,10 +12,12 @@
 #pragma once
 
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace d2r {
 
@@ -26,10 +28,25 @@ public:
 
 class DirectoryWatcher {
 public:
-    // Which target woke the caller. Executable events take priority when
-    // both fire in the same debounce window (the caller wants to re-exec
-    // rather than re-run stale code).
-    enum class Trigger { Primary, Executable };
+    // One file's contribution to a debounce window. `mask` is the OR of
+    // every inotify event mask observed for `name` during the window
+    // (typically some combination of IN_MODIFY / IN_CLOSE_WRITE / IN_DELETE
+    // etc.). Consumers use the mask to decide whether the file is worth
+    // reading (CLOSE_WRITE) or was removed (IN_DELETE).
+    struct ChangedFile {
+        std::string   name;
+        std::uint32_t mask = 0;
+    };
+
+    // What woke the caller. `Executable` events take priority over primary
+    // events in the same debounce window (the caller wants to re-exec
+    // rather than re-run stale code). `files` is only populated for
+    // `Primary` triggers.
+    struct Trigger {
+        enum class Kind { Primary, Executable };
+        Kind                     kind = Kind::Primary;
+        std::vector<ChangedFile> files;
+    };
 
     // Watch `primaryDir` non-recursively. Throws WatcherError on failure.
     explicit DirectoryWatcher(const std::filesystem::path& primaryDir);

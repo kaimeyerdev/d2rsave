@@ -17,6 +17,7 @@
 #include <sys/inotify.h>
 #include <thread>
 #include <unistd.h>
+#include <unordered_map>
 #include <vector>
 
 namespace d2r {
@@ -147,23 +148,42 @@ DirectoryWatcher::waitForChange(std::chrono::milliseconds debounce) {
     if (::poll(&wake, 1, 0) > 0 && (wake.revents & POLLIN)) return std::nullopt;
 
     // 5. Classify. Executable wins when both fire in the same window.
-    bool sawPrimary = false;
-    bool sawExe     = false;
+    // While walking events, accumulate primary-dir filenames into a
+    // {name -> OR-of-masks} map so consumers (e.g. the backup scheduler)
+    // can tell writes apart from deletes without re-parsing the raw
+    // events.
+    bool sawExe = false;
+    std::unordered_map<std::string, std::uint32_t> primaryFiles;
     for (std::size_t i = 0; i + sizeof(inotify_event) <= events.size();) {
         const auto* ev = reinterpret_cast<const inotify_event*>(events.data() + i);
         const std::string_view name{ev->name, ev->len ? ::strnlen(ev->name, ev->len) : 0};
         if (ev->wd == exeWd_ && name == exeBasename_) {
             sawExe = true;
         } else if (ev->wd == primaryWd_) {
-            sawPrimary = true;
+            if (!name.empty()) {
+                primaryFiles[std::string(name)] |= ev->mask;
+            }
+            // Events without a name (IN_DELETE_SELF, IN_MOVE_SELF on the
+            // watched dir itself) still count as "something happened";
+            // fall through so we return a Primary trigger with no files.
         }
         i += sizeof(inotify_event) + ev->len;
     }
-    if (sawExe)     return Trigger::Executable;
-    if (sawPrimary) return Trigger::Primary;
-    // No relevant classification -> spurious wake-up. Treat as primary so the
-    // caller re-runs; that's safer than pretending nothing happened.
-    return Trigger::Primary;
+
+    Trigger result;
+    if (sawExe) {
+        result.kind = Trigger::Kind::Executable;
+        return result;
+    }
+    result.kind = Trigger::Kind::Primary;
+    result.files.reserve(primaryFiles.size());
+    for (auto& kv : primaryFiles) {
+        result.files.push_back({kv.first, kv.second});
+    }
+    // Note: no events at all -> spurious wake-up. Return a Primary
+    // trigger with an empty file list so the caller can re-scan; the
+    // scheduler will just do nothing.
+    return result;
 }
 
 } // namespace d2r

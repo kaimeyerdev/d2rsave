@@ -9,6 +9,9 @@
 #include "d2r/RefDb.hpp"
 
 #if D2R_HAVE_INOTIFY
+#include "d2r/BackupDb.hpp"
+#include "d2r/BackupScheduler.hpp"
+#include "d2r/Paths.hpp"
 #include "d2r/Watcher.hpp"
 #endif
 
@@ -1070,6 +1073,26 @@ int runDashboard(const std::filesystem::path& savePath,
         std::fprintf(stderr, "warning: %s (layout will not persist)\n", ex.what());
     }
 
+#if D2R_HAVE_INOTIFY
+    // Backup DB + scheduler. Failure to open is non-fatal (the dashboard
+    // still works, just without automatic backups). The startup sweep
+    // happens before we enter the FTXUI loop so its writes don't compete
+    // with the first render.
+    std::unique_ptr<BackupDb>        backupDb;
+    std::unique_ptr<BackupScheduler> backupScheduler;
+    try {
+        backupDb = std::make_unique<BackupDb>(backupDbPath());
+        backupScheduler = std::make_unique<BackupScheduler>(*backupDb, savePath);
+        backupScheduler->takeStartupSnapshot();
+    } catch (const std::exception& ex) {
+        std::fprintf(stderr,
+            "warning: backup DB unavailable (%s); no automatic backups this session\n",
+            ex.what());
+        backupScheduler.reset();
+        backupDb.reset();
+    }
+#endif
+
     UiState ui;
     ui.watchedPath = savePath.string();
     ui.rootPane = configDb ? loadPaneTree(configDb) : makeDefaultLayout();
@@ -1365,11 +1388,23 @@ int runDashboard(const std::filesystem::path& savePath,
     }
     if (watcher) {
         try {
-            watcherThread = std::thread([w = watcher.get(), &ui, postRebuild] {
+            auto* schedRaw = backupScheduler.get();
+            watcherThread = std::thread([w = watcher.get(), &ui, postRebuild, schedRaw] {
                 while (!ui.shutdown.load(std::memory_order_relaxed)) {
                     auto trig = w->waitForChange();
                     if (!trig) break;   // shutdown() or spurious signal
                     if (ui.shutdown.load()) break;
+                    // Persist bytes before the rebuild so the backup and
+                    // the visible snapshot come from the same on-disk
+                    // state.
+                    if (schedRaw && trig->kind == DirectoryWatcher::Trigger::Kind::Primary) {
+                        try {
+                            schedRaw->handleWatcherEvents(trig->files);
+                        } catch (const std::exception& ex) {
+                            std::fprintf(stderr, "[backup] watcher-handler failed: %s\n",
+                                         ex.what());
+                        }
+                    }
                     postRebuild();
                 }
             });

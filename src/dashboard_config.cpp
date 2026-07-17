@@ -3,6 +3,8 @@
 
 #include "d2r/DashboardConfig.hpp"
 
+#include "d2r/Paths.hpp"
+
 #include <nlohmann/json.hpp>
 #include <sqlite3.h>
 
@@ -190,24 +192,8 @@ ReconcileKindFilter reconcileKindFromString(std::string_view s) {
 
 // ---- Persistence ------------------------------------------------------------
 
-std::string dashboardConfigDbPath() {
-    namespace fs = std::filesystem;
-    fs::path base;
-    if (const char* xdg = std::getenv("XDG_DATA_HOME"); xdg && *xdg) {
-        base = fs::path(xdg) / "d2rsave";
-    } else if (const char* home = std::getenv("HOME"); home && *home) {
-        base = fs::path(home) / ".local" / "share" / "d2rsave";
-    } else {
-        throw std::runtime_error(
-            "cannot locate dashboard config db: neither $XDG_DATA_HOME nor $HOME is set");
-    }
-    std::error_code ec;
-    fs::create_directories(base, ec);
-    return (base / "dashboard.sqlite").string();
-}
-
 sqlite3* openDashboardConfigDb() {
-    const auto path = dashboardConfigDbPath();
+    const auto path = d2r::dashboardConfigDbPath().string();
     sqlite3* db = nullptr;
     if (sqlite3_open_v2(path.c_str(), &db,
                         SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
