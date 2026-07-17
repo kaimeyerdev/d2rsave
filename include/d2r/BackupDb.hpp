@@ -9,12 +9,19 @@
 //                                clock sampled once per burst
 //   state    INTEGER NOT NULL    0=deleted, 1=save_and_exit,
 //                                2=autosave, 3=startup
+//   checksum INTEGER             per-file-type fingerprint of `data` --
+//                                the D2R rotate-add checksum (offset
+//                                0x0C) for .d2s, CRC-32 for .d2i, NULL
+//                                for tombstones and legacy rows written
+//                                before this column existed
 //   data     BLOB                the raw file bytes; NULL iff state=0
 //
 // Recovery is a point-in-time query on (filename, date). Retention is
 // session-aware: keep rows within X days OR belonging to the last Y
 // sessions per character (with shared-stash rows inheriting the union of
-// preserved character session date ranges).
+// preserved character session date ranges). Change-detection uses
+// `checksum` to skip inserting bytes that are identical to the most
+// recent row for the same filename.
 
 #pragma once
 
@@ -60,18 +67,28 @@ public:
     void insert(std::string_view filename,
                 std::int64_t     dateUnix,
                 State            state,
+                std::uint32_t    checksum,
                 std::span<const std::byte> data);
 
-    // Insert a tombstone row (state=Deleted, data=NULL).
+    // Insert a tombstone row (state=Deleted, data=NULL, checksum=NULL).
     void insertTombstone(std::string_view filename, std::int64_t dateUnix);
 
     // Fetch the latest row where date <= askUnix, or nullopt if none.
     struct Row {
-        State                   state = State::Autosave;
-        std::vector<std::byte>  data;   // empty when state=Deleted
+        State                        state = State::Autosave;
+        std::optional<std::uint32_t> checksum;   // NULL for tombstones / legacy
+        std::vector<std::byte>       data;       // empty when state=Deleted
     };
     [[nodiscard]] std::optional<Row>
     at(std::string_view filename, std::int64_t askUnix) const;
+
+    // Fetch the checksum of the most-recent row for `filename`, or
+    // nullopt if the file has no rows OR the newest row is a tombstone
+    // OR the newest row was written before the `checksum` column
+    // existed. Used by BackupScheduler for change detection: an equal
+    // checksum means the bytes haven't changed since the last insert.
+    [[nodiscard]] std::optional<std::uint32_t>
+    lastChecksumFor(std::string_view filename) const;
 
     // Delete rows that fail both the date rule (date < now - days*86400)
     // and the session rule (belong to the last `sessionsPerFile` sessions

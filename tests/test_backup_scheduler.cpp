@@ -229,3 +229,106 @@ TEST_CASE("Scheduler.handleWatcherEvents records tombstone on IN_DELETE",
     REQUIRE(row->state == BackupDb::State::Deleted);
     REQUIRE(row->data.empty());
 }
+
+TEST_CASE("computeFileChecksum picks the right algorithm per extension",
+          "[backup][scheduler][checksum]") {
+    const std::string d2sBytes = makeD2sBuffer(1234, "payload-alpha");
+    const std::string d2iBytes = "arbitrary-stash-bytes";
+
+    const auto d2sSum = bs::computeFileChecksum(
+        "Kai.d2s",
+        std::span{reinterpret_cast<const std::byte*>(d2sBytes.data()), d2sBytes.size()});
+    const auto d2iSum = bs::computeFileChecksum(
+        "Shared.d2i",
+        std::span{reinterpret_cast<const std::byte*>(d2iBytes.data()), d2iBytes.size()});
+
+    // Same bytes must produce the same result.
+    REQUIRE(bs::computeFileChecksum(
+        "Kai.d2s",
+        std::span{reinterpret_cast<const std::byte*>(d2sBytes.data()), d2sBytes.size()}
+    ) == d2sSum);
+    REQUIRE(bs::computeFileChecksum(
+        "Shared.d2i",
+        std::span{reinterpret_cast<const std::byte*>(d2iBytes.data()), d2iBytes.size()}
+    ) == d2iSum);
+
+    // Different bytes yield different results (spot check).
+    const std::string d2iOther = "different-stash-bytes";
+    REQUIRE(bs::computeFileChecksum(
+        "Shared.d2i",
+        std::span{reinterpret_cast<const std::byte*>(d2iOther.data()), d2iOther.size()}
+    ) != d2iSum);
+}
+
+TEST_CASE("Scheduler dedups: second startup snapshot skips unchanged files",
+          "[backup][scheduler][dedup]") {
+    Scratch sc;
+    writeFile(sc.savesDir, "Kai.d2s",    makeD2sBuffer(555));
+    writeFile(sc.savesDir, "Shared.d2i", "stash-bytes-v1");
+
+    BackupDb db(sc.dbPath);
+    BackupScheduler sched(db, sc.savesDir);
+
+    // First sweep: both files land as new rows.
+    sched.takeStartupSnapshot();
+    REQUIRE(db.historyFor("Kai.d2s",    10).size() == 1);
+    REQUIRE(db.historyFor("Shared.d2i", 10).size() == 1);
+
+    // Second sweep: bytes are unchanged, so no new rows.
+    sched.takeStartupSnapshot();
+    REQUIRE(db.historyFor("Kai.d2s",    10).size() == 1);
+    REQUIRE(db.historyFor("Shared.d2i", 10).size() == 1);
+
+    // Mutate the stash bytes -- next sweep inserts one new row for it
+    // and leaves the character alone.
+    writeFile(sc.savesDir, "Shared.d2i", "stash-bytes-v2");
+    sched.takeStartupSnapshot();
+    REQUIRE(db.historyFor("Kai.d2s",    10).size() == 1);
+    REQUIRE(db.historyFor("Shared.d2i", 10).size() == 2);
+}
+
+TEST_CASE("Scheduler dedups: identical watcher-event bytes don't insert",
+          "[backup][scheduler][dedup]") {
+    Scratch sc;
+    writeFile(sc.savesDir, "Kai.d2s", makeD2sBuffer(555, "same-payload"));
+
+    BackupDb db(sc.dbPath);
+    BackupScheduler sched(db, sc.savesDir);
+
+    const std::vector<DirectoryWatcher::ChangedFile> burst = {
+        mkFile("Kai.d2s", IN_MODIFY | IN_CLOSE_WRITE),
+    };
+    sched.handleWatcherEvents(burst);
+    REQUIRE(db.historyFor("Kai.d2s", 10).size() == 1);
+
+    // Same file, same bytes -- no new row.
+    sched.handleWatcherEvents(burst);
+    REQUIRE(db.historyFor("Kai.d2s", 10).size() == 1);
+
+    // Change the file (even in a byte that keeps the header timestamp);
+    // now a second row lands.
+    writeFile(sc.savesDir, "Kai.d2s", makeD2sBuffer(555, "different-payload"));
+    sched.handleWatcherEvents(burst);
+    REQUIRE(db.historyFor("Kai.d2s", 10).size() == 2);
+}
+
+TEST_CASE("BackupDb.lastChecksumFor returns NULL for tombstones and legacy",
+          "[backup][db][checksum]") {
+    Scratch sc;
+    BackupDb db(sc.dbPath);
+
+    // Empty file history.
+    REQUIRE_FALSE(db.lastChecksumFor("nothing.d2s").has_value());
+
+    // Regular insert -> checksum is retrievable.
+    const std::string bytes = "abc";
+    db.insert("Kai.d2s", 1000, BackupDb::State::Autosave, 0xABCDu,
+              std::span{reinterpret_cast<const std::byte*>(bytes.data()), bytes.size()});
+    auto ck = db.lastChecksumFor("Kai.d2s");
+    REQUIRE(ck.has_value());
+    REQUIRE(*ck == 0xABCDu);
+
+    // Tombstone -> newest row has no checksum, so lastChecksumFor is NULL.
+    db.insertTombstone("Kai.d2s", 2000);
+    REQUIRE_FALSE(db.lastChecksumFor("Kai.d2s").has_value());
+}

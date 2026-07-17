@@ -18,6 +18,9 @@ namespace {
 
 // One row of PRAGMAs + the schema, applied on first open. Idempotent
 // via IF NOT EXISTS so subsequent opens are cheap.
+//
+// The `checksum` column was added after v1 shipped. Existing DBs that
+// don't have it are migrated below in BackupDb::BackupDb().
 constexpr const char* kSchema =
     "PRAGMA journal_mode = WAL;"
     "PRAGMA synchronous  = NORMAL;"
@@ -25,6 +28,7 @@ constexpr const char* kSchema =
     "  filename TEXT    NOT NULL,"
     "  date     INTEGER NOT NULL,"
     "  state    INTEGER NOT NULL,"
+    "  checksum INTEGER,"
     "  data     BLOB"
     ");"
     "CREATE INDEX IF NOT EXISTS idx_backup_filename_date"
@@ -139,6 +143,20 @@ BackupDb::BackupDb(const std::filesystem::path& dbPath) {
     }
     try {
         execOrThrow(db_, kSchema);
+        // Migrate: `checksum` column was added after the initial release.
+        // ADD COLUMN is idempotent-safe when we check first via
+        // pragma_table_info.
+        bool hasChecksum = false;
+        {
+            Stmt s(db_,
+                "SELECT COUNT(*) FROM pragma_table_info('backup') "
+                " WHERE name = 'checksum'");
+            (void) s.step();
+            hasChecksum = s.columnInt64(0) > 0;
+        }
+        if (!hasChecksum) {
+            execOrThrow(db_, "ALTER TABLE backup ADD COLUMN checksum INTEGER");
+        }
     } catch (...) {
         sqlite3_close(db_);
         db_ = nullptr;
@@ -164,26 +182,28 @@ BackupDb& BackupDb::operator=(BackupDb&& other) noexcept {
 void BackupDb::insert(std::string_view filename,
                       std::int64_t     dateUnix,
                       State            state,
+                      std::uint32_t    checksum,
                       std::span<const std::byte> data) {
     Stmt s(db_,
-        "INSERT INTO backup (filename, date, state, data) "
-        "VALUES (?, ?, ?, ?)");
+        "INSERT INTO backup (filename, date, state, checksum, data) "
+        "VALUES (?, ?, ?, ?, ?)");
     s.bindText(1, filename);
     s.bindInt64(2, dateUnix);
     s.bindInt64(3, static_cast<std::int64_t>(state));
+    s.bindInt64(4, static_cast<std::int64_t>(checksum));
     // sqlite3_bind_blob wants int; guard against overflow (unlikely: our
     // files are tens of KB).
     if (data.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
         throw BackupDbError("backup blob too large for sqlite3 bind");
     }
-    s.bindBlob(4, data.data(), static_cast<int>(data.size()));
+    s.bindBlob(5, data.data(), static_cast<int>(data.size()));
     s.run();
 }
 
 void BackupDb::insertTombstone(std::string_view filename, std::int64_t dateUnix) {
     Stmt s(db_,
-        "INSERT INTO backup (filename, date, state, data) "
-        "VALUES (?, ?, ?, NULL)");
+        "INSERT INTO backup (filename, date, state, checksum, data) "
+        "VALUES (?, ?, ?, NULL, NULL)");
     s.bindText(1, filename);
     s.bindInt64(2, dateUnix);
     s.bindInt64(3, static_cast<std::int64_t>(State::Deleted));
@@ -193,7 +213,7 @@ void BackupDb::insertTombstone(std::string_view filename, std::int64_t dateUnix)
 std::optional<BackupDb::Row>
 BackupDb::at(std::string_view filename, std::int64_t askUnix) const {
     Stmt s(db_,
-        "SELECT state, data FROM backup "
+        "SELECT state, checksum, data FROM backup "
         " WHERE filename = ? AND date <= ? "
         " ORDER BY date DESC LIMIT 1");
     s.bindText(1, filename);
@@ -202,9 +222,24 @@ BackupDb::at(std::string_view filename, std::int64_t askUnix) const {
     Row row;
     row.state = static_cast<State>(s.columnInt64(0));
     if (!s.columnIsNull(1)) {
-        row.data = s.columnBlob(1);
+        row.checksum = static_cast<std::uint32_t>(s.columnInt64(1));
+    }
+    if (!s.columnIsNull(2)) {
+        row.data = s.columnBlob(2);
     }
     return row;
+}
+
+std::optional<std::uint32_t>
+BackupDb::lastChecksumFor(std::string_view filename) const {
+    Stmt s(db_,
+        "SELECT checksum FROM backup "
+        " WHERE filename = ? "
+        " ORDER BY date DESC LIMIT 1");
+    s.bindText(1, filename);
+    if (!s.step()) return std::nullopt;   // no rows for this file
+    if (s.columnIsNull(0)) return std::nullopt;   // tombstone or legacy row
+    return static_cast<std::uint32_t>(s.columnInt64(0));
 }
 
 std::vector<BackupDb::FileSummary> BackupDb::summariseFiles() const {

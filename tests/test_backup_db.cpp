@@ -58,7 +58,7 @@ TEST_CASE("BackupDb insert + at round-trip", "[backup][db]") {
     ScratchDir sd;
     BackupDb db(sd.path / "backups.sqlite");
     const std::string payload = "hello world";
-    db.insert("Kai.d2s", 1000, BackupDb::State::Autosave, asBytes(payload));
+    db.insert("Kai.d2s", 1000, BackupDb::State::Autosave, 0xDEADBEEFu, asBytes(payload));
 
     auto row = db.at("Kai.d2s", 1500);
     REQUIRE(row.has_value());
@@ -74,9 +74,9 @@ TEST_CASE("BackupDb insert + at round-trip", "[backup][db]") {
 TEST_CASE("BackupDb picks the newest row <= askUnix", "[backup][db]") {
     ScratchDir sd;
     BackupDb db(sd.path / "backups.sqlite");
-    db.insert("Kai.d2s", 1000, BackupDb::State::Startup,     asBytes("a"));
-    db.insert("Kai.d2s", 2000, BackupDb::State::Autosave,    asBytes("b"));
-    db.insert("Kai.d2s", 3000, BackupDb::State::SaveAndExit, asBytes("c"));
+    db.insert("Kai.d2s", 1000, BackupDb::State::Startup,     1u, asBytes("a"));
+    db.insert("Kai.d2s", 2000, BackupDb::State::Autosave,    2u, asBytes("b"));
+    db.insert("Kai.d2s", 3000, BackupDb::State::SaveAndExit, 3u, asBytes("c"));
 
     REQUIRE(std::string(reinterpret_cast<const char*>(db.at("Kai.d2s", 1500)->data.data()),
                         db.at("Kai.d2s", 1500)->data.size()) == "a");
@@ -99,10 +99,10 @@ TEST_CASE("BackupDb tombstone: NULL data + state=Deleted", "[backup][db]") {
 TEST_CASE("BackupDb summariseFiles + historyFor", "[backup][db]") {
     ScratchDir sd;
     BackupDb db(sd.path / "backups.sqlite");
-    db.insert("Kai.d2s",  1000, BackupDb::State::Startup,     asBytes("k1"));
-    db.insert("Kai.d2s",  1200, BackupDb::State::Autosave,    asBytes("k2"));
-    db.insert("Kai.d2s",  1400, BackupDb::State::SaveAndExit, asBytes("k3"));
-    db.insert("Warlock.d2s", 500, BackupDb::State::SaveAndExit, asBytes("w"));
+    db.insert("Kai.d2s",  1000, BackupDb::State::Startup,     1u, asBytes("k1"));
+    db.insert("Kai.d2s",  1200, BackupDb::State::Autosave,    2u, asBytes("k2"));
+    db.insert("Kai.d2s",  1400, BackupDb::State::SaveAndExit, 3u, asBytes("k3"));
+    db.insert("Warlock.d2s", 500, BackupDb::State::SaveAndExit, 4u, asBytes("w"));
 
     const auto sums = db.summariseFiles();
     REQUIRE(sums.size() == 2);
@@ -129,7 +129,8 @@ TEST_CASE("BackupDb enforceRetention: date rule alone", "[backup][db][retention]
     // 5 rows, one per day going back.
     for (int i = 0; i < 5; ++i) {
         db.insert("Kai.d2s", 10000 - i * 86400,
-                  BackupDb::State::Autosave, asBytes("x"));
+                  BackupDb::State::Autosave,
+                  static_cast<std::uint32_t>(i), asBytes("x"));
     }
     // Keep 2 days worth; sessionsPerFile=0 disables session rule.
     const auto deleted = db.enforceRetention(/*days=*/2,
@@ -151,9 +152,10 @@ TEST_CASE("BackupDb enforceRetention: session rule keeps last Y sessions",
     // (Startup or Autosave) then (SaveAndExit). Session K starts at
     // date K*100 and ends at K*100 + 50.
     for (int k = 1; k <= 4; ++k) {
-        db.insert("Kai.d2s",  k * 100 +  0, BackupDb::State::Startup,     asBytes("s"));
-        db.insert("Kai.d2s",  k * 100 + 20, BackupDb::State::Autosave,    asBytes("a"));
-        db.insert("Kai.d2s",  k * 100 + 50, BackupDb::State::SaveAndExit, asBytes("e"));
+        const auto base = static_cast<std::uint32_t>(k * 10);
+        db.insert("Kai.d2s",  k * 100 +  0, BackupDb::State::Startup,     base + 0, asBytes("s"));
+        db.insert("Kai.d2s",  k * 100 + 20, BackupDb::State::Autosave,    base + 1, asBytes("a"));
+        db.insert("Kai.d2s",  k * 100 + 50, BackupDb::State::SaveAndExit, base + 2, asBytes("e"));
     }
     // Keep last 2 sessions. Date cutoff for session rule = date of
     // 3rd-most-recent state=1 = 200 + 50 = 250. Rows with date > 250
@@ -175,9 +177,9 @@ TEST_CASE("BackupDb enforceRetention: fewer sessions than target keeps all",
     ScratchDir sd;
     BackupDb db(sd.path / "backups.sqlite");
     // Only 1 completed session; ask for 5.
-    db.insert("Kai.d2s", 100, BackupDb::State::Startup,     asBytes("s"));
-    db.insert("Kai.d2s", 200, BackupDb::State::SaveAndExit, asBytes("e"));
-    db.insert("Kai.d2s", 250, BackupDb::State::Autosave,    asBytes("a"));  // in-progress
+    db.insert("Kai.d2s", 100, BackupDb::State::Startup,     1u, asBytes("s"));
+    db.insert("Kai.d2s", 200, BackupDb::State::SaveAndExit, 2u, asBytes("e"));
+    db.insert("Kai.d2s", 250, BackupDb::State::Autosave,    3u, asBytes("a"));  // in-progress
 
     const auto deleted = db.enforceRetention(0, 5, 9999);
     REQUIRE(deleted == 0);
@@ -190,16 +192,16 @@ TEST_CASE("BackupDb enforceRetention: stash inherits kept character range",
     BackupDb db(sd.path / "backups.sqlite");
     // Kai session 1: dates 100..200 (SaveAndExit at 200).
     // Kai session 2: dates 300..400 (SaveAndExit at 400).
-    db.insert("Kai.d2s", 100, BackupDb::State::Startup,     asBytes("s"));
-    db.insert("Kai.d2s", 200, BackupDb::State::SaveAndExit, asBytes("e"));
-    db.insert("Kai.d2s", 300, BackupDb::State::Autosave,    asBytes("a"));
-    db.insert("Kai.d2s", 400, BackupDb::State::SaveAndExit, asBytes("e"));
+    db.insert("Kai.d2s", 100, BackupDb::State::Startup,     1u, asBytes("s"));
+    db.insert("Kai.d2s", 200, BackupDb::State::SaveAndExit, 2u, asBytes("e"));
+    db.insert("Kai.d2s", 300, BackupDb::State::Autosave,    3u, asBytes("a"));
+    db.insert("Kai.d2s", 400, BackupDb::State::SaveAndExit, 4u, asBytes("e"));
 
     // Stash writes at 150 (in session 1), 350 (in session 2), and 500
     // (after everything).
-    db.insert("Shared.d2i", 150, BackupDb::State::Autosave, asBytes("i150"));
-    db.insert("Shared.d2i", 350, BackupDb::State::Autosave, asBytes("i350"));
-    db.insert("Shared.d2i", 500, BackupDb::State::Autosave, asBytes("i500"));
+    db.insert("Shared.d2i", 150, BackupDb::State::Autosave, 11u, asBytes("i150"));
+    db.insert("Shared.d2i", 350, BackupDb::State::Autosave, 12u, asBytes("i350"));
+    db.insert("Shared.d2i", 500, BackupDb::State::Autosave, 13u, asBytes("i500"));
 
     // Keep last 1 Kai session -> Kai rows at 300 and 400 survive.
     // Kai range for rule (c) becomes [300, 400].

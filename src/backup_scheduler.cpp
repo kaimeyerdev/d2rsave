@@ -7,6 +7,7 @@
 #include <sys/inotify.h>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <chrono>
 #include <cstdio>
@@ -24,12 +25,6 @@ namespace d2r {
 // ---------------------------------------------------------------------------
 
 namespace {
-
-std::string toLower(std::string_view s) {
-    std::string out(s);
-    for (auto& c : out) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    return out;
-}
 
 bool endsWithNoCase(std::string_view s, std::string_view suffix) {
     if (s.size() < suffix.size()) return false;
@@ -54,6 +49,29 @@ bool equalsNoCase(std::string_view a, std::string_view b) {
 
 std::int64_t nowUnix() {
     return static_cast<std::int64_t>(std::time(nullptr));
+}
+
+// CRC-32 (IEEE 802.3 polynomial 0xEDB88320), reflected, initial 0xFFFFFFFF,
+// final XOR 0xFFFFFFFF. Table built once at first call. Not for
+// cryptographic use -- purely a change-detection fingerprint for .d2i
+// files that don't carry a native checksum.
+std::uint32_t crc32Ieee(std::span<const std::byte> data) noexcept {
+    static const std::array<std::uint32_t, 256> kTable = []{
+        std::array<std::uint32_t, 256> t{};
+        for (std::uint32_t i = 0; i < 256; ++i) {
+            std::uint32_t c = i;
+            for (int k = 0; k < 8; ++k) {
+                c = (c & 1u) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+            }
+            t[i] = c;
+        }
+        return t;
+    }();
+    std::uint32_t c = 0xFFFFFFFFu;
+    for (const auto b : data) {
+        c = kTable[(c ^ static_cast<std::uint32_t>(b)) & 0xFFu] ^ (c >> 8);
+    }
+    return c ^ 0xFFFFFFFFu;
 }
 
 } // namespace
@@ -92,6 +110,20 @@ std::int64_t extractD2sTimestamp(std::span<const std::byte> bytes) {
     return static_cast<std::int64_t>(v);
 }
 
+std::uint32_t computeFileChecksum(std::string_view name,
+                                  std::span<const std::byte> bytes) noexcept {
+    // .d2s: use the game's own checksum. It excludes the 4 bytes at
+    // offset 0x0C from the sum, so two saves that differ only in the
+    // stored-checksum field would collide -- in practice the two are
+    // computed together and the on-disk checksum matches whenever the
+    // rest of the file matches, so this is a reliable change signal.
+    if (endsWithNoCase(name, ".d2s")) {
+        return computeChecksum(bytes);
+    }
+    // Everything else: CRC-32.
+    return crc32Ieee(bytes);
+}
+
 } // namespace backup_scheduler_detail
 
 // ---------------------------------------------------------------------------
@@ -105,11 +137,12 @@ BackupScheduler::BackupScheduler(BackupDb&                    db,
       savesDir_(std::move(savesDir)),
       retention_(retention) {}
 
-// Read a file's bytes and insert a row with the given state. `nowUnix`
-// is the fallback timestamp; .d2s files use their in-file header
-// timestamp instead. Errors (missing file, permission denied) are
-// logged to stderr and swallowed -- the dashboard should not crash
-// because one save temporarily disappeared.
+// Read a file's bytes, compute its per-type checksum, and insert only
+// when the bytes have actually changed since the last row for this
+// filename. `nowUnix` is the fallback timestamp; .d2s files use their
+// in-file header timestamp instead. Errors (missing file, permission
+// denied) are logged to stderr and swallowed -- the dashboard should
+// not crash because one save temporarily disappeared.
 void BackupScheduler::writeFileAsState(const std::filesystem::path& path,
                                        BackupDb::State              state,
                                        std::int64_t                 nowUnix) {
@@ -121,16 +154,27 @@ void BackupScheduler::writeFileAsState(const std::filesystem::path& path,
                      path.string().c_str(), ex.what());
         return;
     }
+    const auto name = path.filename().string();
+    const auto checksum = backup_scheduler_detail::computeFileChecksum(name, bytes);
+
+    // Dedup: if the last row for this file has the same checksum, the
+    // bytes haven't changed since the last backup. Skip the insert.
+    // A tombstone-or-legacy last row is reported as nullopt, so we
+    // always insert in that case.
+    if (auto last = db_.lastChecksumFor(name); last && *last == checksum) {
+        return;
+    }
+
     std::int64_t date = nowUnix;
-    if (endsWithNoCase(path.filename().string(), ".d2s")) {
+    if (endsWithNoCase(name, ".d2s")) {
         const auto ts = backup_scheduler_detail::extractD2sTimestamp(bytes);
         if (ts > 0) date = ts;
     }
     try {
-        db_.insert(path.filename().string(), date, state, bytes);
+        db_.insert(name, date, state, checksum, bytes);
     } catch (const std::exception& ex) {
         std::fprintf(stderr, "[backup] insert failed for %s: %s\n",
-                     path.filename().string().c_str(), ex.what());
+                     name.c_str(), ex.what());
     }
 }
 

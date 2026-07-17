@@ -84,6 +84,16 @@ namespace backup_scheduler_detail {
 // against fixtures without pulling the character parser.
 [[nodiscard]] std::int64_t extractD2sTimestamp(std::span<const std::byte>);
 
+// Per-file-type change-detection fingerprint. .d2s uses the game's own
+// rotate-add checksum from Save.hpp (bytes 0x0C..0x0F excluded from the
+// sum, so it's stable across saves that don't touch content). .d2i and
+// everything else use CRC-32 (IEEE polynomial 0xEDB88320) as a small
+// content hash -- not cryptographic, but plenty for "did anything
+// change?" queries. Two calls on the same bytes always return the same
+// value.
+[[nodiscard]] std::uint32_t computeFileChecksum(
+    std::string_view name, std::span<const std::byte> bytes) noexcept;
+
 } // namespace backup_scheduler_detail
 
 } // namespace d2r

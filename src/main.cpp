@@ -726,6 +726,11 @@ int cmdBackupsShow(std::vector<std::string_view> args) {
     std::printf("file:  %s\n", filename.c_str());
     std::printf("state: %s\n", stateName(row->state));
     std::printf("bytes: %zu\n", row->data.size());
+    if (row->checksum) {
+        std::printf("checksum: 0x%08x\n", *row->checksum);
+    } else {
+        std::printf("checksum: (none)\n");
+    }
     return 0;
 }
 

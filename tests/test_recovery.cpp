@@ -64,8 +64,8 @@ TEST_CASE("Recovery: round-trip to primary saves dir",
     BackupScheduler sched(db, sc.savesDir);
 
     // Seed: two versions of Kai.d2s in the backup DB.
-    db.insert("Kai.d2s", 1000, BackupDb::State::Autosave, asBytes("old"));
-    db.insert("Kai.d2s", 2000, BackupDb::State::Autosave, asBytes("new"));
+    db.insert("Kai.d2s", 1000, BackupDb::State::Autosave, 1u, asBytes("old"));
+    db.insert("Kai.d2s", 2000, BackupDb::State::Autosave, 2u, asBytes("new"));
 
     // Recover the "old" version to the saves dir.
     RecoverySpec spec;
@@ -89,7 +89,7 @@ TEST_CASE("Recovery: to alternate folder is byte-identical",
     BackupScheduler sched(db, sc.savesDir);
 
     const std::string blob = "some\0binary\0bytes\0with-nulls";
-    db.insert("Shared.d2i", 1000, BackupDb::State::SaveAndExit,
+    db.insert("Shared.d2i", 1000, BackupDb::State::SaveAndExit, 1u,
               std::span{reinterpret_cast<const std::byte*>(blob.data()), blob.size()});
 
     RecoverySpec spec;
@@ -122,7 +122,7 @@ TEST_CASE("Recovery: pre-recovery snapshot captures current bytes",
         f << "current-live-bytes";
     }
     // Seed the DB with an older version to restore.
-    db.insert("Shared.d2i", 1000, BackupDb::State::Autosave,
+    db.insert("Shared.d2i", 1000, BackupDb::State::Autosave, 1u,
               asBytes("older-version-bytes"));
 
     RecoverySpec spec;
@@ -210,7 +210,7 @@ TEST_CASE("Recovery: no backup predating the ask returns nothing",
     Scratch sc;
     BackupDb db(sc.dbPath);
     BackupScheduler sched(db, sc.savesDir);
-    db.insert("Kai.d2s", 2000, BackupDb::State::Autosave, asBytes("late"));
+    db.insert("Kai.d2s", 2000, BackupDb::State::Autosave, 1u, asBytes("late"));
 
     RecoverySpec spec;
     spec.destDir  = sc.altDir;
