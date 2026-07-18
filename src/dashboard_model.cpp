@@ -714,4 +714,117 @@ DashboardSnapshot buildSnapshot(RefDb& db,
     return snap;
 }
 
+// ---------------------------------------------------------------------------
+// Session anchor: override the character-side portion of an existing
+// snapshot with data parsed from raw .d2s bytes. Non-character data
+// (shared stash, chronicle, quests) is left in place, so the anchor
+// still reflects a coherent world state; only the .d2s owner's stats
+// and character-side items are rewound to the backup moment.
+// ---------------------------------------------------------------------------
+bool overrideActivePlayerFromBytes(DashboardSnapshot&         snap,
+                                   RefDb&                     db,
+                                   std::span<const std::byte> characterBytes,
+                                   std::string_view           filename) {
+    Character ch;
+    try {
+        ch = parseCharacter(characterBytes);
+    } catch (const std::exception&) {
+        return false;
+    }
+
+    // Wipe existing character-side items in the snapshot's inventory.
+    // The location prefix is the filename (e.g. "Kai.d2s"), optionally
+    // followed by " (merc)", " (corpse)", or " (iron golem)"; that
+    // matches everything we're about to re-emit from the backup bytes.
+    const std::string filenameStr(filename);
+    snap.inventory.erase(
+        std::remove_if(snap.inventory.begin(), snap.inventory.end(),
+            [&](const InventoryItem& inv) {
+                return inv.location.size() >= filenameStr.size() &&
+                       inv.location.compare(0, filenameStr.size(),
+                                             filenameStr) == 0;
+            }),
+        snap.inventory.end());
+
+    // Repopulate character-side items from the parsed bytes.
+    if (ch.itemsOffset != 0) {
+        ItemParser p(db);
+        auto push = [&](const std::vector<Item>& items,
+                        const std::string& loc) {
+            for (const auto& it : items) {
+                InventoryItem inv;
+                inv.name        = primaryName(db, it);
+                inv.baseName    = lookupBaseName(db, it.code);
+                inv.location    = loc;
+                inv.quality     = it.quality;
+                inv.fingerprint = it.fingerprint;
+                inv.identified  = it.identified;
+                snap.inventory.push_back(std::move(inv));
+                for (const auto& s : it.socketedItems) {
+                    InventoryItem sInv;
+                    sInv.name        = primaryName(db, s);
+                    sInv.baseName    = lookupBaseName(db, s.code);
+                    sInv.location    = loc;
+                    sInv.quality     = s.quality;
+                    sInv.fingerprint = s.fingerprint;
+                    sInv.identified  = s.identified;
+                    snap.inventory.push_back(std::move(sInv));
+                }
+            }
+        };
+        try {
+            push(p.parseItems(characterBytes, ch.itemsOffset), filenameStr);
+            if (ch.mercItemsJMOffset) {
+                push(p.parseItems(characterBytes, ch.mercItemsJMOffset),
+                     filenameStr + " (merc)");
+            }
+            if (ch.corpseJMOffset && ch.corpseItemCount == 1) {
+                push(p.parseItems(characterBytes, ch.corpseJMOffset + 16),
+                     filenameStr + " (corpse)");
+            }
+            if (ch.hasIronGolem && ch.ironGolemItemOffset) {
+                try {
+                    std::vector<Item> golem{
+                        p.parseSingleItem(characterBytes, ch.ironGolemItemOffset)};
+                    push(golem, filenameStr + " (iron golem)");
+                } catch (const std::exception&) {}
+            }
+        } catch (const std::exception&) {
+            // Partial item parse: keep whatever pushed successfully.
+        }
+    }
+
+    // Overwrite the ActivePlayer summary. `expInLevel`/`expForLevel`
+    // are recomputed here so callers get a consistent view without
+    // needing to know the D2R experience table.
+    snap.hasActivePlayer = true;
+    auto& ap = snap.activePlayer;
+    ap.file           = filenameStr;
+    ap.name           = ch.name;
+    ap.characterClass = ch.characterClass;
+    ap.level          = ch.attributes.level ? ch.attributes.level : ch.level;
+    ap.experience     = ch.attributes.experience;
+    ap.timestamp      = ch.timestamp;
+    ap.hardcore       = ch.hardcore;
+    ap.died           = ch.died;
+    ap.mapSeed        = ch.mapId;
+    computeDifficulty(ch, ap.difficulty, ap.act);
+
+    const std::uint32_t lvl       = ap.level;
+    const std::uint64_t curFloor  = experienceToReachLevel(lvl);
+    const std::uint64_t nextFloor = experienceToReachLevel(lvl + 1);
+    if (nextFloor > curFloor) {
+        ap.expForLevel = nextFloor - curFloor;
+        ap.expInLevel  = ap.experience > curFloor
+                         ? ap.experience - curFloor : 0;
+        ap.expPercent  = 100.0 * static_cast<double>(ap.expInLevel)
+                                / static_cast<double>(ap.expForLevel);
+    } else {
+        ap.expForLevel = 0;
+        ap.expInLevel  = 0;
+        ap.expPercent  = 100.0;
+    }
+    return true;
+}
+
 } // namespace d2r

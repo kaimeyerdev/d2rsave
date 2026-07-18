@@ -10,10 +10,13 @@
 #include "d2r/Character.hpp"
 #include "d2r/Item.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <optional>
+#include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace d2r {
@@ -155,6 +158,21 @@ struct DashboardSnapshot {
 [[nodiscard]] DashboardSnapshot buildSnapshot(RefDb& db,
                                               const std::filesystem::path& saveDir,
                                               const std::filesystem::path& stashPath);
+
+// Replace the active-player character portion of `snap` in place with
+// data parsed from a raw .d2s byte buffer. Used by the Session pane to
+// build a "start of session" anchor from the latest SaveAndExit backup:
+// the shared stash + chronicle + quests carry over from the live
+// snapshot, while `activePlayer.*` and every inventory item whose
+// `location` starts with `filename` (base + " (merc)" / " (corpse)"
+// / " (iron golem)") is replaced with what the .d2s bytes contain.
+// Returns true iff parsing succeeded; the snapshot is left untouched
+// on failure. Requires `db.loadItemTables()` to have been called.
+[[nodiscard]] bool overrideActivePlayerFromBytes(
+    DashboardSnapshot&           snap,
+    RefDb&                       db,
+    std::span<const std::byte>   characterBytes,
+    std::string_view             filename);
 
 // Experience needed to reach `level` from a fresh character. Levels
 // outside [1..99] clamp to the boundary. Values are the standard D2/D2R

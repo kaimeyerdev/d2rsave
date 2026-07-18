@@ -1458,7 +1458,7 @@ std::vector<ConfigMenuItem> buildConfigMenu(const PaneConfig& c, bool canDelete)
         items.push_back({"clear backup-actions log", ConfigMenuItem::ClearBackupLog});
     }
     if (c.type == PaneType::Session) {
-        items.push_back({"reset session anchor (start over from now)",
+        items.push_back({"reset session anchor (re-load last Save & Exit)",
                           ConfigMenuItem::ResetSession});
     }
     items.push_back({"split vertical   (side-by-side)", ConfigMenuItem::SplitVertical});
@@ -1854,14 +1854,55 @@ int runDashboard(const std::filesystem::path& savePath,
     ui.backupDb = backupDb.get();   // may be nullptr; renderers cope
     ui.backupScheduler = backupScheduler.get();
 #endif
+
+    // Build a session anchor that respects the "last SaveAndExit" state
+    // of the active character when possible. This lets a user who opens
+    // the dashboard mid-play see a delta between "what my character
+    // looked like last time I quit the game" and the live snapshot,
+    // instead of the trivial 0-delta a same-snapshot anchor gives.
+    // Falls back to reusing the current snapshot when there's no
+    // suitable backup (fresh install, print-mode, DB unavailable, etc.).
+    auto buildSessionAnchor =
+        [&](const std::shared_ptr<const DashboardSnapshot>& current)
+        -> std::shared_ptr<const DashboardSnapshot> {
+        if (!current || !current->hasActivePlayer) return current;
+#if D2R_HAVE_INOTIFY
+        if (!backupDb) return current;
+        const auto& filename = current->activePlayer.file;
+        if (filename.empty()) return current;
+        // Find the newest SaveAndExit row for this .d2s and pull its bytes.
+        std::vector<BackupDb::HistoryRow> hist;
+        try { hist = backupDb->historyFor(filename, 200); }
+        catch (const std::exception&) { return current; }
+        std::optional<BackupDb::Row> row;
+        for (const auto& h : hist) {
+            if (h.state != BackupDb::State::SaveAndExit) continue;
+            try { row = backupDb->at(filename, h.date); }
+            catch (const std::exception&) { row.reset(); }
+            if (row) break;
+        }
+        if (!row || row->data.empty()) return current;
+        // Overlay the S&E character bytes onto a copy of the current
+        // snapshot; shared stash + everything else carry over.
+        auto anchor = std::make_shared<DashboardSnapshot>(*current);
+        if (!overrideActivePlayerFromBytes(*anchor, db, row->data, filename)) {
+            return current;
+        }
+        return anchor;
+#else
+        return current;
+#endif
+    };
+
     {
         auto snap = std::make_shared<DashboardSnapshot>(
             buildSnapshot(db, savePath, stashPath));
         std::lock_guard g(ui.snapshotMutex);
         ui.snapshot = std::move(snap);
-        // Anchor the session view on the very first snapshot. Refreshed
-        // by the user from the Session pane's config menu.
-        ui.sessionAnchor = ui.snapshot;
+        // Anchor the session view on the last SaveAndExit backup when
+        // available; refreshed by the user from the Session pane's
+        // config menu.
+        ui.sessionAnchor = buildSessionAnchor(ui.snapshot);
     }
 
     auto screen = ScreenInteractive::Fullscreen();
@@ -2181,11 +2222,19 @@ int runDashboard(const std::filesystem::path& savePath,
                         break;
                     }
                     case ConfigMenuItem::ResetSession: {
-                        // Reseat the anchor to whatever the render loop
-                        // will see next: hold the snapshot mutex only
-                        // long enough to copy the shared_ptr.
-                        std::lock_guard<std::mutex> g(ui.snapshotMutex);
-                        ui.sessionAnchor = ui.snapshot;
+                        // Re-run the same anchor logic used at startup:
+                        // prefer the newest SaveAndExit backup, falling
+                        // back to the live snapshot when none exists.
+                        std::shared_ptr<const DashboardSnapshot> snapNow;
+                        {
+                            std::lock_guard<std::mutex> g(ui.snapshotMutex);
+                            snapNow = ui.snapshot;
+                        }
+                        auto rebuilt = buildSessionAnchor(snapNow);
+                        {
+                            std::lock_guard<std::mutex> g(ui.snapshotMutex);
+                            ui.sessionAnchor = std::move(rebuilt);
+                        }
                         ui.configMode = false;
                         break;
                     }
