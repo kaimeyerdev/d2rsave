@@ -422,15 +422,22 @@ and are all deferred.
 * **`.d2i` diff (shared-stash).** Same idea for
   `SharedStashParser::parse()` output -- diff by tab, chronicle
   additions, item movements.
-* **Session-delta dashboard pane.** Uses the backups DB as an anchor
-  ("XP earned since the startup snapshot", levels gained, items added
-  to chronicle). Depends on diff.
 * **File-history browser pane.** Timeline per file with drill-in;
   overlaps with the Backups pane detail view.
 * **Optional `.ma0` .. `.ma3` backup.** The scheduler currently
   persists only `.d2s` / `.d2i`. Map state might be worth capturing
   for waypoint recovery; low-priority.
 * **CLI shell completions** for the new `backups` subcommands.
+* **Dedicated hotkeys for the BackupLog + Session panes.** Right
+  now clearing the backup-log ring buffer and resetting the session
+  anchor both live under `[c] config` (they're the only entries in
+  the config menu for those pane types). Common actions like clear/
+  reset feel more natural as top-level keybinds, but the full
+  dashboard keybinding table needs a coherent review before adding
+  more: today's set (`c` config, `/` search, `r` refresh, `?` help,
+  `Tab` focus, `q` quit, `Enter`/`Esc`/`R`/`E` in Backups) leaves
+  few free letters. Revisit alongside a keybinding pass that also
+  documents the config-mode hotkeys in `renderHelpModal`.
 
 ## Build / packaging
 

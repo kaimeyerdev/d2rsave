@@ -27,6 +27,8 @@ enum class PaneType : std::uint8_t {
     Inventory,  // Global item-search across every parsed source.
     Reconcile,  // Diff owned items vs chronicle entries.
     Backups,    // Save-file history from the backup DB (see BackupDb.hpp).
+    BackupLog,  // Ephemeral ring buffer of this-process backup events.
+    Session,    // XP + new items since dashboard startup (or last reset).
 };
 
 enum class ChronicleCategory : std::uint8_t {

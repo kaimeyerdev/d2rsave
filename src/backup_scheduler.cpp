@@ -175,6 +175,11 @@ void BackupScheduler::writeFileAsState(const std::filesystem::path& path,
     } catch (const std::exception& ex) {
         std::fprintf(stderr, "[backup] insert failed for %s: %s\n",
                      name.c_str(), ex.what());
+        return;
+    }
+    if (onInsert_) {
+        try { onInsert_(name, date, state); }
+        catch (const std::exception&) { /* callback bugs must not kill the backup path */ }
     }
 }
 
@@ -222,6 +227,10 @@ void BackupScheduler::handleWatcherEvents(
         if ((f.mask & (IN_DELETE | IN_MOVED_FROM)) != 0) {
             try {
                 db_.insertTombstone(f.name, now);
+                if (onInsert_) {
+                    try { onInsert_(f.name, now, BackupDb::State::Deleted); }
+                    catch (const std::exception&) {}
+                }
             } catch (const std::exception& ex) {
                 std::fprintf(stderr, "[backup] tombstone insert failed for %s: %s\n",
                              f.name.c_str(), ex.what());
@@ -250,6 +259,10 @@ void BackupScheduler::takeManualSnapshot(
             // a tombstone so recovery can reproduce this state.
             try {
                 db_.insertTombstone(name, now);
+                if (onInsert_) {
+                    try { onInsert_(name, now, BackupDb::State::Deleted); }
+                    catch (const std::exception&) {}
+                }
             } catch (const std::exception& ex) {
                 std::fprintf(stderr, "[backup] tombstone insert failed for %s: %s\n",
                              name.c_str(), ex.what());

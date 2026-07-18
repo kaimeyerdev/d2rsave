@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -52,6 +53,17 @@ public:
     [[nodiscard]] const RetentionConfig& retention() const noexcept { return retention_; }
     void setRetention(RetentionConfig cfg) noexcept { retention_ = cfg; }
 
+    // Fires once per successful backup insert (State::Startup,
+    // Autosave, SaveAndExit) and once per tombstone. Dedup-skips and
+    // read failures do NOT fire. Runs synchronously on whatever thread
+    // handles the burst; the callback must be cheap and thread-safe --
+    // in the dashboard the watcher thread calls this, while the UI
+    // thread reads the buffer. Passing an empty function detaches.
+    using InsertCallback = std::function<void(std::string_view filename,
+                                              std::int64_t     dateUnix,
+                                              BackupDb::State  state)>;
+    void setInsertCallback(InsertCallback cb) { onInsert_ = std::move(cb); }
+
 private:
     void writeFileAsState(const std::filesystem::path& path,
                           BackupDb::State              state,
@@ -61,6 +73,7 @@ private:
     BackupDb&              db_;
     std::filesystem::path  savesDir_;
     RetentionConfig        retention_;
+    InsertCallback         onInsert_;
 };
 
 // Helpers exposed for testing.

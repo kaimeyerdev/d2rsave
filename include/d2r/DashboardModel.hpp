@@ -104,6 +104,12 @@ struct InventoryItem {
     std::string      baseName;     // base item type (may equal name)
     std::string      location;     // e.g. "Kai.d2s" or "stash tab 3"
     ItemQuality      quality  = ItemQuality::None;
+    // Per-instance identity read from item bytes. Populated for magic-
+    // and-better items (D2R stores it in the extended block); left at 0
+    // for stackables, gems, runes, etc. Used by the Session pane to
+    // diff owned items against a start-of-session anchor.
+    std::uint32_t    fingerprint = 0;
+    bool             identified  = false;
 };
 
 // One entry in the reconcile diff. Emitted for every unique/set that is

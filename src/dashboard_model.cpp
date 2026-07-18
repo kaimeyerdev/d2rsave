@@ -306,19 +306,23 @@ DashboardSnapshot buildSnapshot(RefDb& db,
                     countQuestItem(it, snap.hellfireTorch,
                                    snap.colossalAncients, snap.terrorZones);
                     InventoryItem inv;
-                    inv.name     = primaryName(db, it);
-                    inv.baseName = lookupBaseName(db, it.code);
-                    inv.location = loc;
-                    inv.quality  = it.quality;
+                    inv.name        = primaryName(db, it);
+                    inv.baseName    = lookupBaseName(db, it.code);
+                    inv.location    = loc;
+                    inv.quality     = it.quality;
+                    inv.fingerprint = it.fingerprint;
+                    inv.identified  = it.identified;
                     snap.inventory.push_back(std::move(inv));
                     for (const auto& s : it.socketedItems) {
                         countQuestItem(s, snap.hellfireTorch,
                                        snap.colossalAncients, snap.terrorZones);
                         InventoryItem sInv;
-                        sInv.name     = primaryName(db, s);
-                        sInv.baseName = lookupBaseName(db, s.code);
-                        sInv.location = loc;
-                        sInv.quality  = s.quality;
+                        sInv.name        = primaryName(db, s);
+                        sInv.baseName    = lookupBaseName(db, s.code);
+                        sInv.location    = loc;
+                        sInv.quality     = s.quality;
+                        sInv.fingerprint = s.fingerprint;
+                        sInv.identified  = s.identified;
                         snap.inventory.push_back(std::move(sInv));
                     }
                 }
@@ -405,10 +409,12 @@ DashboardSnapshot buildSnapshot(RefDb& db,
                         countQuestItem(it, snap.hellfireTorch,
                                        snap.colossalAncients, snap.terrorZones);
                         InventoryItem inv;
-                        inv.name     = primaryName(db, it);
-                        inv.baseName = lookupBaseName(db, it.code);
-                        inv.location = loc;
-                        inv.quality  = it.quality;
+                        inv.name        = primaryName(db, it);
+                        inv.baseName    = lookupBaseName(db, it.code);
+                        inv.location    = loc;
+                        inv.quality     = it.quality;
+                        inv.fingerprint = it.fingerprint;
+                        inv.identified  = it.identified;
                         snap.inventory.push_back(std::move(inv));
 
                         if (it.quality == ItemQuality::Unique &&
@@ -426,10 +432,12 @@ DashboardSnapshot buildSnapshot(RefDb& db,
                             countQuestItem(s, snap.hellfireTorch,
                                            snap.colossalAncients, snap.terrorZones);
                             InventoryItem sInv;
-                            sInv.name     = primaryName(db, s);
-                            sInv.baseName = lookupBaseName(db, s.code);
-                            sInv.location = loc;
-                            sInv.quality  = s.quality;
+                            sInv.name        = primaryName(db, s);
+                            sInv.baseName    = lookupBaseName(db, s.code);
+                            sInv.location    = loc;
+                            sInv.quality     = s.quality;
+                            sInv.fingerprint = s.fingerprint;
+                            sInv.identified  = s.identified;
                             snap.inventory.push_back(std::move(sInv));
                             // Also track socketed uniques/sets (Rainbow Facets,
                             // Defender's Fire etc. are usually socketed).

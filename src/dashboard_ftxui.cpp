@@ -33,11 +33,13 @@
 #include <chrono>
 #include <cstdio>
 #include <ctime>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 namespace d2r {
@@ -125,6 +127,25 @@ struct UiState {
     // Data snapshot (owned; watcher thread replaces via mutex).
     std::mutex                                snapshotMutex;
     std::shared_ptr<const DashboardSnapshot>  snapshot;
+
+    // First snapshot captured at dashboard startup, used as the diff
+    // anchor for the Session pane. Never mutated after assignment
+    // (shared_ptr<const>), so the render thread can read without a
+    // lock; only reassigned when the user picks "Reset session anchor"
+    // from the pane config menu.
+    std::shared_ptr<const DashboardSnapshot>  sessionAnchor;
+
+    // Ephemeral backup-action ring buffer for the BackupLog pane. Written
+    // by the watcher/scheduler thread via setInsertCallback (and by the
+    // Recovery flow), read by the render thread. `kBackupLogCap` bounds
+    // memory across long dashboard sessions; older events fall off the
+    // front. Cleared from the pane's config menu.
+    struct BackupLogEntry {
+        std::string  filename;   // raw basename, e.g. "Kai.d2s"
+        std::int64_t when   = 0; // unix seconds
+    };
+    mutable std::mutex                        backupLogMutex;
+    mutable std::deque<BackupLogEntry>        backupLog;
 
     // Pane tree (persistent).
     PaneNode                                  rootPane;
@@ -1026,6 +1047,247 @@ std::vector<std::string> backupsSummaryOrder(BackupDb* db) {
     return out;
 }
 
+// ---- BackupLog pane (ephemeral this-process ring buffer) -------------------
+
+// Cap on the number of remembered backup events. Older entries are
+// evicted from the front of the deque when a new event arrives. 200 is
+// large enough to cover an evening of play (D2R writes on autosave +
+// save-and-exit + occasional stash flushes) while keeping memory tiny.
+inline constexpr std::size_t kBackupLogCap = 200;
+
+Element renderBackupLogLeaf(const UiState& ui, bool focused) {
+    Element titleEl = text(" Backup Actions ");
+    if (focused) titleEl = titleEl | inverted;
+
+    // Snapshot under the lock so the render doesn't race the watcher
+    // thread's push_back. Copies are cheap (short strings).
+    std::vector<UiState::BackupLogEntry> snap;
+    {
+        std::lock_guard<std::mutex> g(ui.backupLogMutex);
+        snap.assign(ui.backupLog.begin(), ui.backupLog.end());
+    }
+    if (snap.empty()) {
+        return window(titleEl, vbox({
+            filler(),
+            hbox({ filler(),
+                   vbox({
+                       text("No backup events yet this session.") | dim,
+                       text("Save your character in D2R to see entries here.") | dim,
+                   }),
+                   filler() }),
+            filler(),
+        }));
+    }
+    // Newest first so the freshest event is always at the top of the
+    // window without the user needing to scroll.
+    std::reverse(snap.begin(), snap.end());
+    Elements rows;
+    rows.reserve(snap.size() + 2);
+    rows.push_back(hbox({
+        text("Time") | bold | size(WIDTH, EQUAL, 20),
+        text("Name") | bold,
+    }));
+    rows.push_back(separator());
+    for (const auto& e : snap) {
+        rows.push_back(hbox({
+            text(formatWallDateTime(e.when)) | size(WIDTH, EQUAL, 20),
+            text(backupDisplayName(e.filename)) | flex,
+        }));
+    }
+    Element footer = text(" " + std::to_string(snap.size()) + " event(s)  "
+                          "[c] configure / clear ") | dim;
+    return window(titleEl, vbox({
+        vbox(std::move(rows)) | vscroll_indicator | frame | flex,
+        separator(),
+        std::move(footer),
+    }));
+}
+
+// ---- Session pane (diff vs sessionAnchor) ----------------------------------
+
+namespace {
+
+// Formatter for signed integer deltas with thousands separators and a
+// leading '+' / '-'. Zero renders as "+0" so the pane always shows a
+// concrete delta.
+std::string formatSignedDelta(std::int64_t v) {
+    if (v == 0) return "+0";
+    const bool neg = v < 0;
+    std::uint64_t mag = neg ? static_cast<std::uint64_t>(-v)
+                            : static_cast<std::uint64_t>(v);
+    std::string body = formatWithThousands(mag);
+    return (neg ? "-" : "+") + body;
+}
+
+// Total XP earned at `level - 1` (i.e. baseline for the current level).
+// experienceToReachLevel returns the *end* of `level`, so this is the
+// value we need to convert `(level, expInLevel)` -> cumulative XP.
+std::uint64_t cumulativeXp(std::uint32_t level, std::uint64_t inLevel) {
+    if (level == 0) return inLevel;
+    const std::uint64_t prev = experienceToReachLevel(level - 1);
+    return prev + inLevel;
+}
+
+// Collect fingerprints of every identified unique or set item, keyed by
+// (fingerprint, quality) to avoid the rare fingerprint=0 collision on
+// stackables (which we exclude anyway) or the theoretical collision
+// between a unique and a set instance sharing a fingerprint value.
+struct ItemKey {
+    std::uint32_t fingerprint;
+    ItemQuality   quality;
+    bool operator==(const ItemKey& o) const noexcept {
+        return fingerprint == o.fingerprint && quality == o.quality;
+    }
+};
+struct ItemKeyHash {
+    std::size_t operator()(const ItemKey& k) const noexcept {
+        return std::hash<std::uint64_t>{}(
+            (static_cast<std::uint64_t>(k.fingerprint) << 8) |
+            static_cast<std::uint64_t>(k.quality));
+    }
+};
+
+std::unordered_set<ItemKey, ItemKeyHash> collectUniqueSetKeys(
+    const std::vector<InventoryItem>& inv) {
+    std::unordered_set<ItemKey, ItemKeyHash> out;
+    out.reserve(inv.size() / 8 + 16);
+    for (const auto& it : inv) {
+        if (!it.identified) continue;
+        if (it.quality != ItemQuality::Unique && it.quality != ItemQuality::Set)
+            continue;
+        if (it.fingerprint == 0) continue;
+        out.insert({it.fingerprint, it.quality});
+    }
+    return out;
+}
+
+} // namespace
+
+Element renderSessionLeaf(const DashboardSnapshot& now,
+                          const DashboardSnapshot* anchor,
+                          bool focused) {
+    Element titleEl = text(" Session ");
+    if (focused) titleEl = titleEl | inverted;
+
+    if (!anchor) {
+        return window(titleEl, vbox({
+            filler(),
+            hbox({ filler(),
+                   text("Session anchor not yet initialised.") | dim,
+                   filler() }),
+            filler(),
+        }));
+    }
+
+    Elements body;
+    // Header line: which character we're tracking.
+    if (now.hasActivePlayer) {
+        body.push_back(hbox({
+            text("Tracking  ") | dim,
+            text(now.activePlayer.name) | bold,
+            text("  "),
+            text("(" + classString(now.activePlayer.characterClass) + ")") | dim,
+        }));
+    } else {
+        body.push_back(text("Tracking  (no active player)") | dim);
+    }
+
+    // Warn if the active-player identity changed since the anchor -- the
+    // XP delta only makes sense within a single character, so we still
+    // show the numbers but flag the mismatch so the user knows to reset
+    // the anchor from the pane config.
+    if (anchor->hasActivePlayer && now.hasActivePlayer &&
+        anchor->activePlayer.name != now.activePlayer.name) {
+        body.push_back(text(
+            "  * anchor was " + anchor->activePlayer.name +
+            "; reset session for this character") | color(Color::Yellow));
+    }
+    body.push_back(separator());
+
+    // XP delta. Compute in cumulative-XP space so a level-up isn't
+    // interpreted as XP loss (expInLevel resets to 0 at each ding).
+    std::int64_t xpDelta = 0;
+    std::int32_t levelDelta = 0;
+    double       pctDelta = 0.0;
+    if (anchor->hasActivePlayer && now.hasActivePlayer) {
+        const auto& a = anchor->activePlayer;
+        const auto& n = now.activePlayer;
+        const std::uint64_t aCum = cumulativeXp(a.level, a.expInLevel);
+        const std::uint64_t nCum = cumulativeXp(n.level, n.expInLevel);
+        xpDelta = static_cast<std::int64_t>(nCum)
+                - static_cast<std::int64_t>(aCum);
+        levelDelta = static_cast<std::int32_t>(n.level)
+                   - static_cast<std::int32_t>(a.level);
+        // Percentage relative to the anchor's cumulative XP, so long
+        // grinds late-game read as small percentages just like the
+        // in-game bar.
+        if (aCum > 0) {
+            pctDelta = (static_cast<double>(xpDelta) /
+                        static_cast<double>(aCum)) * 100.0;
+        }
+    }
+
+    char pctBuf[32];
+    std::snprintf(pctBuf, sizeof(pctBuf), "%+.2f%%", pctDelta);
+    body.push_back(hbox({
+        text("Exp  ") | bold,
+        text(std::string(pctBuf)),
+        text("   "),
+        text(formatSignedDelta(xpDelta)),
+    }));
+    body.push_back(hbox({
+        text("Levels gained  ") | bold,
+        text(formatSignedDelta(levelDelta)),
+    }));
+    body.push_back(separator());
+
+    // New identified Uniques / Sets since anchor. Diff by fingerprint.
+    const auto anchorKeys = collectUniqueSetKeys(anchor->inventory);
+    std::vector<const InventoryItem*> newUniques;
+    std::vector<const InventoryItem*> newSets;
+    for (const auto& it : now.inventory) {
+        if (!it.identified) continue;
+        if (it.fingerprint == 0) continue;
+        if (it.quality != ItemQuality::Unique && it.quality != ItemQuality::Set)
+            continue;
+        if (anchorKeys.contains({it.fingerprint, it.quality})) continue;
+        (it.quality == ItemQuality::Unique ? newUniques : newSets).push_back(&it);
+    }
+
+    auto renderItemList = [](std::string_view header,
+                             const std::vector<const InventoryItem*>& xs) {
+        Elements rows;
+        rows.push_back(hbox({
+            text(std::string(header)) | bold,
+            text("  "),
+            text("(" + std::to_string(xs.size()) + ")") | dim,
+        }));
+        if (xs.empty()) {
+            rows.push_back(text("  (none)") | dim);
+        } else {
+            for (const auto* it : xs) {
+                rows.push_back(hbox({
+                    text("  "),
+                    text(it->name) | flex,
+                    text("  "),
+                    text(it->location) | dim,
+                }));
+            }
+        }
+        return vbox(std::move(rows));
+    };
+    body.push_back(renderItemList("New Uniques", newUniques));
+    body.push_back(text(""));
+    body.push_back(renderItemList("New Sets", newSets));
+
+    Element footer = text(" reset anchor from [c] configure ") | dim;
+    return window(titleEl, vbox({
+        vbox(std::move(body)) | vscroll_indicator | frame | flex,
+        separator(),
+        std::move(footer),
+    }));
+}
+
 // ---- Recovery modal --------------------------------------------------------
 
 Element renderRecoveryModal(const UiState::RecoveryModal& m,
@@ -1123,6 +1385,8 @@ struct ConfigMenuItem {
         CycleOwnership,
         CycleReconcileKind,
         ToggleQuality,
+        ClearBackupLog,
+        ResetSession,
         SplitVertical, SplitHorizontal, DeletePane, Close,
     } kind;
     // Extra payload used when kind == ToggleQuality.
@@ -1181,6 +1445,13 @@ std::vector<ConfigMenuItem> buildConfigMenu(const PaneConfig& c, bool canDelete)
                 q,
             });
         }
+    }
+    if (c.type == PaneType::BackupLog) {
+        items.push_back({"clear backup-actions log", ConfigMenuItem::ClearBackupLog});
+    }
+    if (c.type == PaneType::Session) {
+        items.push_back({"reset session anchor (start over from now)",
+                          ConfigMenuItem::ResetSession});
     }
     items.push_back({"split vertical   (side-by-side)", ConfigMenuItem::SplitVertical});
     items.push_back({"split horizontal (stacked)",       ConfigMenuItem::SplitHorizontal});
@@ -1307,6 +1578,12 @@ Element renderPane(PaneNode& node, const UiState& ui,
                                         width, height, days, sess);
             break;
         }
+        case PaneType::BackupLog:
+            leafEl = renderBackupLogLeaf(ui, focused);
+            break;
+        case PaneType::Session:
+            leafEl = renderSessionLeaf(s, ui.sessionAnchor.get(), focused);
+            break;
         case PaneType::Blank:
             leafEl = renderBlankLeaf(focused);
             break;
@@ -1425,11 +1702,14 @@ Enum cycleEnum(Enum current, std::initializer_list<Enum> values) {
 }
 
 void cyclePaneType(PaneNode& leaf) {
-    // Blank -> Chronicle -> Inventory -> Reconcile -> Backups -> Blank
+    // Blank -> Chronicle -> Inventory -> Reconcile -> Backups
+    //       -> BackupLog -> Session -> Blank
     leaf.config.type = leaf.config.type == PaneType::Blank     ? PaneType::Chronicle
                      : leaf.config.type == PaneType::Chronicle ? PaneType::Inventory
                      : leaf.config.type == PaneType::Inventory ? PaneType::Reconcile
                      : leaf.config.type == PaneType::Reconcile ? PaneType::Backups
+                     : leaf.config.type == PaneType::Backups   ? PaneType::BackupLog
+                     : leaf.config.type == PaneType::BackupLog ? PaneType::Session
                                                                 : PaneType::Blank;
     leaf.config.cursor = 0;
     // Reset the Backups sub-mode so a freshly-cycled-into pane always
@@ -1571,9 +1851,32 @@ int runDashboard(const std::filesystem::path& savePath,
             buildSnapshot(db, savePath, stashPath));
         std::lock_guard g(ui.snapshotMutex);
         ui.snapshot = std::move(snap);
+        // Anchor the session view on the very first snapshot. Refreshed
+        // by the user from the Session pane's config menu.
+        ui.sessionAnchor = ui.snapshot;
     }
 
     auto screen = ScreenInteractive::Fullscreen();
+
+#if D2R_HAVE_INOTIFY
+    // Feed the BackupLog pane every time the scheduler persists a
+    // successful backup (or tombstone). The callback runs on the
+    // watcher thread; we hold `backupLogMutex` only for the push and
+    // then poke the UI so the pane redraws on the next frame.
+    if (backupScheduler) {
+        backupScheduler->setInsertCallback(
+            [&](std::string_view name, std::int64_t whenUnix, BackupDb::State) {
+                {
+                    std::lock_guard<std::mutex> g(ui.backupLogMutex);
+                    ui.backupLog.push_back({std::string(name), whenUnix});
+                    while (ui.backupLog.size() > kBackupLogCap) {
+                        ui.backupLog.pop_front();
+                    }
+                }
+                screen.PostEvent(Event::Custom);
+            });
+    }
+#endif
 
     auto currentSnapshot = [&]() {
         std::lock_guard g(ui.snapshotMutex);
@@ -1861,6 +2164,21 @@ int runDashboard(const std::filesystem::path& savePath,
                     case ConfigMenuItem::ToggleQuality: {
                         leaf->config.inventoryQualityMask ^= qualityBit(item.quality);
                         leaf->config.cursor = 0;
+                        break;
+                    }
+                    case ConfigMenuItem::ClearBackupLog: {
+                        std::lock_guard<std::mutex> g(ui.backupLogMutex);
+                        ui.backupLog.clear();
+                        ui.configMode = false;
+                        break;
+                    }
+                    case ConfigMenuItem::ResetSession: {
+                        // Reseat the anchor to whatever the render loop
+                        // will see next: hold the snapshot mutex only
+                        // long enough to copy the shared_ptr.
+                        std::lock_guard<std::mutex> g(ui.snapshotMutex);
+                        ui.sessionAnchor = ui.snapshot;
+                        ui.configMode = false;
                         break;
                     }
                     case ConfigMenuItem::SplitVertical:

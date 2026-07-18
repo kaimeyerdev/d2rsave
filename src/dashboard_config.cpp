@@ -75,6 +75,8 @@ std::string_view toString(PaneType t) {
         case PaneType::Inventory: return "inventory";
         case PaneType::Reconcile: return "reconcile";
         case PaneType::Backups:   return "backups";
+        case PaneType::BackupLog: return "backup_log";
+        case PaneType::Session:   return "session";
     }
     return "blank";
 }
@@ -157,15 +159,19 @@ std::string paneTitle(const PaneConfig& c) {
                 return "Backups  " + c.selectedBackupFile;
             }
             return "Backups";
+        case PaneType::BackupLog: return "Backup Actions";
+        case PaneType::Session:   return "Session";
     }
     return "(unconfigured)";
 }
 
 PaneType paneTypeFromString(std::string_view s) {
-    if (s == "chronicle") return PaneType::Chronicle;
-    if (s == "inventory") return PaneType::Inventory;
-    if (s == "reconcile") return PaneType::Reconcile;
-    if (s == "backups")   return PaneType::Backups;
+    if (s == "chronicle")   return PaneType::Chronicle;
+    if (s == "inventory")   return PaneType::Inventory;
+    if (s == "reconcile")   return PaneType::Reconcile;
+    if (s == "backups")     return PaneType::Backups;
+    if (s == "backup_log")  return PaneType::BackupLog;
+    if (s == "session")     return PaneType::Session;
     return PaneType::Blank;
 }
 
