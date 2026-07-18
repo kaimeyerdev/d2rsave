@@ -1029,15 +1029,19 @@ Element renderBackupsDetail(const PaneConfig& config, BackupDb* db,
     if (start + visible > nRows) start = std::max(0, nRows - visible);
     const int end = std::min(nRows, start + visible);
 
-    // Detect a session boundary between row i and row i-1 (older):
-    // draw a divider when the OLDER row was a state=SaveAndExit and
-    // the NEWER row is not the very-first one shown.
+    // A play session is delimited by a state=SaveAndExit row: everything
+    // between the previous S&E and this one is that session. In this
+    // newest-first display we render each session as a contiguous block
+    // capped by its S&E at the TOP -- the divider goes ABOVE each S&E
+    // (except the very top row on screen, where there's nothing to
+    // separate from). That puts autosaves visually beneath the S&E they
+    // ended, matching the "S&E ends a session" model used everywhere
+    // else (retention, session-pane anchor, session count).
     for (int i = start; i < end; ++i) {
         const auto& r = hist[i];
-        // Newer row list; boundary occurs when the CURRENT row is the
-        // one that ends a session (SaveAndExit) -- draw divider AFTER
-        // it. That visually groups newer rows above the divider with
-        // the same session.
+        if (r.state == BackupDb::State::SaveAndExit && i > start) {
+            body.push_back(separator() | dim);
+        }
         Element rowEl = hbox({
             text(pad(formatWallDateTime(r.date), kDateW)),
             text(pad(std::string(backupStateShortLabel(r.state)), kStateW)),
@@ -1053,9 +1057,6 @@ Element renderBackupsDetail(const PaneConfig& config, BackupDb* db,
         });
         if (i == cursor) rowEl = rowEl | inverted;
         body.push_back(rowEl);
-        if (r.state == BackupDb::State::SaveAndExit && i + 1 < end) {
-            body.push_back(separator() | dim);
-        }
     }
 
     // Footer.
@@ -1184,7 +1185,9 @@ Element renderSessionLeaf(const DashboardSnapshot& now,
                           bool                     focused,
                           bool                     anchorPinned) {
     // Title reflects whether the anchor is user-pinned to a specific
-    // backup or tracking the newest SaveAndExit automatically.
+    // backup or tracking the current play session automatically (a
+    // session ends with an S&E; the anchor rides the first save after
+    // the S&E that opened the session).
     Element titleEl = text(
         anchorPinned ? " Session (pinned) " : " Session ");
     if (focused) titleEl = titleEl | inverted;
@@ -1564,7 +1567,7 @@ std::vector<ConfigMenuItem> buildConfigMenu(const PaneConfig& c, bool canDelete)
             items.push_back({
                 "anchor: pinned @ " + formatWallDateTime(c.sessionAnchorPinnedDate),
                 ConfigMenuItem::PickSessionAnchor});
-            items.push_back({"unpin anchor (auto = last Save & Exit)",
+            items.push_back({"unpin anchor (auto-track current session)",
                               ConfigMenuItem::UnpinSessionAnchor});
         } else {
             items.push_back({"anchor: auto (last Save & Exit)  --  [pick backup...]",
@@ -1968,20 +1971,23 @@ int runDashboard(const std::filesystem::path& savePath,
     ui.backupScheduler = backupScheduler.get();
 #endif
 
-    // Build a session anchor that respects the "last SaveAndExit" state
-    // of the active character when possible. Returns a lightweight
-    // SessionAnchor (character stats + pre-computed identified-item
-    // fingerprint set) rather than a shadow DashboardSnapshot -- the
-    // renderer only needs those fields, and the small footprint makes
-    // caching cheap enough to serve rapid autosave bursts without any
-    // byte parsing after the first miss.
+    // Build a session anchor for the current play session. A session
+    // ENDS with an S&E backup; its start is the first save (autosave or
+    // startup) captured after the previous session's S&E. In auto mode
+    // the anchor rides that start-of-session point; the diff therefore
+    // shows everything the player has done since they last logged in.
+    //
+    // Returns a lightweight SessionAnchor (character stats + pre-
+    // computed identified-item fingerprint set) rather than a shadow
+    // DashboardSnapshot -- the renderer only needs those fields, and
+    // the small footprint makes caching cheap enough to serve rapid
+    // autosave bursts without any byte parsing after the first miss.
     //
     // When `pinnedDate` is set, the anchor uses whichever .d2s backup
     // is newest with date <= pinnedDate (regardless of state), plus the
     // matching stash backup at date <= pinnedDate. This is how the
     // "pick backup as anchor" Session-pane menu action pins the diff
-    // base to a specific historical moment instead of auto-tracking
-    // the newest SaveAndExit.
+    // base to a specific historical moment instead of auto-tracking.
     auto buildSessionAnchor =
         [&](const std::shared_ptr<const DashboardSnapshot>& current,
             std::optional<std::int64_t>                     pinnedDate = std::nullopt)
@@ -2166,9 +2172,9 @@ int runDashboard(const std::filesystem::path& savePath,
             aggregateDashboardSnapshot(db, ui.fileCache));
         std::lock_guard g(ui.snapshotMutex);
         ui.snapshot = std::move(snap);
-        // Anchor the session view on the last SaveAndExit backup when
-        // available; refreshed by the user from the Session pane's
-        // config menu.
+        // Anchor the session view on the start of the current-or-just-
+        // ended play session (see buildSessionAnchor above); refreshed
+        // by the user from the Session pane's config menu.
         ui.sessionAnchor = buildSessionAnchor(ui.snapshot, sessionPinFromLayout());
     }
 
@@ -2217,18 +2223,12 @@ int runDashboard(const std::filesystem::path& savePath,
         }
         auto snap = std::make_shared<DashboardSnapshot>(
             aggregateDashboardSnapshot(db, ui.fileCache));
-        // Re-anchor the session view on every rebuild so it tracks the
-        // NEWEST SaveAndExit that D2R has produced. Without this, an
-        // anchor set at dashboard startup would go permanently stale:
-        // once the player quits + relaunches D2R and the scheduler
-        // commits a fresh S&E row (which by definition already contains
-        // everything they picked up during the previous session), that
-        // pickup should stop being flagged as "new" -- but the anchor
-        // still points at the pre-pickup S&E, so items like Aldur's
-        // Rhythm persist in the diff across sessions. Rebuilding the
-        // anchor here means the Session pane converges to "empty diff"
-        // as soon as a matching S&E is captured, which is what "session
-        // = current play attempt" actually means to the player.
+        // Re-anchor the session view on every rebuild so it advances as
+        // the player starts new play sessions. A session ENDS with an
+        // S&E; the anchor is the first save that opened the current-
+        // or-just-ended session (see buildSessionAnchor above). Without
+        // this refresh the anchor would go permanently stale after the
+        // first S&E of a long-running dashboard.
         auto anchor = buildSessionAnchor(snap, sessionPinFromLayout());
         std::lock_guard g(ui.snapshotMutex);
         ui.snapshot      = std::move(snap);
@@ -2568,8 +2568,8 @@ int runDashboard(const std::filesystem::path& savePath,
                     }
                     case ConfigMenuItem::ResetSession: {
                         // Re-run the same anchor logic used at startup:
-                        // prefer the newest SaveAndExit backup, falling
-                        // back to the live snapshot when none exists.
+                        // auto-track the current-or-just-ended session,
+                        // or re-load the user's pinned anchor.
                         std::shared_ptr<const DashboardSnapshot> snapNow;
                         {
                             std::lock_guard<std::mutex> g(ui.snapshotMutex);

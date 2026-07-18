@@ -95,6 +95,13 @@ public:
     // of a character, plus shared-stash rows that fall within any
     // preserved character session's date range). Runs in one transaction.
     // Returns the number of rows deleted.
+    //
+    // A session is the run of saves that ENDS at a state=SaveAndExit
+    // backup: all autosaves + startup rows preceding that S&E belong to
+    // the same session. Retention keeps whole sessions (including their
+    // terminating S&E), so a count of 2 keeps the two newest COMPLETED
+    // sessions plus everything newer than the oldest kept S&E -- i.e.,
+    // the current in-progress session if the user is mid-play.
     std::int64_t enforceRetention(int          days,
                                   int          sessionsPerFile,
                                   std::int64_t nowUnix);
@@ -106,7 +113,11 @@ public:
         std::int64_t lastDate     = 0;
         State        lastState    = State::Autosave;
         std::int64_t backupCount  = 0;
-        std::int64_t sessionCount = 0;   // rows with state=SaveAndExit
+        // Count of state=SaveAndExit rows. Since a session ends with an
+        // S&E, this is exactly the number of COMPLETED sessions we have
+        // on record for the file (an in-progress session -- autosaves
+        // with no S&E yet -- contributes 0).
+        std::int64_t sessionCount = 0;
     };
     [[nodiscard]] std::vector<FileSummary> summariseFiles() const;
 

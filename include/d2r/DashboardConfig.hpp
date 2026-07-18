@@ -28,7 +28,10 @@ enum class PaneType : std::uint8_t {
     Reconcile,  // Diff owned items vs chronicle entries.
     Backups,    // Save-file history from the backup DB (see BackupDb.hpp).
     BackupLog,  // Ephemeral ring buffer of this-process backup events.
-    Session,    // XP + new items since dashboard startup (or last reset).
+    Session,    // XP + new items acquired during the current play session
+                // (or the just-ended one). A session ends with the
+                // active character's SaveAndExit backup; its diff base
+                // is the first save that opened it.
 };
 
 enum class ChronicleCategory : std::uint8_t {

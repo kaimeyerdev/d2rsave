@@ -113,7 +113,9 @@ struct InventoryItem {
     // Per-instance identity read from item bytes. Populated for magic-
     // and-better items (D2R stores it in the extended block); left at 0
     // for stackables, gems, runes, etc. Used by the Session pane to
-    // diff owned items against a start-of-session anchor.
+    // diff owned items against the start-of-session anchor (the first
+    // save of the current-or-just-ended play session; sessions end with
+    // an S&E backup).
     std::uint32_t    fingerprint = 0;
     bool             identified  = false;
 };
@@ -257,7 +259,9 @@ void refreshDashboardCacheFromChanges(
 
 // Replace the active-player character portion of `snap` in place with
 // data parsed from a raw .d2s byte buffer. Used by the Session pane to
-// build a "start of session" anchor from the latest SaveAndExit backup:
+// build a start-of-session anchor from a chosen backup row (in auto
+// mode: the first save after the S&E that opened the current session;
+// in pinned mode: the user-picked row):
 // the shared stash + chronicle + quests carry over from the live
 // snapshot, while `activePlayer.*` and every inventory item whose
 // `location` starts with `filename` (base + " (merc)" / " (corpse)"
