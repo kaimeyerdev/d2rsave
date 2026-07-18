@@ -197,6 +197,19 @@ struct UiState {
         std::string status;
     } retentionModal;
     bool                                      retentionModalVisible = false;
+
+    // Session-anchor picker modal (opened by "pick backup as anchor..."
+    // from the Session pane's config menu). Populated with the active
+    // player's backup history at open time; scrolled with Up/Down;
+    // committed with Enter which writes the pin into the pane's
+    // PaneConfig and reruns the anchor build.
+    struct SessionPicker {
+        PaneNode*                         target = nullptr;  // owning pane
+        std::string                       filename;          // e.g. "Kai.d2s"
+        std::vector<BackupDb::HistoryRow> rows;              // newest-first
+        int                               cursor = 0;
+    } sessionPicker;
+    bool                                      sessionPickerVisible = false;
 };
 
 // ------------------------- top summary panels -------------------------------
@@ -1173,8 +1186,12 @@ std::unordered_set<ItemKey, ItemKeyHash> collectUniqueSetKeys(
 
 Element renderSessionLeaf(const DashboardSnapshot& now,
                           const DashboardSnapshot* anchor,
-                          bool focused) {
-    Element titleEl = text(" Session ");
+                          bool focused,
+                          bool anchorPinned) {
+    // Title reflects whether the anchor is user-pinned to a specific
+    // backup or tracking the newest SaveAndExit automatically.
+    Element titleEl = text(
+        anchorPinned ? " Session (pinned) " : " Session ");
     if (focused) titleEl = titleEl | inverted;
 
     if (!anchor) {
@@ -1401,6 +1418,76 @@ Element renderRetentionModal(const UiState::RetentionModal& m,
     return window(text(" Retention "), vbox(std::move(body)) | size(WIDTH, GREATER_THAN, 60));
 }
 
+// ---- Session-anchor picker modal -------------------------------------------
+
+// Modal that lists the active character's backup history newest-first
+// so the user can pick any specific row as the Session pane's anchor.
+// Rendered on top of the pane layout when `ui.sessionPickerVisible`.
+// Column layout matches the Backups Detail view so the two look and
+// feel identical when scrolling around.
+Element renderSessionPickerModal(const UiState::SessionPicker& p) {
+    Element titleEl = text(" Pick session anchor  " + p.filename + " ");
+
+    if (p.rows.empty()) {
+        return window(titleEl, vbox({
+            text("No backups on record for this character.") | dim,
+            text("Press [Esc] to close.") | dim,
+        }) | size(WIDTH, GREATER_THAN, 60));
+    }
+
+    constexpr int kDateW  = 20;
+    constexpr int kStateW = 10;
+    constexpr int kBytesW = 10;
+    constexpr int kSumW   = 12;
+    auto pad = [](std::string s, int w) {
+        if (static_cast<int>(s.size()) > w) return s.substr(0, w);
+        s.append(w - s.size(), ' ');
+        return s;
+    };
+
+    const int nRows   = static_cast<int>(p.rows.size());
+    const int cursor  = std::clamp(p.cursor, 0, nRows - 1);
+    // Show a window of rows around the cursor so long histories stay
+    // navigable inside a fixed-height modal.
+    constexpr int kVisibleRows = 20;
+    int start = std::max(0, cursor - kVisibleRows / 2);
+    if (start + kVisibleRows > nRows) start = std::max(0, nRows - kVisibleRows);
+    const int end = std::min(nRows, start + kVisibleRows);
+
+    Elements body;
+    body.push_back(hbox({
+        text(pad("when",     kDateW))  | bold,
+        text(pad("state",    kStateW)) | bold,
+        text(pad("bytes",    kBytesW)) | bold,
+        text(pad("checksum", kSumW))   | bold,
+    }));
+    body.push_back(separator());
+    for (int i = start; i < end; ++i) {
+        const auto& r = p.rows[i];
+        std::string sumStr = "-";
+        if (r.checksum) {
+            char b[16];
+            std::snprintf(b, sizeof(b), "%08x", *r.checksum);
+            sumStr = b;
+        }
+        Element rowEl = hbox({
+            text(pad(formatWallDateTime(r.date),                   kDateW)),
+            text(pad(std::string(backupStateShortLabel(r.state)),  kStateW)),
+            text(pad(std::to_string(r.sizeBytes),                  kBytesW)),
+            text(pad(sumStr,                                       kSumW)),
+        });
+        if (i == cursor) rowEl = rowEl | inverted;
+        body.push_back(rowEl);
+    }
+    body.push_back(separator());
+    body.push_back(hbox({
+        text(" row " + std::to_string(cursor + 1) + "/" + std::to_string(nRows)) | dim,
+        filler(),
+        text("[Up/Down] navigate  [Enter] pin  [Esc] cancel ") | dim,
+    }));
+    return window(titleEl, vbox(std::move(body)) | size(WIDTH, GREATER_THAN, 60));
+}
+
 // ---- Config-mode menu -------------------------------------------------------
 
 struct ConfigMenuItem {
@@ -1413,6 +1500,8 @@ struct ConfigMenuItem {
         ToggleQuality,
         ClearBackupLog,
         ResetSession,
+        PickSessionAnchor,
+        UnpinSessionAnchor,
         SplitVertical, SplitHorizontal, DeletePane, Close,
     } kind;
     // Extra payload used when kind == ToggleQuality.
@@ -1476,7 +1565,17 @@ std::vector<ConfigMenuItem> buildConfigMenu(const PaneConfig& c, bool canDelete)
         items.push_back({"clear backup-actions log", ConfigMenuItem::ClearBackupLog});
     }
     if (c.type == PaneType::Session) {
-        items.push_back({"reset session anchor (re-load last Save & Exit)",
+        if (c.sessionAnchorPinned && c.sessionAnchorPinnedDate > 0) {
+            items.push_back({
+                "anchor: pinned @ " + formatWallDateTime(c.sessionAnchorPinnedDate),
+                ConfigMenuItem::PickSessionAnchor});
+            items.push_back({"unpin anchor (auto = last Save & Exit)",
+                              ConfigMenuItem::UnpinSessionAnchor});
+        } else {
+            items.push_back({"anchor: auto (last Save & Exit)  --  [pick backup...]",
+                              ConfigMenuItem::PickSessionAnchor});
+        }
+        items.push_back({"reset session anchor now",
                           ConfigMenuItem::ResetSession});
     }
     items.push_back({"split vertical   (side-by-side)", ConfigMenuItem::SplitVertical});
@@ -1608,7 +1707,8 @@ Element renderPane(PaneNode& node, const UiState& ui,
             leafEl = renderBackupLogLeaf(ui, focused);
             break;
         case PaneType::Session:
-            leafEl = renderSessionLeaf(s, ui.sessionAnchor.get(), focused);
+            leafEl = renderSessionLeaf(s, ui.sessionAnchor.get(), focused,
+                                        node.config.sessionAnchorPinned);
             break;
         case PaneType::Blank:
             leafEl = renderBlankLeaf(focused);
@@ -1880,44 +1980,61 @@ int runDashboard(const std::filesystem::path& savePath,
     // instead of the trivial 0-delta a same-snapshot anchor gives.
     // Falls back to reusing the current snapshot when there's no
     // suitable backup (fresh install, print-mode, DB unavailable, etc.).
+    //
+    // When `pinnedDate` is set, the anchor uses whichever .d2s backup
+    // is newest with date <= pinnedDate (regardless of state), plus the
+    // matching stash backup at date <= pinnedDate. This is how the
+    // "pick backup as anchor" Session-pane menu action pins the diff
+    // base to a specific historical moment instead of auto-tracking
+    // the newest SaveAndExit.
     auto buildSessionAnchor =
-        [&](const std::shared_ptr<const DashboardSnapshot>& current)
+        [&](const std::shared_ptr<const DashboardSnapshot>& current,
+            std::optional<std::int64_t>                     pinnedDate = std::nullopt)
         -> std::shared_ptr<const DashboardSnapshot> {
         if (!current || !current->hasActivePlayer) return current;
 #if D2R_HAVE_INOTIFY
         if (!backupDb) return current;
         const auto& filename = current->activePlayer.file;
         if (filename.empty()) return current;
-        // Find the newest SaveAndExit row for this .d2s and pull its bytes.
-        std::vector<BackupDb::HistoryRow> hist;
-        try { hist = backupDb->historyFor(filename, 200); }
-        catch (const std::exception&) { return current; }
+
         std::optional<BackupDb::Row> row;
-        std::int64_t                 sAndEDate = 0;
-        for (const auto& h : hist) {
-            if (h.state != BackupDb::State::SaveAndExit) continue;
-            try { row = backupDb->at(filename, h.date); }
+        std::int64_t                 anchorDate = 0;
+        if (pinnedDate) {
+            // Pinned mode: fetch the newest row at-or-before the pin.
+            try { row = backupDb->at(filename, *pinnedDate); }
             catch (const std::exception&) { row.reset(); }
-            if (row) { sAndEDate = h.date; break; }
+            if (row) anchorDate = *pinnedDate;
+        } else {
+            // Auto mode: walk history for the newest SaveAndExit row.
+            std::vector<BackupDb::HistoryRow> hist;
+            try { hist = backupDb->historyFor(filename, 200); }
+            catch (const std::exception&) { return current; }
+            for (const auto& h : hist) {
+                if (h.state != BackupDb::State::SaveAndExit) continue;
+                try { row = backupDb->at(filename, h.date); }
+                catch (const std::exception&) { row.reset(); }
+                if (row) { anchorDate = h.date; break; }
+            }
         }
         if (!row || row->data.empty()) return current;
-        // Overlay the S&E character bytes onto a copy of the current
+        // Overlay the anchor character bytes onto a copy of the current
         // snapshot; chronicle / quests / reconcile carry over.
         auto anchor = std::make_shared<DashboardSnapshot>(*current);
         if (!overrideActivePlayerFromBytes(*anchor, db, row->data, filename)) {
             return current;
         }
         // Also rewind the shared stash to the newest .d2i backup that
-        // pre-dates the S&E moment, so items the player deposited into
-        // the stash during this session correctly show as "new" in the
-        // diff. If no matching stash backup exists (e.g. brand-new DB)
-        // we keep the current stash -- worst case is a few false-new
-        // stash items, better than losing the character-side signal.
+        // pre-dates the anchor moment, so items the player deposited
+        // into the stash during this session correctly show as "new"
+        // in the diff. If no matching stash backup exists (e.g. brand-
+        // new DB) we keep the current stash -- worst case is a few
+        // false-new stash items, better than losing the character
+        // signal.
         if (!stashPath.empty()) {
             const auto stashFile = stashPath.filename().string();
             if (!stashFile.empty()) {
                 try {
-                    if (auto stashRow = backupDb->at(stashFile, sAndEDate);
+                    if (auto stashRow = backupDb->at(stashFile, anchorDate);
                         stashRow && !stashRow->data.empty()) {
                         (void)overrideSharedStashFromBytes(
                             *anchor, db, stashRow->data);
@@ -1927,13 +2044,31 @@ int runDashboard(const std::filesystem::path& savePath,
                 }
             }
         }
-        // Stamp the anchor with the S&E moment so the Session pane can
+        // Stamp the anchor with the moment so the Session pane can
         // display the elapsed session duration alongside the deltas.
-        anchor->refreshedAtEpoch = static_cast<std::uint64_t>(sAndEDate);
+        anchor->refreshedAtEpoch = static_cast<std::uint64_t>(anchorDate);
         return anchor;
 #else
+        (void)pinnedDate;
         return current;
 #endif
+    };
+
+    // Locate the first Session pane in the current layout that has a
+    // user-pinned anchor date. Returns nullopt when none is pinned
+    // (auto mode: buildSessionAnchor picks the newest S&E). Multiple
+    // Session panes share one global anchor; if two panes disagree,
+    // the first-in-DFS pin wins -- documented in the pane's config
+    // menu so the user knows the tradeoff.
+    auto sessionPinFromLayout = [&]() -> std::optional<std::int64_t> {
+        for (const auto* leaf : flattenLeaves(ui.rootPane)) {
+            if (leaf->config.type == PaneType::Session &&
+                leaf->config.sessionAnchorPinned &&
+                leaf->config.sessionAnchorPinnedDate > 0) {
+                return leaf->config.sessionAnchorPinnedDate;
+            }
+        }
+        return std::nullopt;
     };
 
     {
@@ -1944,7 +2079,7 @@ int runDashboard(const std::filesystem::path& savePath,
         // Anchor the session view on the last SaveAndExit backup when
         // available; refreshed by the user from the Session pane's
         // config menu.
-        ui.sessionAnchor = buildSessionAnchor(ui.snapshot);
+        ui.sessionAnchor = buildSessionAnchor(ui.snapshot, sessionPinFromLayout());
     }
 
     auto screen = ScreenInteractive::Fullscreen();
@@ -1988,7 +2123,7 @@ int runDashboard(const std::filesystem::path& savePath,
         // anchor here means the Session pane converges to "empty diff"
         // as soon as a matching S&E is captured, which is what "session
         // = current play attempt" actually means to the player.
-        auto anchor = buildSessionAnchor(snap);
+        auto anchor = buildSessionAnchor(snap, sessionPinFromLayout());
         std::lock_guard g(ui.snapshotMutex);
         ui.snapshot      = std::move(snap);
         ui.sessionAnchor = std::move(anchor);
@@ -2046,6 +2181,10 @@ int runDashboard(const std::filesystem::path& savePath,
         if (ui.retentionModalVisible) {
             root = dbox({ root,
                 renderRetentionModal(ui.retentionModal, ui.backupDb) | center });
+        }
+        if (ui.sessionPickerVisible) {
+            root = dbox({ root,
+                renderSessionPickerModal(ui.sessionPicker) | center });
         }
         return root;
     });
@@ -2225,6 +2364,50 @@ int runDashboard(const std::filesystem::path& savePath,
             return true;
         }
 
+        // ---- SESSION-ANCHOR PICKER modal ----
+        if (ui.sessionPickerVisible) {
+            auto& p = ui.sessionPicker;
+            const int n = static_cast<int>(p.rows.size());
+            if (e == Event::Escape) {
+                ui.sessionPickerVisible = false;
+                p.target = nullptr;
+                p.rows.clear();
+                return true;
+            }
+            if (n == 0) return true;   // empty list; only Esc is meaningful
+            if (e == Event::ArrowUp) {
+                p.cursor = std::max(0, p.cursor - 1);
+                return true;
+            }
+            if (e == Event::ArrowDown) {
+                p.cursor = std::min(n - 1, p.cursor + 1);
+                return true;
+            }
+            if (e == Event::PageUp) {
+                p.cursor = std::max(0, p.cursor - 10);
+                return true;
+            }
+            if (e == Event::PageDown) {
+                p.cursor = std::min(n - 1, p.cursor + 10);
+                return true;
+            }
+            if (e == Event::Home) { p.cursor = 0;     return true; }
+            if (e == Event::End)  { p.cursor = n - 1; return true; }
+            if (e == Event::Return) {
+                if (p.target) {
+                    p.target->config.sessionAnchorPinned     = true;
+                    p.target->config.sessionAnchorPinnedDate = p.rows[p.cursor].date;
+                }
+                ui.sessionPickerVisible = false;
+                p.target = nullptr;
+                p.rows.clear();
+                persistLayout();
+                rebuild();   // re-run buildSessionAnchor with the new pin
+                return true;
+            }
+            return true;   // swallow everything else while modal is up
+        }
+
         // ---- CONFIG mode ----
         if (ui.configMode) {
             auto* leaf = focusedLeaf();
@@ -2286,12 +2469,60 @@ int runDashboard(const std::filesystem::path& savePath,
                             std::lock_guard<std::mutex> g(ui.snapshotMutex);
                             snapNow = ui.snapshot;
                         }
-                        auto rebuilt = buildSessionAnchor(snapNow);
+                        auto rebuilt = buildSessionAnchor(snapNow, sessionPinFromLayout());
                         {
                             std::lock_guard<std::mutex> g(ui.snapshotMutex);
                             ui.sessionAnchor = std::move(rebuilt);
                         }
                         ui.configMode = false;
+                        break;
+                    }
+                    case ConfigMenuItem::PickSessionAnchor: {
+                        // Open the backup-history modal seeded with the
+                        // active player's rows. The Enter handler in
+                        // the modal loop writes the pick back into this
+                        // pane's PaneConfig and reruns the anchor build.
+                        std::shared_ptr<const DashboardSnapshot> snapNow;
+                        {
+                            std::lock_guard<std::mutex> g(ui.snapshotMutex);
+                            snapNow = ui.snapshot;
+                        }
+                        std::string filename;
+                        if (snapNow && snapNow->hasActivePlayer)
+                            filename = snapNow->activePlayer.file;
+#if D2R_HAVE_INOTIFY
+                        std::vector<BackupDb::HistoryRow> rows;
+                        if (ui.backupDb && !filename.empty()) {
+                            try { rows = ui.backupDb->historyFor(filename, 500); }
+                            catch (const std::exception&) {}
+                        }
+#else
+                        std::vector<BackupDb::HistoryRow> rows;
+#endif
+                        // Preselect the current pin if it exists.
+                        int cursor = 0;
+                        if (leaf->config.sessionAnchorPinned) {
+                            for (int i = 0; i < (int)rows.size(); ++i) {
+                                if (rows[i].date == leaf->config.sessionAnchorPinnedDate) {
+                                    cursor = i;
+                                    break;
+                                }
+                            }
+                        }
+                        ui.sessionPicker.target   = leaf;
+                        ui.sessionPicker.filename = std::move(filename);
+                        ui.sessionPicker.rows     = std::move(rows);
+                        ui.sessionPicker.cursor   = cursor;
+                        ui.sessionPickerVisible   = true;
+                        ui.configMode             = false;
+                        break;
+                    }
+                    case ConfigMenuItem::UnpinSessionAnchor: {
+                        leaf->config.sessionAnchorPinned     = false;
+                        leaf->config.sessionAnchorPinnedDate = 0;
+                        ui.configMode = false;
+                        persistLayout();
+                        rebuild();   // return to auto = newest S&E
                         break;
                     }
                     case ConfigMenuItem::SplitVertical:

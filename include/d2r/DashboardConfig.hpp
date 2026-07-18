@@ -96,6 +96,15 @@ struct PaneConfig {
     // most recently-viewed file across dashboard restarts.
     std::string       selectedBackupFile;
 
+    // Session-only. When `sessionAnchorPinned` is true, the Session
+    // pane uses `sessionAnchorPinnedDate` as its diff base -- the
+    // newest .d2s row for the active player with date <= this value,
+    // plus the matching stash backup. When false, the anchor tracks
+    // whatever SaveAndExit the scheduler last captured (auto mode).
+    // Pins are per-pane and persisted across dashboard restarts.
+    bool              sessionAnchorPinned     = false;
+    std::int64_t      sessionAnchorPinnedDate = 0;   // unix seconds
+
     // Chronicle + Inventory + Reconcile.
     std::string       searchQuery;
 

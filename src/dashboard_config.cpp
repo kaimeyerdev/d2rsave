@@ -271,6 +271,10 @@ nlohmann::json toJson(const PaneNode& n) {
         j["backupViewMode"]     = std::string(toString(c.backupViewMode));
         j["selectedBackupFile"] = c.selectedBackupFile;
     }
+    if (c.type == PaneType::Session) {
+        j["sessionAnchorPinned"]     = c.sessionAnchorPinned;
+        j["sessionAnchorPinnedDate"] = c.sessionAnchorPinnedDate;
+    }
     if (c.type == PaneType::Chronicle
      || c.type == PaneType::Inventory
      || c.type == PaneType::Reconcile) {
@@ -314,6 +318,12 @@ PaneNode fromJson(const nlohmann::json& j) {
                 j.value("backupViewMode", std::string("summary")));
             n.config.selectedBackupFile = j.value(
                 "selectedBackupFile", std::string());
+        }
+        if (n.config.type == PaneType::Session) {
+            n.config.sessionAnchorPinned     = j.value(
+                "sessionAnchorPinned", false);
+            n.config.sessionAnchorPinnedDate = j.value(
+                "sessionAnchorPinnedDate", std::int64_t{0});
         }
         if (n.config.type == PaneType::Chronicle
          || n.config.type == PaneType::Inventory
