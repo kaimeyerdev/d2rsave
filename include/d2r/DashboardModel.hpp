@@ -174,6 +174,17 @@ struct DashboardSnapshot {
     std::span<const std::byte>   characterBytes,
     std::string_view             filename);
 
+// Replace the shared-stash items in `snap.inventory` (locations
+// starting with "stash tab ") with items parsed from a raw .d2i byte
+// buffer. Companion to `overrideActivePlayerFromBytes` -- together
+// they build a Session anchor that fully reflects a past moment in
+// time. Returns true iff parsing succeeded; snapshot untouched on
+// failure. Requires `db.loadItemTables()` to have been called.
+[[nodiscard]] bool overrideSharedStashFromBytes(
+    DashboardSnapshot&           snap,
+    RefDb&                       db,
+    std::span<const std::byte>   stashBytes);
+
 // Experience needed to reach `level` from a fresh character. Levels
 // outside [1..99] clamp to the boundary. Values are the standard D2/D2R
 // experience table (public knowledge, matches game/D2R experience.txt).

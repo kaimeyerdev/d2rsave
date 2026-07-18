@@ -1188,17 +1188,35 @@ Element renderSessionLeaf(const DashboardSnapshot& now,
     }
 
     Elements body;
-    // Header line: which character we're tracking.
+    // Header line: character + session duration since the anchor moment.
+    // Session duration uses the anchor's stamped epoch (S&E backup date)
+    // vs wall-clock `now`, so the display keeps advancing between
+    // snapshot rebuilds rather than freezing at the last refresh.
+    Elements header;
     if (now.hasActivePlayer) {
-        body.push_back(hbox({
-            text("Tracking  ") | dim,
-            text(now.activePlayer.name) | bold,
-            text("  "),
-            text("(" + classString(now.activePlayer.characterClass) + ")") | dim,
-        }));
+        header.push_back(text(now.activePlayer.name) | bold);
+        header.push_back(text("  "));
+        header.push_back(text("(" + classString(now.activePlayer.characterClass) + ")") | dim);
     } else {
-        body.push_back(text("Tracking  (no active player)") | dim);
+        header.push_back(text("(no active player)") | dim);
     }
+    if (anchor->refreshedAtEpoch != 0) {
+        const auto anchorEpoch = static_cast<std::int64_t>(anchor->refreshedAtEpoch);
+        const auto nowEpoch    = static_cast<std::int64_t>(std::time(nullptr));
+        std::int64_t secs = nowEpoch - anchorEpoch;
+        if (secs < 0) secs = 0;
+        const std::int64_t h =  secs / 3600;
+        const std::int64_t m = (secs % 3600) / 60;
+        const std::int64_t s =  secs % 60;
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%lldh %02lldm %02llds",
+                      static_cast<long long>(h),
+                      static_cast<long long>(m),
+                      static_cast<long long>(s));
+        header.push_back(text("   "));
+        header.push_back(text(std::string(buf)) | dim);
+    }
+    body.push_back(hbox(std::move(header)));
 
     // Warn if the active-player identity changed since the anchor -- the
     // XP delta only makes sense within a single character, so we still
@@ -1875,19 +1893,43 @@ int runDashboard(const std::filesystem::path& savePath,
         try { hist = backupDb->historyFor(filename, 200); }
         catch (const std::exception&) { return current; }
         std::optional<BackupDb::Row> row;
+        std::int64_t                 sAndEDate = 0;
         for (const auto& h : hist) {
             if (h.state != BackupDb::State::SaveAndExit) continue;
             try { row = backupDb->at(filename, h.date); }
             catch (const std::exception&) { row.reset(); }
-            if (row) break;
+            if (row) { sAndEDate = h.date; break; }
         }
         if (!row || row->data.empty()) return current;
         // Overlay the S&E character bytes onto a copy of the current
-        // snapshot; shared stash + everything else carry over.
+        // snapshot; chronicle / quests / reconcile carry over.
         auto anchor = std::make_shared<DashboardSnapshot>(*current);
         if (!overrideActivePlayerFromBytes(*anchor, db, row->data, filename)) {
             return current;
         }
+        // Also rewind the shared stash to the newest .d2i backup that
+        // pre-dates the S&E moment, so items the player deposited into
+        // the stash during this session correctly show as "new" in the
+        // diff. If no matching stash backup exists (e.g. brand-new DB)
+        // we keep the current stash -- worst case is a few false-new
+        // stash items, better than losing the character-side signal.
+        if (!stashPath.empty()) {
+            const auto stashFile = stashPath.filename().string();
+            if (!stashFile.empty()) {
+                try {
+                    if (auto stashRow = backupDb->at(stashFile, sAndEDate);
+                        stashRow && !stashRow->data.empty()) {
+                        (void)overrideSharedStashFromBytes(
+                            *anchor, db, stashRow->data);
+                    }
+                } catch (const std::exception&) {
+                    // Non-fatal; anchor still has correct character side.
+                }
+            }
+        }
+        // Stamp the anchor with the S&E moment so the Session pane can
+        // display the elapsed session duration alongside the deltas.
+        anchor->refreshedAtEpoch = static_cast<std::uint64_t>(sAndEDate);
         return anchor;
 #else
         return current;

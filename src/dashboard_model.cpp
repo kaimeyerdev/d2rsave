@@ -827,4 +827,60 @@ bool overrideActivePlayerFromBytes(DashboardSnapshot&         snap,
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Session anchor (part 2): swap the shared-stash items in a snapshot for
+// items parsed from a specific .d2i byte buffer, so a Session anchor can
+// represent the stash as it was at a past moment in time (e.g. when the
+// backup that seeded the character-side override was taken).
+// ---------------------------------------------------------------------------
+bool overrideSharedStashFromBytes(DashboardSnapshot&         snap,
+                                  RefDb&                     db,
+                                  std::span<const std::byte> stashBytes) {
+    static const std::string kStashPrefix = "stash tab ";
+
+    SharedStash parsed;
+    try {
+        SharedStashParser sp(db);
+        parsed = sp.parse(stashBytes);
+    } catch (const std::exception&) {
+        return false;
+    }
+
+    // Drop every existing stash-side inventory item; the parsed bytes
+    // are the authoritative replacement.
+    snap.inventory.erase(
+        std::remove_if(snap.inventory.begin(), snap.inventory.end(),
+            [&](const InventoryItem& inv) {
+                return inv.location.size() >= kStashPrefix.size() &&
+                       inv.location.compare(0, kStashPrefix.size(),
+                                             kStashPrefix) == 0;
+            }),
+        snap.inventory.end());
+
+    for (std::size_t i = 0; i < parsed.tabs.size(); ++i) {
+        const std::string loc = kStashPrefix + std::to_string(i + 1);
+        for (const auto& it : parsed.tabs[i].items) {
+            InventoryItem inv;
+            inv.name        = primaryName(db, it);
+            inv.baseName    = lookupBaseName(db, it.code);
+            inv.location    = loc;
+            inv.quality     = it.quality;
+            inv.fingerprint = it.fingerprint;
+            inv.identified  = it.identified;
+            snap.inventory.push_back(std::move(inv));
+            for (const auto& s : it.socketedItems) {
+                InventoryItem sInv;
+                sInv.name        = primaryName(db, s);
+                sInv.baseName    = lookupBaseName(db, s.code);
+                sInv.location    = loc;
+                sInv.quality     = s.quality;
+                sInv.fingerprint = s.fingerprint;
+                sInv.identified  = s.identified;
+                snap.inventory.push_back(std::move(sInv));
+            }
+        }
+    }
+    return true;
+}
+
 } // namespace d2r
