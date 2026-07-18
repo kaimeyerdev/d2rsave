@@ -128,12 +128,27 @@ struct UiState {
     std::mutex                                snapshotMutex;
     std::shared_ptr<const DashboardSnapshot>  snapshot;
 
-    // First snapshot captured at dashboard startup, used as the diff
-    // anchor for the Session pane. Never mutated after assignment
-    // (shared_ptr<const>), so the render thread can read without a
-    // lock; only reassigned when the user picks "Reset session anchor"
-    // from the pane config menu.
-    std::shared_ptr<const DashboardSnapshot>  sessionAnchor;
+    // Lightweight point-in-time record the Session pane diffs against.
+    // Rebuilt by `buildSessionAnchor` on every rebuild, but cached by
+    // `sessionAnchorCacheKey` -- consecutive rebuilds during an
+    // autosave burst (e.g. gem-combine) share the same key and
+    // short-circuit without any byte parsing. Renderer just reads
+    // `sessionAnchor->itemKeys.contains(...)` per current item.
+    std::shared_ptr<const SessionAnchor>      sessionAnchor;
+    // Cache key: character-side anchor date, stash-side anchor date,
+    // pinned date (0 when auto mode). If the previously-built anchor
+    // was for the same key, we return it as-is.
+    struct SessionAnchorCacheKey {
+        std::int64_t characterDate = 0;
+        std::int64_t stashDate     = 0;
+        std::int64_t pinnedDate    = 0;
+        bool operator==(const SessionAnchorCacheKey& o) const noexcept {
+            return characterDate == o.characterDate
+                && stashDate     == o.stashDate
+                && pinnedDate    == o.pinnedDate;
+        }
+    };
+    SessionAnchorCacheKey                     sessionAnchorCacheKey{};
 
     // Ephemeral backup-action ring buffer for the BackupLog pane. Written
     // by the watcher/scheduler thread via setInsertCallback (and by the
@@ -1149,45 +1164,12 @@ std::uint64_t cumulativeXp(std::uint32_t level, std::uint64_t inLevel) {
     return prev + inLevel;
 }
 
-// Collect fingerprints of every identified unique or set item, keyed by
-// (fingerprint, quality) to avoid the rare fingerprint=0 collision on
-// stackables (which we exclude anyway) or the theoretical collision
-// between a unique and a set instance sharing a fingerprint value.
-struct ItemKey {
-    std::uint32_t fingerprint;
-    ItemQuality   quality;
-    bool operator==(const ItemKey& o) const noexcept {
-        return fingerprint == o.fingerprint && quality == o.quality;
-    }
-};
-struct ItemKeyHash {
-    std::size_t operator()(const ItemKey& k) const noexcept {
-        return std::hash<std::uint64_t>{}(
-            (static_cast<std::uint64_t>(k.fingerprint) << 8) |
-            static_cast<std::uint64_t>(k.quality));
-    }
-};
-
-std::unordered_set<ItemKey, ItemKeyHash> collectUniqueSetKeys(
-    const std::vector<InventoryItem>& inv) {
-    std::unordered_set<ItemKey, ItemKeyHash> out;
-    out.reserve(inv.size() / 8 + 16);
-    for (const auto& it : inv) {
-        if (!it.identified) continue;
-        if (it.quality != ItemQuality::Unique && it.quality != ItemQuality::Set)
-            continue;
-        if (it.fingerprint == 0) continue;
-        out.insert({it.fingerprint, it.quality});
-    }
-    return out;
-}
-
 } // namespace
 
 Element renderSessionLeaf(const DashboardSnapshot& now,
-                          const DashboardSnapshot* anchor,
-                          bool focused,
-                          bool anchorPinned) {
+                          const SessionAnchor*     anchor,
+                          bool                     focused,
+                          bool                     anchorPinned) {
     // Title reflects whether the anchor is user-pinned to a specific
     // backup or tracking the newest SaveAndExit automatically.
     Element titleEl = text(
@@ -1217,8 +1199,8 @@ Element renderSessionLeaf(const DashboardSnapshot& now,
     } else {
         header.push_back(text("(no active player)") | dim);
     }
-    if (anchor->refreshedAtEpoch != 0) {
-        const auto anchorEpoch = static_cast<std::int64_t>(anchor->refreshedAtEpoch);
+    if (anchor->anchorEpoch != 0) {
+        const auto anchorEpoch = anchor->anchorEpoch;
         const auto nowEpoch    = static_cast<std::int64_t>(std::time(nullptr));
         std::int64_t secs = nowEpoch - anchorEpoch;
         if (secs < 0) secs = 0;
@@ -1240,9 +1222,9 @@ Element renderSessionLeaf(const DashboardSnapshot& now,
     // show the numbers but flag the mismatch so the user knows to reset
     // the anchor from the pane config.
     if (anchor->hasActivePlayer && now.hasActivePlayer &&
-        anchor->activePlayer.name != now.activePlayer.name) {
+        anchor->playerName != now.activePlayer.name) {
         body.push_back(text(
-            "  * anchor was " + anchor->activePlayer.name +
+            "  * anchor was " + anchor->playerName +
             "; reset session for this character") | color(Color::Yellow));
     }
     body.push_back(separator());
@@ -1253,14 +1235,13 @@ Element renderSessionLeaf(const DashboardSnapshot& now,
     std::int32_t levelDelta = 0;
     double       pctDelta = 0.0;
     if (anchor->hasActivePlayer && now.hasActivePlayer) {
-        const auto& a = anchor->activePlayer;
         const auto& n = now.activePlayer;
-        const std::uint64_t aCum = cumulativeXp(a.level, a.expInLevel);
-        const std::uint64_t nCum = cumulativeXp(n.level, n.expInLevel);
+        const std::uint64_t aCum = cumulativeXp(anchor->level, anchor->expInLevel);
+        const std::uint64_t nCum = cumulativeXp(n.level,       n.expInLevel);
         xpDelta = static_cast<std::int64_t>(nCum)
                 - static_cast<std::int64_t>(aCum);
         levelDelta = static_cast<std::int32_t>(n.level)
-                   - static_cast<std::int32_t>(a.level);
+                   - static_cast<std::int32_t>(anchor->level);
         // Percentage relative to the anchor's cumulative XP, so long
         // grinds late-game read as small percentages just like the
         // in-game bar.
@@ -1284,8 +1265,9 @@ Element renderSessionLeaf(const DashboardSnapshot& now,
     }));
     body.push_back(separator());
 
-    // New identified Uniques / Sets since anchor. Diff by fingerprint.
-    const auto anchorKeys = collectUniqueSetKeys(anchor->inventory);
+    // New identified Uniques / Sets since anchor. Diff by fingerprint
+    // against the pre-computed anchor->itemKeys set (built once at
+    // anchor construction time; no per-render hash rebuild).
     std::vector<const InventoryItem*> newUniques;
     std::vector<const InventoryItem*> newSets;
     for (const auto& it : now.inventory) {
@@ -1293,7 +1275,7 @@ Element renderSessionLeaf(const DashboardSnapshot& now,
         if (it.fingerprint == 0) continue;
         if (it.quality != ItemQuality::Unique && it.quality != ItemQuality::Set)
             continue;
-        if (anchorKeys.contains({it.fingerprint, it.quality})) continue;
+        if (anchor->itemKeys.contains({it.fingerprint, it.quality})) continue;
         (it.quality == ItemQuality::Unique ? newUniques : newSets).push_back(&it);
     }
 
@@ -1974,12 +1956,12 @@ int runDashboard(const std::filesystem::path& savePath,
 #endif
 
     // Build a session anchor that respects the "last SaveAndExit" state
-    // of the active character when possible. This lets a user who opens
-    // the dashboard mid-play see a delta between "what my character
-    // looked like last time I quit the game" and the live snapshot,
-    // instead of the trivial 0-delta a same-snapshot anchor gives.
-    // Falls back to reusing the current snapshot when there's no
-    // suitable backup (fresh install, print-mode, DB unavailable, etc.).
+    // of the active character when possible. Returns a lightweight
+    // SessionAnchor (character stats + pre-computed identified-item
+    // fingerprint set) rather than a shadow DashboardSnapshot -- the
+    // renderer only needs those fields, and the small footprint makes
+    // caching cheap enough to serve rapid autosave bursts without any
+    // byte parsing after the first miss.
     //
     // When `pinnedDate` is set, the anchor uses whichever .d2s backup
     // is newest with date <= pinnedDate (regardless of state), plus the
@@ -1990,25 +1972,33 @@ int runDashboard(const std::filesystem::path& savePath,
     auto buildSessionAnchor =
         [&](const std::shared_ptr<const DashboardSnapshot>& current,
             std::optional<std::int64_t>                     pinnedDate = std::nullopt)
-        -> std::shared_ptr<const DashboardSnapshot> {
-        if (!current || !current->hasActivePlayer) return current;
+        -> std::shared_ptr<const SessionAnchor> {
+        // Fallback used when we can't build a proper anchor -- treats
+        // the current snapshot's active player + inventory as the
+        // anchor, which produces a trivial 0-delta diff (correct: we
+        // have no historical reference).
+        auto anchorFromCurrent = [&]() -> std::shared_ptr<const SessionAnchor> {
+            if (!current) return std::make_shared<SessionAnchor>();
+            return std::make_shared<SessionAnchor>(
+                makeSessionAnchorFromSnapshot(*current, 0));
+        };
+        if (!current || !current->hasActivePlayer) return anchorFromCurrent();
 #if D2R_HAVE_INOTIFY
-        if (!backupDb) return current;
+        if (!backupDb) return anchorFromCurrent();
         const auto& filename = current->activePlayer.file;
-        if (filename.empty()) return current;
+        if (filename.empty()) return anchorFromCurrent();
 
+        // Step 1: resolve the CHARACTER-side anchor date (row lookup).
         std::optional<BackupDb::Row> row;
         std::int64_t                 anchorDate = 0;
         if (pinnedDate) {
-            // Pinned mode: fetch the newest row at-or-before the pin.
             try { row = backupDb->at(filename, *pinnedDate); }
             catch (const std::exception&) { row.reset(); }
             if (row) anchorDate = *pinnedDate;
         } else {
-            // Auto mode: walk history for the newest SaveAndExit row.
             std::vector<BackupDb::HistoryRow> hist;
             try { hist = backupDb->historyFor(filename, 200); }
-            catch (const std::exception&) { return current; }
+            catch (const std::exception&) { return anchorFromCurrent(); }
             for (const auto& h : hist) {
                 if (h.state != BackupDb::State::SaveAndExit) continue;
                 try { row = backupDb->at(filename, h.date); }
@@ -2016,38 +2006,24 @@ int runDashboard(const std::filesystem::path& savePath,
                 if (row) { anchorDate = h.date; break; }
             }
         }
-        if (!row || row->data.empty()) return current;
-        // Overlay the anchor character bytes onto a copy of the current
-        // snapshot; chronicle / quests / reconcile carry over.
-        auto anchor = std::make_shared<DashboardSnapshot>(*current);
-        if (!overrideActivePlayerFromBytes(*anchor, db, row->data, filename)) {
-            return current;
-        }
-        // Also rewind the shared stash to a matching backup so items
-        // the player deposited into the stash since the anchor moment
-        // correctly show as "new" in the diff. Two-step lookup:
-        //   1. newest .d2i row with date <= anchorDate (the usual case)
-        //   2. if none exists (e.g. user pinned an early Kai backup
-        //      that pre-dates the earliest stash backup), fall back to
-        //      the OLDEST stash row on file -- an approximation that
-        //      may under-count changes between "earliest known" and
-        //      the pin, but is far better than silently substituting
-        //      the current stash (which cancels the stash-side diff
-        //      to zero).
-        //   3. if the DB has no stash rows at all, empty the anchor's
-        //      stash side so every currently-owned stash item shows
-        //      up as new -- honest signal that we don't know what
-        //      the stash looked like back then.
+        if (!row || row->data.empty()) return anchorFromCurrent();
+
+        // Step 2: resolve the STASH-side anchor date. Three-tier lookup
+        // (see the older commit log for the rationale) but here we only
+        // record the DATE + row, delaying the parse to the miss path.
+        std::optional<BackupDb::Row> stashRow;
+        std::int64_t                 stashDate = 0;
+        std::string                  stashFile;
         if (!stashPath.empty()) {
-            const auto stashFile = stashPath.filename().string();
+            stashFile = stashPath.filename().string();
             if (!stashFile.empty()) {
-                std::optional<BackupDb::Row> stashRow;
                 try { stashRow = backupDb->at(stashFile, anchorDate); }
                 catch (const std::exception&) {}
-                if (!stashRow || stashRow->data.empty()) {
-                    // Fallback (2): search for the OLDEST non-empty
-                    // stash row -- historyFor returns newest-first,
-                    // so iterate from the back.
+                if (stashRow && !stashRow->data.empty()) {
+                    stashDate = anchorDate;   // approx; not needed for lookup
+                } else {
+                    stashRow.reset();
+                    // Fallback: OLDEST non-empty stash row.
                     std::vector<BackupDb::HistoryRow> hist;
                     try { hist = backupDb->historyFor(stashFile, 1000); }
                     catch (const std::exception&) {}
@@ -2056,26 +2032,59 @@ int runDashboard(const std::filesystem::path& savePath,
                         if (it->sizeBytes <= 0) continue;
                         try { stashRow = backupDb->at(stashFile, it->date); }
                         catch (const std::exception&) { stashRow.reset(); }
-                        if (stashRow && !stashRow->data.empty()) break;
+                        if (stashRow && !stashRow->data.empty()) {
+                            stashDate = it->date;
+                            break;
+                        }
                         stashRow.reset();
                     }
                 }
-                if (stashRow && !stashRow->data.empty()) {
-                    (void)overrideSharedStashFromBytes(
-                        *anchor, db, stashRow->data);
-                } else {
-                    // Fallback (3): no historical stash data at all.
-                    clearSharedStashInSnapshot(*anchor);
-                }
             }
         }
-        // Stamp the anchor with the moment so the Session pane can
-        // display the elapsed session duration alongside the deltas.
-        anchor->refreshedAtEpoch = static_cast<std::uint64_t>(anchorDate);
+
+        // Step 3: cache check. During autosave bursts the (character
+        // date, stash date, pinned date) tuple usually stays stable
+        // across many rebuilds -- return the previously-built anchor
+        // without touching the parser.
+        const UiState::SessionAnchorCacheKey key{
+            anchorDate,
+            stashDate,
+            pinnedDate.value_or(0),
+        };
+        if (ui.sessionAnchor && ui.sessionAnchorCacheKey == key) {
+            return ui.sessionAnchor;
+        }
+
+        // Step 4: miss path -- build a fresh anchor. Start from a
+        // shallow-ish copy of `current` so items owned by OTHER
+        // characters (SetHolderFour, UniqueArmors, etc. -- .d2s files
+        // that live in the same save dir) stay in the anchor's item
+        // pool. Otherwise every such item would flag as "new" in the
+        // diff, because they'd be present in `now.inventory` but
+        // absent from an empty anchor. We can't easily strip out
+        // chronicle/reconcile without touching DashboardSnapshot, so
+        // eat the deep copy on the miss path -- the cache-hit fast
+        // path avoids it during bursts, which is what matters.
+        DashboardSnapshot temp = *current;
+        if (!overrideActivePlayerFromBytes(temp, db, row->data, filename)) {
+            return anchorFromCurrent();
+        }
+        if (stashRow && !stashRow->data.empty()) {
+            (void)overrideSharedStashFromBytes(temp, db, stashRow->data);
+        } else if (!stashFile.empty()) {
+            // No historical stash backup at all -- clear the current
+            // stash out of the anchor so current-stash items don't
+            // silently zero the stash diff.
+            clearSharedStashInSnapshot(temp);
+        }
+
+        auto anchor = std::make_shared<SessionAnchor>(
+            makeSessionAnchorFromSnapshot(temp, anchorDate));
+        ui.sessionAnchorCacheKey = key;
         return anchor;
 #else
         (void)pinnedDate;
-        return current;
+        return anchorFromCurrent();
 #endif
     };
 

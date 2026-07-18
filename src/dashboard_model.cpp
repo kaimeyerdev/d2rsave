@@ -895,4 +895,32 @@ void clearSharedStashInSnapshot(DashboardSnapshot& snap) {
         snap.inventory.end());
 }
 
+// Reduce a fully-populated DashboardSnapshot to the small
+// SessionAnchor the pane actually reads. Kept as a pure function so
+// the ftxui layer can call it after applying the character + stash
+// byte overrides to a working snapshot.
+SessionAnchor makeSessionAnchorFromSnapshot(const DashboardSnapshot& snap,
+                                            std::int64_t             anchorEpoch) {
+    SessionAnchor out;
+    out.hasActivePlayer = snap.hasActivePlayer;
+    if (snap.hasActivePlayer) {
+        out.playerName   = snap.activePlayer.name;
+        out.playerClass  = snap.activePlayer.characterClass;
+        out.level        = snap.activePlayer.level;
+        out.expInLevel   = snap.activePlayer.expInLevel;
+    }
+    out.anchorEpoch = anchorEpoch;
+    // Pre-computed lookup set: identified Unique/Set items with a
+    // non-zero fingerprint. Renderer's diff loop just probes contains().
+    out.itemKeys.reserve(snap.inventory.size() / 8 + 16);
+    for (const auto& it : snap.inventory) {
+        if (!it.identified) continue;
+        if (it.quality != ItemQuality::Unique && it.quality != ItemQuality::Set)
+            continue;
+        if (it.fingerprint == 0) continue;
+        out.itemKeys.insert({it.fingerprint, it.quality});
+    }
+    return out;
+}
+
 } // namespace d2r

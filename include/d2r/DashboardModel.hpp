@@ -17,6 +17,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <vector>
 
 namespace d2r {
@@ -192,6 +193,64 @@ struct DashboardSnapshot {
 // empty is more honest than silently substituting the current stash
 // (which would zero-out the stash side of the diff).
 void clearSharedStashInSnapshot(DashboardSnapshot& snap);
+
+// ---------------------------------------------------------------------------
+// SessionAnchor: the lightweight point-in-time record the Session pane
+// diffs against.
+//
+// Historically the anchor was stored as a full DashboardSnapshot (deep-
+// copied from the live snapshot then overlaid with backup bytes). That
+// deep copy carries chronicle + reconcile + quests + per-item name
+// strings the Session pane never reads, and forces the renderer to
+// rebuild an identified-uniques/sets hash set on every frame. Rapid
+// autosave bursts (e.g. combining gems fires ~10 .d2s writes in a few
+// seconds) made both costs painful.
+//
+// SessionAnchor keeps only what the renderer actually consumes AND
+// pre-computes the identified-item lookup set once, at anchor build
+// time. Consecutive rebuilds where the anchor inputs are unchanged
+// can reuse the same shared_ptr without any byte parsing.
+// ---------------------------------------------------------------------------
+struct SessionAnchorItemKey {
+    std::uint32_t fingerprint = 0;
+    ItemQuality   quality     = ItemQuality::None;
+    bool operator==(const SessionAnchorItemKey& o) const noexcept {
+        return fingerprint == o.fingerprint && quality == o.quality;
+    }
+};
+struct SessionAnchorItemKeyHash {
+    std::size_t operator()(const SessionAnchorItemKey& k) const noexcept {
+        return std::hash<std::uint64_t>{}(
+            (static_cast<std::uint64_t>(k.fingerprint) << 8) |
+             static_cast<std::uint64_t>(k.quality));
+    }
+};
+
+struct SessionAnchor {
+    bool           hasActivePlayer = false;
+    std::string    playerName;
+    CharacterClass playerClass     = CharacterClass::Unknown;
+    std::uint32_t  level           = 0;
+    std::uint64_t  expInLevel      = 0;
+    // When the anchor was taken (unix seconds; 0 when unavailable).
+    // The Session pane subtracts this from wall-clock time to render
+    // the elapsed session duration.
+    std::int64_t   anchorEpoch     = 0;
+    // Pre-computed set of (fingerprint, quality) for every identified
+    // Unique / Set item that existed in the anchor's character-side
+    // AND shared-stash inventory. The renderer's diff loop only needs
+    // to query `itemKeys.contains(...)` per current item -- no
+    // per-render hash-set rebuild.
+    std::unordered_set<SessionAnchorItemKey, SessionAnchorItemKeyHash> itemKeys;
+};
+
+// Extract a SessionAnchor from a fully-populated DashboardSnapshot.
+// Used by the ftxui layer after overlaying the anchor bytes onto a
+// working DashboardSnapshot. `anchorEpoch` should be the unix time of
+// the underlying backup row (character-side); it drives the pane's
+// duration display.
+[[nodiscard]] SessionAnchor makeSessionAnchorFromSnapshot(
+    const DashboardSnapshot& snap, std::int64_t anchorEpoch);
 
 // Experience needed to reach `level` from a fresh character. Levels
 // outside [1..99] clamp to the boundary. Values are the standard D2/D2R
