@@ -112,9 +112,10 @@ public:
 
     // Per-file history, most-recent first, up to `limit` rows.
     struct HistoryRow {
-        std::int64_t date      = 0;
-        State        state     = State::Autosave;
-        std::int64_t sizeBytes = 0;   // 0 for tombstones
+        std::int64_t                 date      = 0;
+        State                        state     = State::Autosave;
+        std::int64_t                 sizeBytes = 0;   // 0 for tombstones
+        std::optional<std::uint32_t> checksum;         // NULL for tombstones / legacy
     };
     [[nodiscard]] std::vector<HistoryRow>
     historyFor(std::string_view filename, std::size_t limit) const;

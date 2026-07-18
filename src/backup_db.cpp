@@ -282,7 +282,8 @@ std::vector<BackupDb::HistoryRow>
 BackupDb::historyFor(std::string_view filename, std::size_t limit) const {
     Stmt s(db_,
         "SELECT date, state, "
-        "       CASE WHEN data IS NULL THEN 0 ELSE length(data) END AS n "
+        "       CASE WHEN data IS NULL THEN 0 ELSE length(data) END AS n, "
+        "       checksum "
         "  FROM backup "
         " WHERE filename = ? "
         " ORDER BY date DESC LIMIT ?");
@@ -294,6 +295,9 @@ BackupDb::historyFor(std::string_view filename, std::size_t limit) const {
         r.date      = s.columnInt64(0);
         r.state     = static_cast<State>(s.columnInt64(1));
         r.sizeBytes = s.columnInt64(2);
+        if (!s.columnIsNull(3)) {
+            r.checksum = static_cast<std::uint32_t>(s.columnInt64(3));
+        }
         out.push_back(r);
     }
     return out;

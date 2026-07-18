@@ -1001,6 +1001,14 @@ Element renderBackupsDetail(const PaneConfig& config, BackupDb* db,
             text(pad(formatWallDateTime(r.date), kDateW)),
             text(pad(std::string(backupStateShortLabel(r.state)), kStateW)),
             text(pad(std::to_string(r.sizeBytes), kBytesW)),
+            text(pad(r.checksum
+                        ? [v = *r.checksum]{
+                              char b[16];
+                              std::snprintf(b, sizeof(b), "%08x", v);
+                              return std::string(b);
+                          }()
+                        : std::string("-"),
+                     kSumW)),
         });
         if (i == cursor) rowEl = rowEl | inverted;
         body.push_back(rowEl);
