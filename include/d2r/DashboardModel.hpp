@@ -185,6 +185,14 @@ struct DashboardSnapshot {
     RefDb&                       db,
     std::span<const std::byte>   stashBytes);
 
+// Remove every shared-stash item (location starting with
+// "stash tab ") from `snap.inventory`, leaving character-side items
+// untouched. Used by the Session anchor when no historical stash
+// backup covers the pinned moment -- treating the anchor's stash as
+// empty is more honest than silently substituting the current stash
+// (which would zero-out the stash side of the diff).
+void clearSharedStashInSnapshot(DashboardSnapshot& snap);
+
 // Experience needed to reach `level` from a fresh character. Levels
 // outside [1..99] clamp to the boundary. Values are the standard D2/D2R
 // experience table (public knowledge, matches game/D2R experience.txt).

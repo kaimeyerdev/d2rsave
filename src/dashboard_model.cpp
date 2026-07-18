@@ -883,4 +883,16 @@ bool overrideSharedStashFromBytes(DashboardSnapshot&         snap,
     return true;
 }
 
+void clearSharedStashInSnapshot(DashboardSnapshot& snap) {
+    static const std::string kStashPrefix = "stash tab ";
+    snap.inventory.erase(
+        std::remove_if(snap.inventory.begin(), snap.inventory.end(),
+            [&](const InventoryItem& inv) {
+                return inv.location.size() >= kStashPrefix.size() &&
+                       inv.location.compare(0, kStashPrefix.size(),
+                                             kStashPrefix) == 0;
+            }),
+        snap.inventory.end());
+}
+
 } // namespace d2r

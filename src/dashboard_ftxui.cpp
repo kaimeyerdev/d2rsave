@@ -2023,24 +2023,49 @@ int runDashboard(const std::filesystem::path& savePath,
         if (!overrideActivePlayerFromBytes(*anchor, db, row->data, filename)) {
             return current;
         }
-        // Also rewind the shared stash to the newest .d2i backup that
-        // pre-dates the anchor moment, so items the player deposited
-        // into the stash during this session correctly show as "new"
-        // in the diff. If no matching stash backup exists (e.g. brand-
-        // new DB) we keep the current stash -- worst case is a few
-        // false-new stash items, better than losing the character
-        // signal.
+        // Also rewind the shared stash to a matching backup so items
+        // the player deposited into the stash since the anchor moment
+        // correctly show as "new" in the diff. Two-step lookup:
+        //   1. newest .d2i row with date <= anchorDate (the usual case)
+        //   2. if none exists (e.g. user pinned an early Kai backup
+        //      that pre-dates the earliest stash backup), fall back to
+        //      the OLDEST stash row on file -- an approximation that
+        //      may under-count changes between "earliest known" and
+        //      the pin, but is far better than silently substituting
+        //      the current stash (which cancels the stash-side diff
+        //      to zero).
+        //   3. if the DB has no stash rows at all, empty the anchor's
+        //      stash side so every currently-owned stash item shows
+        //      up as new -- honest signal that we don't know what
+        //      the stash looked like back then.
         if (!stashPath.empty()) {
             const auto stashFile = stashPath.filename().string();
             if (!stashFile.empty()) {
-                try {
-                    if (auto stashRow = backupDb->at(stashFile, anchorDate);
-                        stashRow && !stashRow->data.empty()) {
-                        (void)overrideSharedStashFromBytes(
-                            *anchor, db, stashRow->data);
+                std::optional<BackupDb::Row> stashRow;
+                try { stashRow = backupDb->at(stashFile, anchorDate); }
+                catch (const std::exception&) {}
+                if (!stashRow || stashRow->data.empty()) {
+                    // Fallback (2): search for the OLDEST non-empty
+                    // stash row -- historyFor returns newest-first,
+                    // so iterate from the back.
+                    std::vector<BackupDb::HistoryRow> hist;
+                    try { hist = backupDb->historyFor(stashFile, 1000); }
+                    catch (const std::exception&) {}
+                    for (auto it = hist.rbegin(); it != hist.rend(); ++it) {
+                        if (it->state == BackupDb::State::Deleted) continue;
+                        if (it->sizeBytes <= 0) continue;
+                        try { stashRow = backupDb->at(stashFile, it->date); }
+                        catch (const std::exception&) { stashRow.reset(); }
+                        if (stashRow && !stashRow->data.empty()) break;
+                        stashRow.reset();
                     }
-                } catch (const std::exception&) {
-                    // Non-fatal; anchor still has correct character side.
+                }
+                if (stashRow && !stashRow->data.empty()) {
+                    (void)overrideSharedStashFromBytes(
+                        *anchor, db, stashRow->data);
+                } else {
+                    // Fallback (3): no historical stash data at all.
+                    clearSharedStashInSnapshot(*anchor);
                 }
             }
         }
