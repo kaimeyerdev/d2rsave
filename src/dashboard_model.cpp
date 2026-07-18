@@ -264,6 +264,248 @@ void computeDifficulty(const Character& c,
     }
 }
 
+// ---------------------------------------------------------------------------
+// Per-file parse helpers used by the incremental snapshot pipeline. Each
+// takes raw bytes and produces a self-contained DashboardFileCache entry;
+// the aggregator merges entries into the final snapshot. Kept in the
+// anonymous namespace so `primaryName` / `lookupBaseName` / `countQuestItem`
+// / `computeDifficulty` are reachable.
+// ---------------------------------------------------------------------------
+
+DashboardFileCache::D2sEntry parseD2sIntoEntry(
+    RefDb&                                        db,
+    std::span<const std::byte>                    bytes,
+    std::string_view                              filename,
+    const std::unordered_set<std::uint32_t>&      collectableUniqueIds,
+    const std::unordered_set<std::uint32_t>&      collectableSetIds) {
+    DashboardFileCache::D2sEntry out;
+    out.character = parseCharacter(bytes);
+    if (out.character.itemsOffset == 0) return out;
+
+    ItemParser p(db);
+    const std::string filestr(filename);
+    auto record = [&](const std::vector<Item>& items,
+                      const std::string&       loc) {
+        for (const auto& it : items) {
+            countQuestItem(it, out.hellfire, out.colossal, out.terror);
+            InventoryItem inv;
+            inv.name        = primaryName(db, it);
+            inv.baseName    = lookupBaseName(db, it.code);
+            inv.location    = loc;
+            inv.quality     = it.quality;
+            inv.fingerprint = it.fingerprint;
+            inv.identified  = it.identified;
+            out.items.push_back(std::move(inv));
+
+            if (it.quality == ItemQuality::Unique) {
+                if (collectableUniqueIds.contains(it.uniqueId)) {
+                    out.chronUniqueLocs.emplace_back(it.uniqueId, loc);
+                }
+                out.ownedUniqueLocs.emplace_back(it.uniqueId, loc);
+            } else if (it.quality == ItemQuality::Set) {
+                if (collectableSetIds.contains(it.setItemId)) {
+                    out.chronSetLocs.emplace_back(it.setItemId, loc);
+                }
+                out.ownedSetLocs.emplace_back(it.setItemId, loc);
+            }
+
+            for (const auto& s : it.socketedItems) {
+                countQuestItem(s, out.hellfire, out.colossal, out.terror);
+                InventoryItem sInv;
+                sInv.name        = primaryName(db, s);
+                sInv.baseName    = lookupBaseName(db, s.code);
+                sInv.location    = loc;
+                sInv.quality     = s.quality;
+                sInv.fingerprint = s.fingerprint;
+                sInv.identified  = s.identified;
+                out.items.push_back(std::move(sInv));
+                // Socketed uniques/sets (Rainbow Facets, Defender's Fire)
+                // must count for reconcile ownership too.
+                if (s.quality == ItemQuality::Unique) {
+                    out.ownedUniqueLocs.emplace_back(s.uniqueId, loc);
+                } else if (s.quality == ItemQuality::Set) {
+                    out.ownedSetLocs.emplace_back(s.setItemId, loc);
+                }
+            }
+        }
+    };
+    try {
+        record(p.parseItems(bytes, out.character.itemsOffset), filestr);
+        if (out.character.mercItemsJMOffset) {
+            record(p.parseItems(bytes, out.character.mercItemsJMOffset),
+                   filestr + " (merc)");
+        }
+        if (out.character.corpseJMOffset && out.character.corpseItemCount == 1) {
+            record(p.parseItems(bytes, out.character.corpseJMOffset + 16),
+                   filestr + " (corpse)");
+        }
+        if (out.character.hasIronGolem && out.character.ironGolemItemOffset) {
+            try {
+                std::vector<Item> golem{
+                    p.parseSingleItem(bytes, out.character.ironGolemItemOffset)};
+                record(golem, filestr + " (iron golem)");
+            } catch (const std::exception&) {}
+        }
+    } catch (const std::exception&) {
+        // Partial parse: keep whatever succeeded.
+    }
+    return out;
+}
+
+DashboardFileCache::D2iEntry parseD2iIntoEntry(
+    RefDb&                        db,
+    std::span<const std::byte>    bytes) {
+    DashboardFileCache::D2iEntry out;
+    SharedStashParser sp(db);
+    // Single full parse yields both chronicle + storage tabs; the older
+    // code did two passes which doubled the .d2i cost. The chronicle
+    // block is embedded in the same file so `parse()` reads everything
+    // in one traversal; `parseChronicleOnly` just skips the tab items.
+    out.chron    = sp.parseChronicleOnly(bytes);
+    for (const auto& e : out.chron.uniques)  out.foundUniqueIds.insert(e.itemId);
+    for (const auto& e : out.chron.setItems) out.foundSetIds.insert(e.itemId);
+
+    const auto full = sp.parse(bytes);
+    for (std::size_t i = 0; i < full.tabs.size(); ++i) {
+        const std::string loc = "stash tab " + std::to_string(i + 1);
+        for (const auto& it : full.tabs[i].items) {
+            countQuestItem(it, out.hellfire, out.colossal, out.terror);
+            InventoryItem inv;
+            inv.name        = primaryName(db, it);
+            inv.baseName    = lookupBaseName(db, it.code);
+            inv.location    = loc;
+            inv.quality     = it.quality;
+            inv.fingerprint = it.fingerprint;
+            inv.identified  = it.identified;
+            out.items.push_back(std::move(inv));
+            if (it.quality == ItemQuality::Unique) {
+                out.ownedUniqueLocs.emplace_back(it.uniqueId, loc);
+            } else if (it.quality == ItemQuality::Set) {
+                out.ownedSetLocs.emplace_back(it.setItemId, loc);
+            }
+            for (const auto& s : it.socketedItems) {
+                countQuestItem(s, out.hellfire, out.colossal, out.terror);
+                InventoryItem sInv;
+                sInv.name        = primaryName(db, s);
+                sInv.baseName    = lookupBaseName(db, s.code);
+                sInv.location    = loc;
+                sInv.quality     = s.quality;
+                sInv.fingerprint = s.fingerprint;
+                sInv.identified  = s.identified;
+                out.items.push_back(std::move(sInv));
+                if (s.quality == ItemQuality::Unique) {
+                    out.ownedUniqueLocs.emplace_back(s.uniqueId, loc);
+                } else if (s.quality == ItemQuality::Set) {
+                    out.ownedSetLocs.emplace_back(s.setItemId, loc);
+                }
+            }
+        }
+    }
+    return out;
+}
+
+// Merge quest counters (all are sums of stack sizes / instance counts).
+void mergeQuestCounts(HellfireTorchQuest&       dst,
+                      const HellfireTorchQuest& src) {
+    dst.keysTerror      += src.keysTerror;
+    dst.keysHate        += src.keysHate;
+    dst.keysDestruction += src.keysDestruction;
+    dst.torchesHellfire += src.torchesHellfire;
+}
+void mergeQuestCounts(ColossalAncientsQuest&       dst,
+                      const ColossalAncientsQuest& src) {
+    dst.talicAnguish       += src.talicAnguish;
+    dst.madawcIre          += src.madawcIre;
+    dst.korlicPain         += src.korlicPain;
+    dst.bulKathosNightmare += src.bulKathosNightmare;
+    dst.woruskEnd          += src.woruskEnd;
+    dst.colossalJewels     += src.colossalJewels;
+}
+void mergeQuestCounts(TerrorZones& dst, const TerrorZones& src) {
+    dst.shardWestern  += src.shardWestern;
+    dst.shardEastern  += src.shardEastern;
+    dst.shardSouthern += src.shardSouthern;
+    dst.shardDeep     += src.shardDeep;
+    dst.shardNorthern += src.shardNorthern;
+}
+
+// Stat + parse-if-changed. Returns true when the cache entry was newly
+// populated (missing or stale); false when the on-disk file matched the
+// cached (mtime, size) and no work was needed. Missing files remove the
+// entry from the cache and return true (mutation happened).
+bool refreshD2sIfNeeded(
+    RefDb&                                        db,
+    const std::filesystem::path&                  path,
+    const std::string&                            basename,
+    const std::unordered_set<std::uint32_t>&      collectableUniqueIds,
+    const std::unordered_set<std::uint32_t>&      collectableSetIds,
+    DashboardFileCache&                           cache) {
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec) ||
+        !std::filesystem::is_regular_file(path, ec)) {
+        // File is gone; drop any cached entry.
+        return cache.d2s.erase(basename) > 0;
+    }
+    const auto mtime = std::filesystem::last_write_time(path, ec);
+    const auto size  = std::filesystem::file_size(path, ec);
+    if (ec) return false;   // stat failed; leave cache untouched.
+    if (auto it = cache.d2s.find(basename); it != cache.d2s.end()) {
+        if (it->second.mtime == mtime && it->second.size == size) {
+            return false;   // cache still valid
+        }
+    }
+    try {
+        const auto bytes = readFile(path.string());
+        auto entry = parseD2sIntoEntry(db, bytes, basename,
+                                        collectableUniqueIds, collectableSetIds);
+        entry.mtime = mtime;
+        entry.size  = size;
+        cache.d2s.insert_or_assign(basename, std::move(entry));
+        return true;
+    } catch (const std::exception&) {
+        // Parse failed -- keep any prior entry (may still be valid) so
+        // the pane stays populated with the last known-good state.
+        return false;
+    }
+}
+
+bool refreshD2iIfNeeded(
+    RefDb&                          db,
+    const std::filesystem::path&    path,
+    DashboardFileCache&             cache) {
+    std::error_code ec;
+    if (path.empty() ||
+        !std::filesystem::exists(path, ec) ||
+        !std::filesystem::is_regular_file(path, ec)) {
+        const bool had = cache.stash.has_value();
+        cache.stash.reset();
+        return had;
+    }
+    const auto mtime = std::filesystem::last_write_time(path, ec);
+    const auto size  = std::filesystem::file_size(path, ec);
+    if (ec) return false;
+    if (cache.stash && cache.stash->mtime == mtime && cache.stash->size == size) {
+        return false;
+    }
+    try {
+        const auto bytes = readFile(path.string());
+        auto entry = parseD2iIntoEntry(db, bytes);
+        entry.mtime = mtime;
+        entry.size  = size;
+        cache.stash = std::move(entry);
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
+// Ensure the process-lifetime RefDb tables are loaded on the cache.
+void ensureCacheTables(RefDb& db, DashboardFileCache& cache) {
+    if (!cache.tierByCode)          cache.tierByCode          = loadTierMap(db);
+    if (!cache.collectableUniqueIds) cache.collectableUniqueIds = loadCollectable(db, "uniqueitems", "code");
+    if (!cache.collectableSetIds)    cache.collectableSetIds    = loadCollectable(db, "setitems",    "item");
+}
+
 } // namespace
 
 std::uint64_t experienceToReachLevel(std::uint32_t level) noexcept {
@@ -271,200 +513,154 @@ std::uint64_t experienceToReachLevel(std::uint32_t level) noexcept {
     return kExpToReachLevel[level];
 }
 
-DashboardSnapshot buildSnapshot(RefDb& db,
-                                const std::filesystem::path& saveDir,
-                                const std::filesystem::path& stashPath) {
-    DashboardSnapshot snap;
-    snap.refreshedAtEpoch = static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count());
+// ---------------------------------------------------------------------------
+// Incremental snapshot pipeline.
+//
+// `refreshDashboardCacheFromDirectory` handles cold starts + manual [r]
+// refreshes: full walk, stat each file, re-parse only when mtime/size
+// changed, drop entries for files that vanished.
+//
+// `refreshDashboardCacheFromChanges` is the inotify hot path: touch only
+// the named basenames (which the watcher just told us changed). Skips
+// non-tracked filenames silently so the caller can forward the raw
+// watcher payload without pre-filtering.
+//
+// `aggregateDashboardSnapshot` walks the cache in deterministic order,
+// concatenates per-file items into snap.inventory, sums quest counters,
+// merges first-wins ownership maps, runs the chronicle + reconcile SQL
+// passes, and populates ActivePlayer from the newest-timestamped .d2s.
+//
+// The public one-shot `buildSnapshot(db, saveDir, stashPath)` is now a
+// thin wrapper: create a throwaway cache, refresh from directory,
+// aggregate. Preserves existing callers (tests, non-inotify builds).
+// ---------------------------------------------------------------------------
 
-    const auto tierByCode = loadTierMap(db);
-    const auto collectableUniqueIds = loadCollectable(db, "uniqueitems", "code");
-    const auto collectableSetIds    = loadCollectable(db, "setitems",    "item");
-
-    // Chronicle-tab entries from the shared stash (which the account has
-    // already "collected"). Location string is left blank; the per-.d2s
-    // scan below overlays a location for still-held items. The full
-    // ChronicleTab is retained for the reconcile diff below (needs the
-    // per-entry timestamps).
-    std::unordered_set<std::uint32_t> foundUniqueIds, foundSetIds;
-    ChronicleTab chron;
-    if (!stashPath.empty()) {
-        try {
-            const auto bytes = readFile(stashPath.string());
-            SharedStashParser sp(db);
-            chron = sp.parseChronicleOnly(bytes);
-            for (const auto& e : chron.uniques)  foundUniqueIds.insert(e.itemId);
-            for (const auto& e : chron.setItems) foundSetIds.insert(e.itemId);
-
-            // Storage-tab items (keys, torches, shards, statues, cjw).
-            const auto full = sp.parse(bytes);
-            for (std::size_t i = 0; i < full.tabs.size(); ++i) {
-                const std::string loc = "stash tab " + std::to_string(i + 1);
-                for (const auto& it : full.tabs[i].items) {
-                    countQuestItem(it, snap.hellfireTorch,
-                                   snap.colossalAncients, snap.terrorZones);
-                    InventoryItem inv;
-                    inv.name        = primaryName(db, it);
-                    inv.baseName    = lookupBaseName(db, it.code);
-                    inv.location    = loc;
-                    inv.quality     = it.quality;
-                    inv.fingerprint = it.fingerprint;
-                    inv.identified  = it.identified;
-                    snap.inventory.push_back(std::move(inv));
-                    for (const auto& s : it.socketedItems) {
-                        countQuestItem(s, snap.hellfireTorch,
-                                       snap.colossalAncients, snap.terrorZones);
-                        InventoryItem sInv;
-                        sInv.name        = primaryName(db, s);
-                        sInv.baseName    = lookupBaseName(db, s.code);
-                        sInv.location    = loc;
-                        sInv.quality     = s.quality;
-                        sInv.fingerprint = s.fingerprint;
-                        sInv.identified  = s.identified;
-                        snap.inventory.push_back(std::move(sInv));
-                    }
-                }
-            }
-        } catch (const std::exception&) {
-            // Ignored: absent / corrupt stash leaves quest counts and
-            // chronicle sets at zero.
-        }
-    }
-
-    // Character walk: pick the newest-by-timestamp for the ActivePlayer
-    // slot, count quest items across every inventory, and record ownership
-    // locations for chronicle rows.
-    std::unordered_map<std::uint32_t, std::string> uniqueLocations;
-    std::unordered_map<std::uint32_t, std::string> setLocations;
-    // Reconcile: track every owned unique / set id + first-seen location,
-    // regardless of collectable-catalog membership. Used below to compute
-    // the OwnedNotChronicled and ChronicledNotOwned lists.
-    std::unordered_map<std::uint32_t, std::string> ownedUniqueLocs;
-    std::unordered_map<std::uint32_t, std::string> ownedSetLocs;
-
-    // Record ownership for a single parsed Item into the reconcile maps.
-    // Socketed items (uniques like Rainbow Facet, or Defender's Fire type
-    // Colossal Jewels commonly slotted into armour) are just as much
-    // "owned" as the container -- reconcile has to see them or it'll
-    // report a false "discovered, not owned" discrepancy. Mirrors the
-    // recursion in `collectOwned` in src/main.cpp.
-    //
-    // Note: no `id != 0` guard. Both `uniqueitems.txt` and `setitems.txt`
-    // use id 0 for legitimate rows (The Gnasher, Civerb's Ward). The
-    // ItemQuality check is sufficient to know the id field is meaningful.
-    auto recordOwnership = [&](const Item& it, const std::string& loc) {
-        if (it.quality == ItemQuality::Unique) {
-            ownedUniqueLocs.try_emplace(it.uniqueId, loc);
-        } else if (it.quality == ItemQuality::Set) {
-            ownedSetLocs.try_emplace(it.setItemId, loc);
-        }
-    };
-
-    // Extend the stash-tab pass above: capture ownership for uniques/sets
-    // in stash tabs too. We do this in a second walk over `full.tabs` to
-    // keep the change local; parse cost is negligible relative to the
-    // characters below.
-    if (!stashPath.empty()) {
-        try {
-            const auto bytes = readFile(stashPath.string());
-            SharedStashParser sp(db);
-            const auto full = sp.parse(bytes);
-            for (std::size_t i = 0; i < full.tabs.size(); ++i) {
-                const std::string loc = "stash tab " + std::to_string(i + 1);
-                for (const auto& it : full.tabs[i].items) {
-                    recordOwnership(it, loc);
-                    for (const auto& s : it.socketedItems) recordOwnership(s, loc);
-                }
-            }
-        } catch (const std::exception&) {}
-    }
-
-    Character bestChar;
-    bool haveBest = false;
-
+void refreshDashboardCacheFromDirectory(
+    RefDb&                                        db,
+    const std::filesystem::path&                  saveDir,
+    const std::filesystem::path&                  stashPath,
+    DashboardFileCache&                           cache) {
+    ensureCacheTables(db, cache);
+    // Stash (single entry).
+    refreshD2iIfNeeded(db, stashPath, cache);
+    // Characters.
+    std::unordered_set<std::string> presentD2s;
     if (!saveDir.empty()) {
         std::error_code ec;
         for (const auto& entry : std::filesystem::directory_iterator(saveDir, ec)) {
             if (ec) break;
             if (entry.path().extension() != ".d2s") continue;
-            try {
-                const auto bytes = readFile(entry.path().string());
-                const auto ch    = parseCharacter(bytes);
-
-                if (!haveBest || ch.timestamp > bestChar.timestamp) {
-                    bestChar = ch;
-                    snap.activePlayer.file = entry.path().filename().string();
-                    haveBest = true;
-                }
-
-                if (ch.itemsOffset == 0) continue;
-                ItemParser p(db);
-                const auto file = entry.path().filename().string();
-
-                auto record = [&](const std::vector<Item>& items,
-                                  const std::string& loc) {
-                    for (const auto& it : items) {
-                        countQuestItem(it, snap.hellfireTorch,
-                                       snap.colossalAncients, snap.terrorZones);
-                        InventoryItem inv;
-                        inv.name        = primaryName(db, it);
-                        inv.baseName    = lookupBaseName(db, it.code);
-                        inv.location    = loc;
-                        inv.quality     = it.quality;
-                        inv.fingerprint = it.fingerprint;
-                        inv.identified  = it.identified;
-                        snap.inventory.push_back(std::move(inv));
-
-                        if (it.quality == ItemQuality::Unique &&
-                            collectableUniqueIds.contains(it.uniqueId)) {
-                            uniqueLocations.emplace(it.uniqueId, loc);
-                        } else if (it.quality == ItemQuality::Set &&
-                                   collectableSetIds.contains(it.setItemId)) {
-                            setLocations.emplace(it.setItemId, loc);
-                        }
-                        // Reconcile tracking (independent of collectable-catalog
-                        // membership so genuinely off-catalog owns still surface).
-                        recordOwnership(it, loc);
-
-                        for (const auto& s : it.socketedItems) {
-                            countQuestItem(s, snap.hellfireTorch,
-                                           snap.colossalAncients, snap.terrorZones);
-                            InventoryItem sInv;
-                            sInv.name        = primaryName(db, s);
-                            sInv.baseName    = lookupBaseName(db, s.code);
-                            sInv.location    = loc;
-                            sInv.quality     = s.quality;
-                            sInv.fingerprint = s.fingerprint;
-                            sInv.identified  = s.identified;
-                            snap.inventory.push_back(std::move(sInv));
-                            // Also track socketed uniques/sets (Rainbow Facets,
-                            // Defender's Fire etc. are usually socketed).
-                            recordOwnership(s, loc);
-                        }
-                    }
-                };
-                record(p.parseItems(bytes, ch.itemsOffset), file);
-                if (ch.mercItemsJMOffset) {
-                    record(p.parseItems(bytes, ch.mercItemsJMOffset),
-                           file + " (merc)");
-                }
-                if (ch.corpseJMOffset && ch.corpseItemCount == 1) {
-                    record(p.parseItems(bytes, ch.corpseJMOffset + 16),
-                           file + " (corpse)");
-                }
-                if (ch.hasIronGolem && ch.ironGolemItemOffset) {
-                    try {
-                        std::vector<Item> golem{
-                            p.parseSingleItem(bytes, ch.ironGolemItemOffset)};
-                        record(golem, file + " (iron golem)");
-                    } catch (const std::exception&) {}
-                }
-            } catch (const std::exception&) {
-                // Skip this .d2s; keep going.
-            }
+            auto name = entry.path().filename().string();
+            refreshD2sIfNeeded(db, entry.path(), name,
+                                *cache.collectableUniqueIds,
+                                *cache.collectableSetIds, cache);
+            presentD2s.insert(std::move(name));
         }
+    }
+    // Prune vanished files.
+    for (auto it = cache.d2s.begin(); it != cache.d2s.end();) {
+        if (!presentD2s.contains(it->first)) it = cache.d2s.erase(it);
+        else                                 ++it;
+    }
+}
+
+void refreshDashboardCacheFromChanges(
+    RefDb&                                        db,
+    const std::filesystem::path&                  saveDir,
+    const std::filesystem::path&                  stashPath,
+    DashboardFileCache&                           cache,
+    std::span<const std::string>                  changedBasenames) {
+    ensureCacheTables(db, cache);
+    const std::string stashName = stashPath.empty() ? std::string{}
+                                                    : stashPath.filename().string();
+    auto endsIn = [](std::string_view s, std::string_view suf) {
+        if (s.size() < suf.size()) return false;
+        const auto off = s.size() - suf.size();
+        for (std::size_t i = 0; i < suf.size(); ++i) {
+            const char a = static_cast<char>(
+                std::tolower(static_cast<unsigned char>(s[off + i])));
+            const char b = static_cast<char>(
+                std::tolower(static_cast<unsigned char>(suf[i])));
+            if (a != b) return false;
+        }
+        return true;
+    };
+    for (const auto& name : changedBasenames) {
+        if (!stashName.empty() && name == stashName) {
+            refreshD2iIfNeeded(db, stashPath, cache);
+            continue;
+        }
+        if (endsIn(name, ".d2s")) {
+            refreshD2sIfNeeded(db, saveDir / name, name,
+                                *cache.collectableUniqueIds,
+                                *cache.collectableSetIds, cache);
+        }
+        // Anything else (e.g. .ctl, .ma0, Settings.json) is irrelevant to
+        // the snapshot -- silently ignored.
+    }
+}
+
+DashboardSnapshot aggregateDashboardSnapshot(RefDb&              db,
+                                             DashboardFileCache& cache) {
+    ensureCacheTables(db, cache);
+
+    DashboardSnapshot snap;
+    snap.refreshedAtEpoch = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+
+    // Aggregation-time work. First-wins semantics preserved by iterating
+    // .d2s entries in sorted basename order (directory_iterator was
+    // already non-deterministic in the old code; sorting here makes the
+    // observable snapshot stable regardless of filesystem order).
+    std::unordered_set<std::uint32_t> foundUniqueIds, foundSetIds;
+    ChronicleTab                      chron;
+    std::unordered_map<std::uint32_t, std::string> uniqueLocations, setLocations;
+    std::unordered_map<std::uint32_t, std::string> ownedUniqueLocs, ownedSetLocs;
+
+    // Stash first: matches the old code's stash-then-characters
+    // ordering in snap.inventory and lets stash ownership seed the
+    // reconcile maps before characters overlay.
+    if (cache.stash) {
+        const auto& s = *cache.stash;
+        snap.inventory.insert(snap.inventory.end(),
+                               s.items.begin(), s.items.end());
+        mergeQuestCounts(snap.hellfireTorch,   s.hellfire);
+        mergeQuestCounts(snap.colossalAncients, s.colossal);
+        mergeQuestCounts(snap.terrorZones,     s.terror);
+        for (auto id : s.foundUniqueIds) foundUniqueIds.insert(id);
+        for (auto id : s.foundSetIds)    foundSetIds.insert(id);
+        chron = s.chron;
+        for (const auto& [id, loc] : s.ownedUniqueLocs) ownedUniqueLocs.try_emplace(id, loc);
+        for (const auto& [id, loc] : s.ownedSetLocs)    ownedSetLocs.try_emplace(id, loc);
+    }
+
+    // Characters: sorted by basename for deterministic first-wins.
+    std::vector<const std::string*> orderedD2s;
+    orderedD2s.reserve(cache.d2s.size());
+    for (const auto& kv : cache.d2s) orderedD2s.push_back(&kv.first);
+    std::sort(orderedD2s.begin(), orderedD2s.end(),
+              [](const std::string* a, const std::string* b) { return *a < *b; });
+
+    Character bestChar;
+    bool      haveBest = false;
+    for (const std::string* namePtr : orderedD2s) {
+        const auto& name = *namePtr;
+        const auto& e    = cache.d2s.at(name);
+        if (!haveBest || e.character.timestamp > bestChar.timestamp) {
+            bestChar = e.character;
+            snap.activePlayer.file = name;
+            haveBest = true;
+        }
+        snap.inventory.insert(snap.inventory.end(),
+                               e.items.begin(), e.items.end());
+        mergeQuestCounts(snap.hellfireTorch,   e.hellfire);
+        mergeQuestCounts(snap.colossalAncients, e.colossal);
+        mergeQuestCounts(snap.terrorZones,     e.terror);
+        for (const auto& [id, loc] : e.chronUniqueLocs) uniqueLocations.try_emplace(id, loc);
+        for (const auto& [id, loc] : e.chronSetLocs)    setLocations.try_emplace(id, loc);
+        for (const auto& [id, loc] : e.ownedUniqueLocs) ownedUniqueLocs.try_emplace(id, loc);
+        for (const auto& [id, loc] : e.ownedSetLocs)    ownedSetLocs.try_emplace(id, loc);
     }
 
     if (haveBest) {
@@ -504,6 +700,7 @@ DashboardSnapshot buildSnapshot(RefDb& db,
     }
 
     // Build the chronicle table.
+    const auto& tierByCode = *cache.tierByCode;
     auto tierOf = [&](std::string_view code) -> ChronicleTier {
         if (code.empty()) return ChronicleTier::None;
         auto it = tierByCode.find(std::string(code));
@@ -712,6 +909,17 @@ DashboardSnapshot buildSnapshot(RefDb& db,
     }
 
     return snap;
+}
+
+DashboardSnapshot buildSnapshot(RefDb&                       db,
+                                const std::filesystem::path& saveDir,
+                                const std::filesystem::path& stashPath) {
+    // Compat wrapper: throwaway cache, full scan, aggregate. Preserves
+    // existing tests + non-inotify builds. The dashboard hot path uses
+    // the persistent-cache API above (refresh* + aggregate*) directly.
+    DashboardFileCache tmp;
+    refreshDashboardCacheFromDirectory(db, saveDir, stashPath, tmp);
+    return aggregateDashboardSnapshot(db, tmp);
 }
 
 // ---------------------------------------------------------------------------

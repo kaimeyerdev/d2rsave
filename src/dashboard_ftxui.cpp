@@ -180,6 +180,19 @@ struct UiState {
     // Signal from watcher to redraw.
     std::atomic<bool>                         shutdown{false};
 
+    // Persistent per-file parse cache. Populated with a full scan at
+    // startup; the rebuild path only re-parses files that inotify
+    // reported as changed (see pendingChangedFiles below).
+    DashboardFileCache                        fileCache;
+
+    // Names (basenames) of files the watcher told us changed since the
+    // last rebuild. Written by the watcher thread under the mutex,
+    // drained by the main-thread rebuild(). Empty list means "no
+    // targeted invalidation" -- rebuild() then falls back to a full
+    // rescan (used by manual [r] refresh and by the initial init).
+    mutable std::mutex                        pendingChangesMutex;
+    std::vector<std::string>                  pendingChangedFiles;
+
     // Print-once mode: forces the layout builder to use a fixed
     // dimension instead of querying the real tty. Empty in the
     // interactive path.
@@ -2106,8 +2119,12 @@ int runDashboard(const std::filesystem::path& savePath,
     };
 
     {
+        // Cold start: full scan populates the file cache. Every
+        // subsequent rebuild uses the cache; only files inotify says
+        // changed get re-parsed.
+        refreshDashboardCacheFromDirectory(db, savePath, stashPath, ui.fileCache);
         auto snap = std::make_shared<DashboardSnapshot>(
-            buildSnapshot(db, savePath, stashPath));
+            aggregateDashboardSnapshot(db, ui.fileCache));
         std::lock_guard g(ui.snapshotMutex);
         ui.snapshot = std::move(snap);
         // Anchor the session view on the last SaveAndExit backup when
@@ -2143,8 +2160,24 @@ int runDashboard(const std::filesystem::path& savePath,
         return ui.snapshot;
     };
     auto rebuild = [&]() {
+        // Drain the watcher's pending-change list. If non-empty, only
+        // the named files get re-parsed -- the other 50+ character
+        // files stay in the cache. Empty list means "manual [r] or
+        // best-effort recovery" and we fall back to a full rescan.
+        std::vector<std::string> changed;
+        {
+            std::lock_guard g(ui.pendingChangesMutex);
+            changed = std::move(ui.pendingChangedFiles);
+            ui.pendingChangedFiles.clear();
+        }
+        if (changed.empty()) {
+            refreshDashboardCacheFromDirectory(db, savePath, stashPath, ui.fileCache);
+        } else {
+            refreshDashboardCacheFromChanges(db, savePath, stashPath,
+                                              ui.fileCache, changed);
+        }
         auto snap = std::make_shared<DashboardSnapshot>(
-            buildSnapshot(db, savePath, stashPath));
+            aggregateDashboardSnapshot(db, ui.fileCache));
         // Re-anchor the session view on every rebuild so it tracks the
         // NEWEST SaveAndExit that D2R has produced. Without this, an
         // anchor set at dashboard startup would go permanently stale:
@@ -2770,6 +2803,20 @@ int runDashboard(const std::filesystem::path& savePath,
                         } catch (const std::exception& ex) {
                             std::fprintf(stderr, "[backup] watcher-handler failed: %s\n",
                                          ex.what());
+                        }
+                    }
+                    // Forward the changed-file basenames to the main
+                    // thread. rebuild() drains this list and only
+                    // re-parses the named files -- massive win vs
+                    // re-parsing every .d2s in the save dir on every
+                    // autosave burst (see refreshDashboardCacheFromChanges).
+                    if (trig->kind == DirectoryWatcher::Trigger::Kind::Primary
+                        && !trig->files.empty()) {
+                        std::lock_guard g(ui.pendingChangesMutex);
+                        ui.pendingChangedFiles.reserve(
+                            ui.pendingChangedFiles.size() + trig->files.size());
+                        for (const auto& f : trig->files) {
+                            ui.pendingChangedFiles.push_back(f.name);
                         }
                     }
                     postRebuild();

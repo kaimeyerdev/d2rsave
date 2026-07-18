@@ -9,6 +9,7 @@
 
 #include "d2r/Character.hpp"
 #include "d2r/Item.hpp"
+#include "d2r/SharedStash.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -17,6 +18,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -159,6 +161,99 @@ struct DashboardSnapshot {
 [[nodiscard]] DashboardSnapshot buildSnapshot(RefDb& db,
                                               const std::filesystem::path& saveDir,
                                               const std::filesystem::path& stashPath);
+
+// ---------------------------------------------------------------------------
+// Incremental snapshot pipeline (dashboard hot path).
+//
+// The one-shot `buildSnapshot` above re-parses every .d2s + the .d2i on
+// each call, which is 100-150ms per rebuild against a real save dir --
+// painful during autosave bursts (gem-combines fire ~10 events in a few
+// seconds). The dashboard instead keeps a persistent `DashboardFileCache`
+// and, when inotify reports a change, invalidates only the affected file
+// entries. Aggregation into a fresh DashboardSnapshot then costs only
+// what changed since the previous frame + the (cheap) chronicle SQL
+// pass. RefDb lookup tables (tier map + collectable ids) are memoised
+// on the cache so they load once per session, not once per rebuild.
+// ---------------------------------------------------------------------------
+struct DashboardFileCache {
+    struct D2sEntry {
+        std::filesystem::file_time_type mtime{};
+        std::uintmax_t                  size = 0;
+        Character                       character{};
+        // Every item this .d2s contributes to snap.inventory. Locations
+        // already stamped (base filename, " (merc)", " (corpse)",
+        // " (iron golem)").
+        std::vector<InventoryItem>      items;
+        HellfireTorchQuest              hellfire{};
+        ColossalAncientsQuest           colossal{};
+        TerrorZones                     terror{};
+        // Chronicle-column ownership: only ids present in the collectable
+        // catalogs (uniqueitems.spawnable, setitems.disablechronicle).
+        // First-seen location per id, preserved via ordered emission at
+        // aggregation time.
+        std::vector<std::pair<std::uint32_t, std::string>> chronUniqueLocs;
+        std::vector<std::pair<std::uint32_t, std::string>> chronSetLocs;
+        // Reconcile ownership: unfiltered so off-catalog owns surface too.
+        std::vector<std::pair<std::uint32_t, std::string>> ownedUniqueLocs;
+        std::vector<std::pair<std::uint32_t, std::string>> ownedSetLocs;
+    };
+    struct D2iEntry {
+        std::filesystem::file_time_type mtime{};
+        std::uintmax_t                  size = 0;
+        // Stash-tab items (with "stash tab N" locations).
+        std::vector<InventoryItem>      items;
+        HellfireTorchQuest              hellfire{};
+        ColossalAncientsQuest           colossal{};
+        TerrorZones                     terror{};
+        // Chronicle-tab discovery ids (the account has "collected" these).
+        std::unordered_set<std::uint32_t> foundUniqueIds;
+        std::unordered_set<std::uint32_t> foundSetIds;
+        // Full parsed chronicle (reconcile uses per-entry timestamps).
+        ChronicleTab                    chron{};
+        // Stash-tab ownership for reconcile.
+        std::vector<std::pair<std::uint32_t, std::string>> ownedUniqueLocs;
+        std::vector<std::pair<std::uint32_t, std::string>> ownedSetLocs;
+    };
+
+    // Character .d2s files, keyed by basename (e.g. "Kai.d2s").
+    std::unordered_map<std::string, D2sEntry> d2s;
+    // Shared stash (single entry). Present only when the stash file exists.
+    std::optional<D2iEntry>                   stash;
+
+    // Memoised RefDb lookup tables. Populated on the first refresh; never
+    // invalidated (the reference DB is process-lifetime read-only).
+    std::optional<std::unordered_map<std::string, ChronicleTier>> tierByCode;
+    std::optional<std::unordered_set<std::uint32_t>>              collectableUniqueIds;
+    std::optional<std::unordered_set<std::uint32_t>>              collectableSetIds;
+};
+
+// Populate / refresh the cache from a full directory walk. Invalidates
+// missing files (drops them from the map). Idempotent and safe to call
+// on an empty or partially-populated cache. Used at dashboard startup
+// and on manual `[r]` refresh.
+void refreshDashboardCacheFromDirectory(
+    RefDb&                          db,
+    const std::filesystem::path&    saveDir,
+    const std::filesystem::path&    stashPath,
+    DashboardFileCache&             cache);
+
+// Targeted refresh for the inotify hot path: re-parse only the named
+// files (basename form, e.g. "Kai.d2s"). Files that no longer exist
+// are removed from the cache. Files not matching the tracked set
+// (non-.d2s that aren't the stash) are silently ignored so callers can
+// forward the raw watcher payload without pre-filtering.
+void refreshDashboardCacheFromChanges(
+    RefDb&                          db,
+    const std::filesystem::path&    saveDir,
+    const std::filesystem::path&    stashPath,
+    DashboardFileCache&             cache,
+    std::span<const std::string>    changedBasenames);
+
+// Aggregate the current cache state into a fresh snapshot. Pure w.r.t.
+// the cache. Runs the chronicle + reconcile SQL passes internally.
+[[nodiscard]] DashboardSnapshot aggregateDashboardSnapshot(
+    RefDb&                          db,
+    DashboardFileCache&             cache);
 
 // Replace the active-player character portion of `snap` in place with
 // data parsed from a raw .d2s byte buffer. Used by the Session pane to
