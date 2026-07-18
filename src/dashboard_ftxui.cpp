@@ -1976,8 +1976,22 @@ int runDashboard(const std::filesystem::path& savePath,
     auto rebuild = [&]() {
         auto snap = std::make_shared<DashboardSnapshot>(
             buildSnapshot(db, savePath, stashPath));
+        // Re-anchor the session view on every rebuild so it tracks the
+        // NEWEST SaveAndExit that D2R has produced. Without this, an
+        // anchor set at dashboard startup would go permanently stale:
+        // once the player quits + relaunches D2R and the scheduler
+        // commits a fresh S&E row (which by definition already contains
+        // everything they picked up during the previous session), that
+        // pickup should stop being flagged as "new" -- but the anchor
+        // still points at the pre-pickup S&E, so items like Aldur's
+        // Rhythm persist in the diff across sessions. Rebuilding the
+        // anchor here means the Session pane converges to "empty diff"
+        // as soon as a matching S&E is captured, which is what "session
+        // = current play attempt" actually means to the player.
+        auto anchor = buildSessionAnchor(snap);
         std::lock_guard g(ui.snapshotMutex);
-        ui.snapshot = std::move(snap);
+        ui.snapshot      = std::move(snap);
+        ui.sessionAnchor = std::move(anchor);
     };
     auto persistLayout = [&]() {
         if (configDb) savePaneTree(configDb, ui.rootPane);
