@@ -573,7 +573,13 @@ void printBackupsUsage() {
         "\n"
         "  snapshot\n"
         "      Force a startup-style sweep of --path <saves-dir>. Useful\n"
-        "      for seeding or refreshing the backup DB outside the TUI.\n");
+        "      for seeding or refreshing the backup DB outside the TUI.\n"
+        "\n"
+        "  diff <filename> [--limit N] [--db PATH] [--max-diffs K]\n"
+        "      Byte-diff the N (default 3) most-recent rows for <filename>,\n"
+        "      labelling each differing offset by the region it lives in.\n"
+        "      Per-byte rows are printed only for currently-undecoded\n"
+        "      header/section regions; decoded regions are only tallied.\n");
 }
 
 int cmdBackupsSummary() {
@@ -795,6 +801,247 @@ int cmdBackupsRecover(std::vector<std::string_view>       args,
     return 0;
 }
 
+// ---- backups diff ----------------------------------------------------------
+//
+// Byte-diff N adjacent backup rows for a single .d2s or .d2i and label
+// every differing offset with the region it lives in. Purpose: identify
+// whether an *objective* signal for save-and-exit vs autosave exists
+// inside the file itself (as opposed to the sibling .ctl / Settings.json
+// write we currently key on in BackupScheduler::classifyBurst).
+//
+// A byte differs "in an unknown region" iff its offset falls outside
+// every labeled range below. Those unknown ranges are the header bytes
+// we've never wired up (see docs on .d2s coverage: 0x10-0x13, 0x16-0x17,
+// 0x19-0x1A, 0x1C-0x1F, 0x24-0x97, 0x9F-0xA0, 0xAF-0xF7, 0xF9-0x12A,
+// 0x13B-0x192) plus the quest/waypoint/NPC payloads whose OFFSETS we
+// find but whose CONTENTS we don't decode.
+
+struct BlobRegion {
+    std::size_t begin  = 0;   // inclusive
+    std::size_t end    = 0;   // exclusive
+    const char* label  = "";
+    bool        known  = false; // true when the parser DECODES this region
+};
+
+std::vector<BlobRegion> buildD2sRegions(std::span<const std::byte> bytes) {
+    // Fixed header regions from src/character_parser.cpp + include/d2r/Save.hpp.
+    std::vector<BlobRegion> regions = {
+        {0x00, 0x04, "magic",           true},
+        {0x04, 0x08, "version",         true},
+        {0x08, 0x0C, "fileSize",        true},
+        {0x0C, 0x10, "storedChecksum",  true},
+        {0x14, 0x15, "status",          true},
+        {0x15, 0x16, "actProgression",  true},
+        {0x18, 0x19, "class",           true},
+        {0x1B, 0x1C, "level(header)",   true},
+        {0x20, 0x24, "timestamp",       true},
+        {0x98, 0x9B, "difficulty",      true},
+        {0x9B, 0x9F, "mapSeed",         true},
+        {0xA1, 0xAF, "mercenary",       true},
+        {0xF8, 0xF9, "expansionByte",   true},
+        {0x12B,0x13B,"name",            true},
+    };
+    // Try to parse the character to pick up variable-section offsets.
+    try {
+        d2r::Character ch = d2r::parseCharacter(bytes);
+        if (ch.questsOffset) {
+            const auto e = ch.waypointsOffset ? ch.waypointsOffset : ch.statsOffset;
+            regions.push_back({ch.questsOffset, e ? e : bytes.size(),
+                               "quests(marker+payload,undecoded)", false});
+        }
+        if (ch.waypointsOffset) {
+            const auto e = ch.npcOffset ? ch.npcOffset : ch.statsOffset;
+            regions.push_back({ch.waypointsOffset, e ? e : bytes.size(),
+                               "waypoints(undecoded)", false});
+        }
+        if (ch.npcOffset) {
+            const auto e = ch.statsOffset ? ch.statsOffset : bytes.size();
+            regions.push_back({ch.npcOffset, e, "npc(undecoded)", false});
+        }
+        if (ch.statsOffset && ch.skillsOffset) {
+            regions.push_back({ch.statsOffset, ch.skillsOffset,
+                               "attributes", true});
+        }
+        if (ch.skillsOffset && ch.itemsOffset) {
+            regions.push_back({ch.skillsOffset, ch.itemsOffset,
+                               "skills", true});
+        }
+        if (ch.itemsOffset) {
+            const std::size_t e = ch.corpseJMOffset ? ch.corpseJMOffset
+                                                    : bytes.size();
+            regions.push_back({ch.itemsOffset, e, "items", true});
+        }
+        if (ch.corpseJMOffset) {
+            const std::size_t e = ch.mercItemsJMOffset ? ch.mercItemsJMOffset - 2
+                                                       : (ch.ironGolemItemOffset
+                                                             ? ch.ironGolemItemOffset - 3
+                                                             : bytes.size());
+            regions.push_back({ch.corpseJMOffset, e, "corpseItems", true});
+        }
+        if (ch.mercItemsJMOffset) {
+            const std::size_t e = ch.ironGolemItemOffset
+                                    ? ch.ironGolemItemOffset - 3
+                                    : bytes.size();
+            regions.push_back({ch.mercItemsJMOffset - 2, e,
+                               "mercItems", true});
+        }
+        if (ch.ironGolemItemOffset) {
+            regions.push_back({ch.ironGolemItemOffset - 3, bytes.size(),
+                               "ironGolem", true});
+        }
+    } catch (const std::exception&) {
+        // Fall back to header-only labelling; unknown regions dominate.
+    }
+    std::sort(regions.begin(), regions.end(),
+        [](const BlobRegion& a, const BlobRegion& b) {
+            return a.begin < b.begin;
+        });
+    return regions;
+}
+
+const BlobRegion* regionAt(const std::vector<BlobRegion>& rs, std::size_t off) {
+    for (const auto& r : rs) {
+        if (off >= r.begin && off < r.end) return &r;
+    }
+    return nullptr;
+}
+
+int cmdBackupsDiff(std::vector<std::string_view> args) {
+    if (args.size() < 3) {
+        std::fprintf(stderr, "error: backups diff: expected <filename>\n");
+        return 2;
+    }
+    const std::string filename(args[2]);
+    std::size_t limit = 3;
+    std::filesystem::path dbPath = d2r::backupDbPath();
+    std::size_t maxDiffsToPrint  = 64; // per pair; -1 for unlimited
+    for (std::size_t i = 3; i < args.size(); ++i) {
+        const auto a = args[i];
+        auto need = [&](const char* flag) {
+            if (i + 1 >= args.size()) {
+                throw std::runtime_error(std::string("backups diff: ") + flag + " expects a value");
+            }
+            return args[++i];
+        };
+        if      (a == "--limit") limit = static_cast<std::size_t>(std::atoll(std::string(need("--limit")).c_str()));
+        else if (a == "--db")    dbPath = std::filesystem::path(std::string(need("--db")));
+        else if (a == "--max-diffs") maxDiffsToPrint = static_cast<std::size_t>(std::atoll(std::string(need("--max-diffs")).c_str()));
+        else {
+            throw std::runtime_error("backups diff: unknown flag '" + std::string(a) + "'");
+        }
+    }
+    if (limit < 2) {
+        std::fprintf(stderr, "error: backups diff: --limit must be >= 2\n");
+        return 2;
+    }
+
+    d2r::BackupDb db(dbPath);
+    const auto hist = db.historyFor(filename, limit);
+    if (hist.size() < 2) {
+        std::printf("(need at least 2 backups for %s; have %zu)\n",
+                    filename.c_str(), hist.size());
+        return 0;
+    }
+    // Fetch blobs. hist is date-DESC; walk chronologically ascending so
+    // "prev -> next" reads naturally.
+    struct Loaded {
+        std::int64_t                 date  = 0;
+        d2r::BackupDb::State         state = d2r::BackupDb::State::Autosave;
+        std::vector<std::byte>       data;
+    };
+    std::vector<Loaded> rows;
+    rows.reserve(hist.size());
+    for (auto it = hist.rbegin(); it != hist.rend(); ++it) {
+        auto r = db.at(filename, it->date);
+        if (!r) continue;
+        rows.push_back(Loaded{it->date, it->state, std::move(r->data)});
+    }
+    if (rows.size() < 2) {
+        std::printf("(couldn't load enough blob rows to diff)\n");
+        return 0;
+    }
+
+    std::printf("file: %s   loaded %zu rows (oldest first)\n",
+                filename.c_str(), rows.size());
+    for (const auto& r : rows) {
+        std::printf("  %-20s  %-14s  %zu bytes\n",
+                    formatBackupDate(r.date).c_str(),
+                    stateName(r.state), r.data.size());
+    }
+
+    // Region maps: build one per row (offsets can shift when the file
+    // grows/shrinks). For diffs we index the *earlier* row's regions;
+    // this keeps offsets stable within the reported pair.
+    for (std::size_t i = 0; i + 1 < rows.size(); ++i) {
+        const auto& a = rows[i];
+        const auto& b = rows[i + 1];
+        const auto regs = buildD2sRegions(a.data);
+
+        std::printf("\n---- %s (%s) -> %s (%s) ----\n",
+                    formatBackupDate(a.date).c_str(), stateName(a.state),
+                    formatBackupDate(b.date).c_str(), stateName(b.state));
+        std::printf("     sizes: %zu -> %zu   (%s%zd)\n",
+                    a.data.size(), b.data.size(),
+                    b.data.size() >= a.data.size() ? "+" : "",
+                    static_cast<std::ptrdiff_t>(b.data.size()) -
+                        static_cast<std::ptrdiff_t>(a.data.size()));
+
+        // Aggregate diffs by region label so we don't drown in per-byte
+        // rows for the items bitstream (which shifts wildly on every save).
+        std::map<std::string, std::size_t> perRegionKnown;
+        std::map<std::string, std::size_t> perRegionUnknown;
+        std::size_t totalDiffs = 0;
+        std::size_t unknownDiffs = 0;
+        std::size_t printed = 0;
+
+        const std::size_t common = std::min(a.data.size(), b.data.size());
+        for (std::size_t off = 0; off < common; ++off) {
+            if (a.data[off] == b.data[off]) continue;
+            ++totalDiffs;
+            const auto* reg = regionAt(regs, off);
+            const bool known = reg && reg->known;
+            const std::string label = reg ? reg->label : "UNKNOWN";
+            if (known) perRegionKnown[label] += 1;
+            else       { perRegionUnknown[label] += 1; ++unknownDiffs; }
+
+            // Print per-byte rows for unknown regions (that's where the
+            // interesting signal would hide). For known/decoded regions
+            // we only tally; per-byte churn in the items bitstream would
+            // otherwise flood the output.
+            if (!known && printed < maxDiffsToPrint) {
+                std::printf("  0x%04zx  %02x -> %02x   [%s]\n",
+                            off,
+                            static_cast<unsigned>(std::to_integer<std::uint8_t>(a.data[off])),
+                            static_cast<unsigned>(std::to_integer<std::uint8_t>(b.data[off])),
+                            label.c_str());
+                ++printed;
+            }
+        }
+        if (b.data.size() != a.data.size()) {
+            std::printf("  (tail-length delta of %zu bytes not shown)\n",
+                        (b.data.size() > a.data.size())
+                            ? b.data.size() - a.data.size()
+                            : a.data.size() - b.data.size());
+        }
+
+        std::printf("summary: %zu total diffs (%zu in unknown regions, %zu in decoded regions)\n",
+                    totalDiffs, unknownDiffs, totalDiffs - unknownDiffs);
+        if (!perRegionUnknown.empty()) {
+            std::printf("  unknown-region breakdown:\n");
+            for (const auto& [k, v] : perRegionUnknown) {
+                std::printf("    %-40s  %zu\n", k.c_str(), v);
+            }
+        }
+        if (!perRegionKnown.empty()) {
+            std::printf("  decoded-region breakdown:\n");
+            for (const auto& [k, v] : perRegionKnown) {
+                std::printf("    %-40s  %zu\n", k.c_str(), v);
+            }
+        }
+    }
+    return 0;
+}
+
 int cmdBackupsPrune(std::vector<std::string_view> args) {
     int days = 30, sessions = 100;
     for (std::size_t i = 2; i < args.size(); ++i) {
@@ -838,6 +1085,7 @@ int cmdBackups(std::vector<std::string_view>       args,
         if (sub == "list")     return cmdBackupsList(args);
         if (sub == "sessions") return cmdBackupsSessions(args);
         if (sub == "show")     return cmdBackupsShow(args);
+        if (sub == "diff")     return cmdBackupsDiff(args);
         if (sub == "recover")  return cmdBackupsRecover(args, primarySavePath);
         if (sub == "prune")    return cmdBackupsPrune(args);
         if (sub == "snapshot") return cmdBackupsSnapshot(primarySavePath);

@@ -134,6 +134,13 @@ public:
     [[nodiscard]] sqlite3* raw() const noexcept { return db_; }
 
 private:
+    // Force any WAL-only rows into the main database file. Called after
+    // every write so an external `cp backups.sqlite` snapshots a fully
+    // up-to-date view (WAL mode otherwise defers this until an
+    // auto-checkpoint or clean shutdown). Best-effort: SQLITE_BUSY is
+    // silently ignored -- the next write retries.
+    void checkpointWal() noexcept;
+
     sqlite3* db_ = nullptr;
 };
 

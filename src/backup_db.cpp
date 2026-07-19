@@ -198,6 +198,7 @@ void BackupDb::insert(std::string_view filename,
     }
     s.bindBlob(5, data.data(), static_cast<int>(data.size()));
     s.run();
+    checkpointWal();
 }
 
 void BackupDb::insertTombstone(std::string_view filename, std::int64_t dateUnix) {
@@ -208,6 +209,24 @@ void BackupDb::insertTombstone(std::string_view filename, std::int64_t dateUnix)
     s.bindInt64(2, dateUnix);
     s.bindInt64(3, static_cast<std::int64_t>(State::Deleted));
     s.run();
+    checkpointWal();
+}
+
+void BackupDb::checkpointWal() noexcept {
+    // Journal mode is WAL, so committed inserts sit in the -wal sidecar
+    // until an auto-checkpoint (~1000 pages / hundreds of saves) or a
+    // clean shutdown migrates them into the main file. That's fine for
+    // durability -- readers on the same connection see WAL data -- but
+    // it means an external `cp backups.sqlite` snapshots a stale view.
+    // Truncate after every write so the main file always reflects the
+    // committed state; at our write rate (~one every few seconds) the
+    // extra fsync is trivial. TRUNCATE is best-effort: if a reader is
+    // holding the WAL open the call returns SQLITE_BUSY and we simply
+    // skip -- the next write will retry.
+    if (db_) {
+        (void)sqlite3_wal_checkpoint_v2(
+            db_, nullptr, SQLITE_CHECKPOINT_TRUNCATE, nullptr, nullptr);
+    }
 }
 
 std::optional<BackupDb::Row>
@@ -459,6 +478,7 @@ std::int64_t BackupDb::enforceRetention(int          days,
         execOrThrow(db_, "ROLLBACK;");
         throw;
     }
+    checkpointWal();
     return deleted;
 }
 
