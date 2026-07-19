@@ -2015,21 +2015,26 @@ int runDashboard(const std::filesystem::path& savePath,
             catch (const std::exception&) { row.reset(); }
             if (row) anchorDate = *pinnedDate;
         } else {
-            // Auto mode: anchor on the START of the current-or-just-ended
-            // session, not the most recent S&E. Model: an S&E marks the
-            // END of a session; the session it ended began at the first
-            // save chronologically after the PREVIOUS S&E. Anchoring on
-            // the S&E itself collapsed the diff the instant the player
-            // quit -- the user's key complaint. Rules (hist is date DESC):
-            //   * If hist[0] is an S&E, the user just quit -- skip past
-            //     it and treat the second-most-recent S&E as the boundary.
-            //   * Otherwise the user is mid-session -- the most-recent
-            //     S&E is the boundary.
-            //   * Anchor date = the OLDEST save with date > boundary
-            //     (i.e., hist[boundaryIdx - 1] in DESC order).
-            //   * Fallbacks: no S&E in history -> oldest known save;
-            //     boundary S&E with no saves after it -> use the boundary
-            //     itself so the diff still says something.
+            // Auto mode: the anchor is the LATEST SAVE of the PREVIOUS
+            // session -- i.e., the S&E that ended it. Diff = latest save
+            // of the current session vs latest save of the previous.
+            // A session ends with an S&E, so the previous session's
+            // last save IS its terminating S&E (see BackupDb's session
+            // model documentation).
+            //
+            // Rules (hist is date DESC):
+            //   * If hist[0] is an S&E, the user just quit -- the
+            //     "current" session ended at hist[0]. Its previous
+            //     session's terminating S&E is the SECOND-newest S&E
+            //     on record, so seThreshold = 2.
+            //   * Otherwise the user is mid-session -- the previous
+            //     session's terminating S&E is the newest S&E on record,
+            //     so seThreshold = 1.
+            //   * Anchor = that boundary S&E's row directly.
+            //   * Fallback: no qualifying S&E on record -> anchor on
+            //     the oldest known save so the diff still says something
+            //     (represents "everything since the DB started tracking
+            //     this character").
             std::vector<BackupDb::HistoryRow> hist;
             try { hist = backupDb->historyFor(filename, 200); }
             catch (const std::exception&) { return anchorFromCurrent(); }
@@ -2043,22 +2048,9 @@ int runDashboard(const std::filesystem::path& savePath,
                     if (++seSeen == seThreshold) { boundaryIdx = i; break; }
                 }
             }
-            int anchorIdx;
-            if (boundaryIdx < 0) {
-                anchorIdx = static_cast<int>(hist.size()) - 1;
-            } else if (boundaryIdx == 0) {
-                anchorIdx = 0;   // degenerate; only entry is an S&E
-            } else {
-                anchorIdx = boundaryIdx - 1;
-                // If seThreshold == 2 and the two S&Es are adjacent (no
-                // autosaves between the previous S&E and the one we just
-                // did), anchorIdx would land on hist[0], which is the
-                // just-S&E'd row itself -> unusable. Fall back to the
-                // previous S&E as the anchor.
-                if (seThreshold == 2 && anchorIdx == 0) {
-                    anchorIdx = boundaryIdx;
-                }
-            }
+            const int anchorIdx = (boundaryIdx >= 0)
+                ? boundaryIdx
+                : static_cast<int>(hist.size()) - 1;
             const auto& pick = hist[static_cast<std::size_t>(anchorIdx)];
             try { row = backupDb->at(filename, pick.date); }
             catch (const std::exception&) { row.reset(); }
