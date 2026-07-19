@@ -11,6 +11,7 @@
 #if D2R_HAVE_INOTIFY
 #include "d2r/BackupDb.hpp"
 #include "d2r/BackupScheduler.hpp"
+#include "d2r/CharacterParser.hpp"
 #include "d2r/Paths.hpp"
 #include "d2r/Recovery.hpp"
 #include "d2r/Watcher.hpp"
@@ -39,6 +40,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -203,6 +205,15 @@ struct UiState {
     // handles the nullptr case gracefully.
     BackupDb*                                 backupDb        = nullptr;
     BackupScheduler*                          backupScheduler = nullptr;
+
+    // Cache for the Backups detail view's "exp %" column. Parsing a
+    // .d2s blob is a few ms; we only compute values for the rows the
+    // renderer is about to draw and remember them here. Keyed on the
+    // row's `date`; nullopt means "not applicable / parse failed"
+    // (tombstones, non-character files, corrupt bytes). The cache is
+    // invalidated when the detail view switches to a different file.
+    mutable std::string                                           backupsExpCacheFilename;
+    mutable std::unordered_map<std::int64_t, std::optional<double>> backupsExpCache;
 
     // Recovery modal state. Populated when the user presses [R] on the
     // Backups pane detail view; cleared on confirm or cancel.
@@ -963,6 +974,7 @@ Element renderBackupsSummary(const PaneConfig& config, BackupDb* db,
 }
 
 Element renderBackupsDetail(const PaneConfig& config, BackupDb* db,
+                            const UiState& ui,
                             bool focused, int pageHeight) {
     Element titleEl = text(" Backups  " + config.selectedBackupFile + " ");
     if (focused) titleEl = titleEl | inverted;
@@ -1002,7 +1014,7 @@ Element renderBackupsDetail(const PaneConfig& config, BackupDb* db,
 
     constexpr int kDateW  = 20;
     constexpr int kStateW = 14;
-    constexpr int kBytesW = 10;
+    constexpr int kExpW   = 8;      // "exp %" like " 87.3 % " -- 7 chars
     constexpr int kSumW   = 12;
     auto pad = [](std::string s, int w) {
         if (static_cast<int>(s.size()) > w) return s.substr(0, w);
@@ -1013,7 +1025,7 @@ Element renderBackupsDetail(const PaneConfig& config, BackupDb* db,
     Element header = hbox({
         text(pad("when",     kDateW))  | bold,
         text(pad("state",    kStateW)) | bold,
-        text(pad("bytes",    kBytesW)) | bold,
+        text(pad("exp %",    kExpW))   | bold,
         text(pad("checksum", kSumW))   | bold,
     });
 
@@ -1028,6 +1040,64 @@ Element renderBackupsDetail(const PaneConfig& config, BackupDb* db,
     int start = std::max(0, cursor - visible / 2);
     if (start + visible > nRows) start = std::max(0, nRows - visible);
     const int end = std::min(nRows, start + visible);
+
+    // Reset the exp% cache when the detail view switches to a
+    // different file. Only .d2s backups carry a character; other file
+    // types show "-" in the exp column and are never parsed.
+    if (ui.backupsExpCacheFilename != config.selectedBackupFile) {
+        ui.backupsExpCacheFilename = config.selectedBackupFile;
+        ui.backupsExpCache.clear();
+    }
+    const bool isCharacterFile =
+        config.selectedBackupFile.size() >= 4 &&
+        (config.selectedBackupFile.compare(
+             config.selectedBackupFile.size() - 4, 4, ".d2s") == 0 ||
+         config.selectedBackupFile.compare(
+             config.selectedBackupFile.size() - 4, 4, ".D2S") == 0);
+
+    auto expPercentFor = [&](const BackupDb::HistoryRow& r)
+        -> std::optional<double> {
+        if (!isCharacterFile) return std::nullopt;
+        if (r.state == BackupDb::State::Deleted) return std::nullopt;
+        if (r.sizeBytes <= 0) return std::nullopt;
+        auto it = ui.backupsExpCache.find(r.date);
+        if (it != ui.backupsExpCache.end()) return it->second;
+
+        std::optional<double> pct;
+        try {
+            auto row = db->at(config.selectedBackupFile, r.date);
+            if (row && !row->data.empty()) {
+                const auto ch = parseCharacter(row->data);
+                const std::uint32_t lvl = ch.attributes.level
+                    ? ch.attributes.level
+                    : static_cast<std::uint32_t>(ch.level);
+                const std::uint64_t curFloor  = experienceToReachLevel(lvl);
+                const std::uint64_t nextFloor = experienceToReachLevel(lvl + 1);
+                const std::uint64_t exp       = ch.attributes.experience;
+                if (nextFloor > curFloor && exp >= curFloor) {
+                    const std::uint64_t inLvl = exp - curFloor;
+                    const std::uint64_t span  = nextFloor - curFloor;
+                    double p = 100.0 * static_cast<double>(inLvl)
+                                       / static_cast<double>(span);
+                    if (p < 0.0)   p = 0.0;
+                    if (p > 100.0) p = 100.0;
+                    pct = p;
+                }
+            }
+        } catch (const std::exception&) {
+            // Parse failure -- cache the negative result so we don't
+            // retry every render.
+        }
+        ui.backupsExpCache.emplace(r.date, pct);
+        return pct;
+    };
+
+    auto formatExp = [](const std::optional<double>& pct) -> std::string {
+        if (!pct) return "-";
+        char buf[16];
+        std::snprintf(buf, sizeof(buf), "%5.1f%%", *pct);
+        return buf;
+    };
 
     // A play session is delimited by a state=SaveAndExit row: everything
     // between the previous S&E and this one is that session. In this
@@ -1045,7 +1115,7 @@ Element renderBackupsDetail(const PaneConfig& config, BackupDb* db,
         Element rowEl = hbox({
             text(pad(formatWallDateTime(r.date), kDateW)),
             text(pad(std::string(backupStateShortLabel(r.state)), kStateW)),
-            text(pad(std::to_string(r.sizeBytes), kBytesW)),
+            text(pad(formatExp(expPercentFor(r)), kExpW)),
             text(pad(r.checksum
                         ? [v = *r.checksum]{
                               char b[16];
@@ -1071,10 +1141,11 @@ Element renderBackupsDetail(const PaneConfig& config, BackupDb* db,
 }
 
 Element renderBackupsLeaf(const PaneConfig& config, BackupDb* db,
+                          const UiState& ui,
                           bool focused, int paneWidth, int pageHeight,
                           int daysRetention, int sessionsRetention) {
     return config.backupViewMode == BackupViewMode::Detail
-        ? renderBackupsDetail(config, db, focused, pageHeight)
+        ? renderBackupsDetail(config, db, ui, focused, pageHeight)
         : renderBackupsSummary(config, db, focused, paneWidth,
                                 daysRetention, sessionsRetention);
 }
@@ -1258,13 +1329,26 @@ Element renderSessionLeaf(const DashboardSnapshot& now,
                 - static_cast<std::int64_t>(aCum);
         levelDelta = static_cast<std::int32_t>(n.level)
                    - static_cast<std::int32_t>(anchor->level);
-        // Percentage relative to the anchor's cumulative XP, so long
-        // grinds late-game read as small percentages just like the
-        // in-game bar.
-        if (aCum > 0) {
-            pctDelta = (static_cast<double>(xpDelta) /
-                        static_cast<double>(aCum)) * 100.0;
-        }
+        // Percentage is expressed as "fraction of the XP bar filled
+        // during the session", matching the in-game XP bar. A level-up
+        // contributes 100% (the anchor's remaining bar + all subsequent
+        // full bars + progress into the current bar). Late-game sessions
+        // therefore read as "3.0%" rather than a cumulative-XP fraction
+        // that trends toward zero as total XP grows.
+        const std::uint64_t anchorFloor = experienceToReachLevel(anchor->level);
+        const std::uint64_t anchorCeil  = experienceToReachLevel(anchor->level + 1);
+        const std::uint64_t anchorSpan  = anchorCeil > anchorFloor
+                                            ? anchorCeil - anchorFloor : 0;
+        const double anchorFrac = (anchorSpan > 0)
+            ? static_cast<double>(anchor->expInLevel)
+              / static_cast<double>(anchorSpan)
+            : 0.0;
+        const double nowFrac = (n.expForLevel > 0)
+            ? static_cast<double>(n.expInLevel)
+              / static_cast<double>(n.expForLevel)
+            : 0.0;
+        pctDelta = 100.0 * (static_cast<double>(levelDelta)
+                            + nowFrac - anchorFrac);
     }
 
     char pctBuf[32];
@@ -1697,7 +1781,7 @@ Element renderPane(PaneNode& node, const UiState& ui,
         case PaneType::Backups: {
             const int days = ui.backupScheduler ? ui.backupScheduler->retention().days : 30;
             const int sess = ui.backupScheduler ? ui.backupScheduler->retention().sessionsPerFile : 100;
-            leafEl = renderBackupsLeaf(node.config, ui.backupDb, focused,
+            leafEl = renderBackupsLeaf(node.config, ui.backupDb, ui, focused,
                                         width, height, days, sess);
             break;
         }
@@ -2271,18 +2355,25 @@ int runDashboard(const std::filesystem::path& savePath,
             hbox({ renderStatus(ui, s) | flex, text(globalHint) | dim }),
         });
 
-        if (ui.helpVisible) root = dbox({ root, renderHelpModal() | center });
+        // `clear_under` paints the modal opaquely so the panes behind it
+        // don't bleed through the borders/whitespace of the popup.
+        if (ui.helpVisible) {
+            root = dbox({ root, renderHelpModal() | clear_under | center });
+        }
         if (ui.recoveryModalVisible) {
             root = dbox({ root,
-                renderRecoveryModal(ui.recoveryModal, ui.watchedPath) | center });
+                renderRecoveryModal(ui.recoveryModal, ui.watchedPath)
+                    | clear_under | center });
         }
         if (ui.retentionModalVisible) {
             root = dbox({ root,
-                renderRetentionModal(ui.retentionModal, ui.backupDb) | center });
+                renderRetentionModal(ui.retentionModal, ui.backupDb)
+                    | clear_under | center });
         }
         if (ui.sessionPickerVisible) {
             root = dbox({ root,
-                renderSessionPickerModal(ui.sessionPicker) | center });
+                renderSessionPickerModal(ui.sessionPicker)
+                    | clear_under | center });
         }
         return root;
     });
