@@ -51,6 +51,15 @@ public:
         SaveAndExit = 1,
         Autosave    = 2,
         Startup     = 3,
+        // File content changed but the surrounding IO pattern didn't
+        // look like a game-driven save (no CLOSE_WRITE on any .d2s /
+        // .d2i / .ctl). Typical trigger: an external tool (rsync, cp,
+        // a syncthing client) replaces the file via atomic rename, so
+        // we see IN_MOVED_TO instead of the game's write-then-close
+        // sequence. Preserving the change as `Other` keeps every
+        // distinct on-disk version in the backup DB without lying
+        // about what caused it.
+        Other       = 4,
     };
 
     // Open/create the DB at `dbPath`. Applies WAL + synchronous=NORMAL

@@ -798,6 +798,7 @@ std::string_view backupStateShortLabel(BackupDb::State s) {
         case BackupDb::State::SaveAndExit: return "S&E";
         case BackupDb::State::Autosave:    return "auto";
         case BackupDb::State::Startup:     return "startup";
+        case BackupDb::State::Other:       return "other";
     }
     return "?";
 }

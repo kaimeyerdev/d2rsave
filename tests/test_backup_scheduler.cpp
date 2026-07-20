@@ -107,6 +107,31 @@ TEST_CASE("classifyBurst: signal without CLOSE_WRITE is not enough",
     REQUIRE(bs::classifyBurst(modifyOnly) == BackupDb::State::Autosave);
 }
 
+TEST_CASE("classifyBurst: atomic-rename bursts classify as Other",
+          "[backup][scheduler]") {
+    // rsync / cp / syncthing use write-temp + rename, so we see
+    // IN_MOVED_TO on the target basename but never IN_CLOSE_WRITE on
+    // a persisted file. Batches often include many files at once.
+    const std::vector<DirectoryWatcher::ChangedFile> rsyncPull = {
+        mkFile("Kai.d2s",                          IN_MOVED_TO),
+        mkFile("ModernSharedStashSoftCoreV2.d2i",  IN_MOVED_TO),
+        mkFile("Kai.ctl",                          IN_MOVED_TO),
+    };
+    REQUIRE(bs::classifyBurst(rsyncPull) == BackupDb::State::Other);
+}
+
+TEST_CASE("classifyBurst: MOVED_TO plus in-game CLOSE_WRITE still Autosave",
+          "[backup][scheduler]") {
+    // Mixed burst -- shouldn't happen in practice, but if a MOVED_TO
+    // races with a real autosave in the same window we prefer the
+    // stronger classification.
+    const std::vector<DirectoryWatcher::ChangedFile> mixed = {
+        mkFile("Kai.d2s",   IN_MOVED_TO),
+        mkFile("Warlock.d2s", IN_CLOSE_WRITE | IN_MODIFY),
+    };
+    REQUIRE(bs::classifyBurst(mixed) == BackupDb::State::Autosave);
+}
+
 TEST_CASE("isPersistedFile: only .d2s and .d2i", "[backup][scheduler]") {
     REQUIRE(bs::isPersistedFile("Kai.d2s"));
     REQUIRE(bs::isPersistedFile("Shared.d2i"));

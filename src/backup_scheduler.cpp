@@ -88,15 +88,34 @@ bool isSaveAndExitSignal(std::string_view name) {
 
 BackupDb::State classifyBurst(
     std::span<const DirectoryWatcher::ChangedFile> files) {
+    // Classifier tiers, in priority order:
+    //   1. Any .ctl or Settings.json with CLOSE_WRITE  -> SaveAndExit
+    //      (the game writes these companions only when the user quits).
+    //   2. Any .d2s / .d2i with CLOSE_WRITE            -> Autosave
+    //      (in-game write path; save file finalised in-place).
+    //   3. Anything else that touched a .d2s / .d2i    -> Other
+    //      (an external process replaced the file: rsync, cp, syncthing,
+    //      manual editing, ...). We still want a backup so the DB
+    //      captures the imported state, but we can't honestly claim it
+    //      was an in-game save-and-exit or autosave.
+    bool sawSaveExitSignal = false;
+    bool sawPersistedClose = false;
+    bool sawPersistedTouch = false;
     for (const auto& f : files) {
-        // A classifier signal only counts when it was actually written
-        // (CLOSE_WRITE). Other events on Settings.json (e.g. read-only
-        // access, though inotify's IN_ACCESS isn't in our mask) are not
-        // reliable indicators of a save-and-exit.
-        if ((f.mask & IN_CLOSE_WRITE) != 0 && isSaveAndExitSignal(f.name)) {
-            return BackupDb::State::SaveAndExit;
-        }
+        const bool persisted = isPersistedFile(f.name);
+        const bool signal    = isSaveAndExitSignal(f.name);
+        const bool cw        = (f.mask & IN_CLOSE_WRITE) != 0;
+        const bool moved     = (f.mask & IN_MOVED_TO)    != 0;
+        if (cw && signal)                       sawSaveExitSignal = true;
+        if (cw && persisted)                    sawPersistedClose = true;
+        if (persisted && (cw || moved))         sawPersistedTouch = true;
     }
+    if (sawSaveExitSignal) return BackupDb::State::SaveAndExit;
+    if (sawPersistedClose) return BackupDb::State::Autosave;
+    if (sawPersistedTouch) return BackupDb::State::Other;
+    // Nothing persisted was actually touched (e.g. a .ma0 wrote alone).
+    // Return Autosave as a conservative default; the caller only writes
+    // rows for persisted files, so this state won't actually reach the DB.
     return BackupDb::State::Autosave;
 }
 
@@ -237,9 +256,14 @@ void BackupScheduler::handleWatcherEvents(
             }
             continue;
         }
-        // Otherwise only act on CLOSE_WRITE: torn / mid-write bytes
-        // are not worth capturing.
-        if ((f.mask & IN_CLOSE_WRITE) == 0) continue;
+        // Otherwise only act on CLOSE_WRITE or MOVED_TO. CLOSE_WRITE is
+        // the game's own save path (write-then-close in place). MOVED_TO
+        // is the atomic-rename path used by rsync/cp/etc: a temp file
+        // is written elsewhere and renamed on top of the target, so we
+        // never see CLOSE_WRITE on the target basename -- only the
+        // rename landing. Torn / mid-write IN_MODIFY events are still
+        // filtered out.
+        if ((f.mask & (IN_CLOSE_WRITE | IN_MOVED_TO)) == 0) continue;
         writeFileAsState(savesDir_ / f.name, burstState, now);
     }
     runRetention(now);
