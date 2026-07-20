@@ -17,6 +17,44 @@ files (`.d2s` characters and `.d2i` shared stashes). Provides:
 - **`d2rsave_tests`** — Catch2 test binary exercising the parser
   against a committed fixture corpus.
 
+## What `d2rsave` does
+
+`d2rsave` complements D2R in a few areas the game itself doesn't cover:
+
+- **Backups.** The tool maintains a local SQLite database of save-file
+  snapshots (default `$XDG_DATA_HOME/d2rsave/backups.sqlite`),
+  automatically capturing new snapshots as files change when the
+  dashboard is running, and on demand from the CLI otherwise. Each
+  snapshot is tagged with the save's state (save-and-exit, autosave,
+  startup, external write). Historical snapshots can be listed,
+  byte-diffed against one another, searched for items that appeared
+  in prior states, and restored back to disk — a rollback path for
+  save corruption, mistaken vendor sales, hardcore deaths, or "when
+  did I last have that unique?" investigations, all without touching
+  the live save file.
+
+- **Live dashboard.** A terminal UI (built on ftxui) that watches the
+  save directory while D2R is running and refreshes automatically as
+  the game writes new save state. Panels cover the currently-active
+  character, long-tail quest state, the current Terror Zone rotation,
+  and an account-wide chronicle table showing uniques and sets found
+  versus remaining. A `--print` mode renders the current view once
+  as ANSI and exits, for pipes and screenshots.
+
+- **Parser and query CLI.** The parser decodes `.d2s` characters and
+  `.d2i` shared stashes — headers, attributes, skills, quest flags,
+  waypoints, and the item bit-stream — into a structured in-memory
+  representation. Subcommands expose that data as account-wide item
+  queries (filterable by character, stash tab, quality, tier, and
+  substring), collection-completion reports against known uniques
+  and sets, and safe in-place edits (rename, map-seed change,
+  checksum recompute) that preserve save-file invariants.
+
+The remaining executables (`d2r_refdb_gen`, `d2r_casc_dump`,
+`d2r_tz_forecast`) are supporting tools that seed the reference
+SQLite database from a D2R CASC install or run stand-alone
+terror-zone forecasting.
+
 ## Attribution
 
 This project is a **C++ port of** [paladijn's Java
