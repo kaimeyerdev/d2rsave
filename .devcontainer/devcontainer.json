@@ -1,0 +1,35 @@
+{
+  "name": "d2rsavegameparser_cpp",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": "."
+  },
+  "containerUser": "vscode",
+  "updateRemoteUserUID": true,
+  "workspaceFolder": "/workspaces/d2rsavegameparser_cpp",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspaces/d2rsavegameparser_cpp,type=bind,consistency=cached",
+  "mounts": [
+    "source=vcpkg-cache,target=/home/vscode/.cache/vcpkg,type=volume"
+  ],
+  "remoteEnv": {
+    "VCPKG_DEFAULT_BINARY_CACHE": "/home/vscode/.cache/vcpkg"
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-vscode.cpptools",
+        "ms-vscode.cpptools-extension-pack",
+        "ms-vscode.cmake-tools",
+        "twxs.cmake",
+        "GitHub.copilot",
+        "GitHub.copilot-chat"
+      ],
+      "settings": {
+        "cmake.configureOnOpen": false,
+        "C_Cpp.default.compileCommands": "${workspaceFolder}/build/debug/compile_commands.json",
+        "chat.agent.sandbox.enabled": "off"
+      }
+    }
+  },
+  "postCreateCommand": "sudo chown -R vscode:vscode /home/vscode/.cache/vcpkg && ./bootstrap-vcpkg.sh"
+}
