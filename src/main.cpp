@@ -511,6 +511,7 @@ const char* stateName(d2r::BackupDb::State s) {
         case d2r::BackupDb::State::SaveAndExit: return "save_and_exit";
         case d2r::BackupDb::State::Autosave:    return "autosave";
         case d2r::BackupDb::State::Startup:     return "startup";
+        case d2r::BackupDb::State::Other:       return "other";
     }
     return "?";
 }
@@ -551,7 +552,7 @@ void printBackupsUsage() {
         "\n"
         "  list [--filename NAME] [--limit N] [--state K]\n"
         "      Reverse-chronological rows. --state filters to one of\n"
-        "      0(deleted) 1(save_and_exit) 2(autosave) 3(startup).\n"
+        "      0(deleted) 1(save_and_exit) 2(autosave) 3(startup) 4(other).\n"
         "\n"
         "  sessions <filename> [--limit N]\n"
         "      Print one line per session for a .d2s file. A session ends\n"
@@ -579,7 +580,16 @@ void printBackupsUsage() {
         "      Byte-diff the N (default 3) most-recent rows for <filename>,\n"
         "      labelling each differing offset by the region it lives in.\n"
         "      Per-byte rows are printed only for currently-undecoded\n"
-        "      header/section regions; decoded regions are only tallied.\n");
+        "      header/section regions; decoded regions are only tallied.\n"
+        "\n"
+        "  find-item {--character NAME | --all-characters} [--shared-stash]\n"
+        "           {--name PATTERN | --code CODE}\n"
+        "           [--db PATH] [--limit-rows N] [--limit-matches K]\n"
+        "      Scan the N (default 500) most-recent rows of each selected\n"
+        "      character (and, with --shared-stash, .d2i) for items whose\n"
+        "      unique/set/base name matches PATTERN (case-insensitive\n"
+        "      substring) or whose item code equals CODE. Prints every row\n"
+        "      where a match exists so the user can pick one to restore.\n");
 }
 
 int cmdBackupsSummary() {
@@ -1042,6 +1052,311 @@ int cmdBackupsDiff(std::vector<std::string_view> args) {
     return 0;
 }
 
+// ---- backups find-item ----------------------------------------------------
+//
+// Scan historical .d2s and (optionally) .d2i blobs across N recent rows
+// per file for items matching --name <substring> or --code <exact>.
+// Prints every row+location where a match exists so the user can pick a
+// row to `backups recover`. Intended for the "I lost a unique -- when
+// did I last have it?" workflow.
+
+std::string toLowerAscii(std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        out.push_back(static_cast<char>(
+            std::tolower(static_cast<unsigned char>(c))));
+    }
+    return out;
+}
+
+bool endsWithIgnoreCase(std::string_view s, std::string_view suffix) {
+    if (s.size() < suffix.size()) return false;
+    const auto off = s.size() - suffix.size();
+    for (std::size_t i = 0; i < suffix.size(); ++i) {
+        const char a = static_cast<char>(std::tolower(static_cast<unsigned char>(s[off + i])));
+        const char b = static_cast<char>(std::tolower(static_cast<unsigned char>(suffix[i])));
+        if (a != b) return false;
+    }
+    return true;
+}
+
+std::string characterBasenameStem(std::string_view filename) {
+    if (endsWithIgnoreCase(filename, ".d2s")) {
+        return std::string(filename.substr(0, filename.size() - 4));
+    }
+    return std::string(filename);
+}
+
+// Resolve an item's display name. Prefers the quality-specific name
+// (e.g. "Earthshaker" for unique mau8 rather than the base "Legendary
+// Mallet"), falls back to the base item name from armor/weapon/misc.
+std::string resolveItemDisplayName(const d2r::RefDb& refDb, const d2r::Item& it) {
+    if (it.quality == d2r::ItemQuality::Unique) {
+        if (const auto* r = refDb.lookupUnique(static_cast<std::uint16_t>(it.uniqueId))) {
+            return r->index;
+        }
+    } else if (it.quality == d2r::ItemQuality::Set) {
+        if (const auto* r = refDb.lookupSetItem(static_cast<std::uint16_t>(it.setItemId))) {
+            return r->index;
+        }
+    }
+    // Base name resolved by ItemParser (may be empty if the code is
+    // unknown to the reference DB, which is unusual).
+    return it.itemName;
+}
+
+int cmdBackupsFindItem(std::vector<std::string_view>       args,
+                       const std::filesystem::path&        exePath,
+                       std::string_view                    referenceDbOverride) {
+    std::string charName;
+    bool        allCharacters = false;
+    bool        includeStash  = false;
+    std::string namePattern;
+    std::string codePattern;
+    std::filesystem::path dbPath = d2r::backupDbPath();
+    std::size_t rowLimit = 500;   // per file
+    std::size_t printLimit = 200; // matching rows per file
+    for (std::size_t i = 2; i < args.size(); ++i) {
+        const auto a = args[i];
+        auto need = [&](const char* flag) -> std::string_view {
+            if (i + 1 >= args.size()) {
+                throw std::runtime_error(std::string("backups find-item: ") + flag + " expects a value");
+            }
+            return args[++i];
+        };
+        if      (a == "--character")       charName = std::string(need("--character"));
+        else if (a == "--all-characters")  allCharacters = true;
+        else if (a == "--shared-stash")    includeStash = true;
+        else if (a == "--name")            namePattern = std::string(need("--name"));
+        else if (a == "--code")            codePattern = std::string(need("--code"));
+        else if (a == "--db")              dbPath = std::filesystem::path(std::string(need("--db")));
+        else if (a == "--limit-rows")      rowLimit = static_cast<std::size_t>(std::atoll(std::string(need("--limit-rows")).c_str()));
+        else if (a == "--limit-matches")   printLimit = static_cast<std::size_t>(std::atoll(std::string(need("--limit-matches")).c_str()));
+        else {
+            throw std::runtime_error("backups find-item: unknown flag '" + std::string(a) + "'");
+        }
+    }
+    // Argument validation. Exactly one character-scope flag required;
+    // exactly one item-selector required.
+    if (charName.empty() == !allCharacters) {
+        std::fprintf(stderr,
+            "error: backups find-item: pass exactly one of --character NAME or --all-characters\n");
+        return 2;
+    }
+    if (namePattern.empty() == codePattern.empty()) {
+        std::fprintf(stderr,
+            "error: backups find-item: pass exactly one of --name PATTERN or --code CODE\n");
+        return 2;
+    }
+
+    const auto refDbPath = d2r::findReferenceDb(exePath, referenceDbOverride);
+    if (!refDbPath) {
+        std::fprintf(stderr,
+            "error: backups find-item: reference DB not found. Build the\n"
+            "       'reference_db' target or set D2R_REFERENCE_DB / pass\n"
+            "       --reference-db.\n");
+        return 1;
+    }
+    d2r::RefDb refDb(*refDbPath);
+    // ItemParser + SharedStashParser both need the armor/weapon/misc/
+    // uniqueitems/setitems tables populated; without this every parse
+    // silently produces an empty item list.
+    refDb.loadItemTables();
+
+    const std::string wantNameLower = toLowerAscii(namePattern);
+    const std::string wantCodeLower = toLowerAscii(codePattern);
+    auto itemMatches = [&](const d2r::Item& it) -> bool {
+        if (!wantCodeLower.empty()) {
+            return toLowerAscii(it.code) == wantCodeLower;
+        }
+        // Match against display name AND base name -- users often type
+        // "Earthshaker" (unique name) or "Legendary Mallet" (base).
+        const auto disp = toLowerAscii(resolveItemDisplayName(refDb, it));
+        if (!disp.empty() && disp.find(wantNameLower) != std::string::npos) return true;
+        const auto base = toLowerAscii(it.itemName);
+        if (!base.empty() && base.find(wantNameLower) != std::string::npos) return true;
+        return false;
+    };
+
+    d2r::BackupDb db(dbPath);
+    const auto sums = db.summariseFiles();
+    if (sums.empty()) {
+        std::printf("(no backups on record)\n");
+        return 0;
+    }
+
+    // Build the ordered file list. We always search in filename order
+    // for determinism.
+    std::vector<std::string> targets;
+    const std::string wantStemLower = toLowerAscii(charName);
+    for (const auto& fs : sums) {
+        if (endsWithIgnoreCase(fs.filename, ".d2s")) {
+            const auto stem = toLowerAscii(characterBasenameStem(fs.filename));
+            if (allCharacters || stem == wantStemLower) {
+                targets.push_back(fs.filename);
+            }
+        } else if (includeStash && endsWithIgnoreCase(fs.filename, ".d2i")) {
+            targets.push_back(fs.filename);
+        }
+    }
+    if (targets.empty()) {
+        std::fprintf(stderr,
+            "error: backups find-item: no matching files in %s\n",
+            dbPath.string().c_str());
+        return 1;
+    }
+
+    std::printf("search: %s%s   scanning %zu file%s (up to %zu rows each)\n",
+                wantCodeLower.empty() ? "name~" : "code=",
+                wantCodeLower.empty() ? namePattern.c_str() : codePattern.c_str(),
+                targets.size(), targets.size() == 1 ? "" : "s",
+                rowLimit);
+
+    d2r::ItemParser itemParser(refDb);
+    d2r::SharedStashParser stashParser(refDb);
+
+    // Per-file totals for the trailing summary line.
+    struct Totals {
+        std::string  filename;
+        std::size_t  rowsScanned  = 0;
+        std::size_t  rowsMatched  = 0;
+        std::int64_t firstMatch   = 0;
+        std::int64_t lastMatch    = 0;
+    };
+    std::vector<Totals> totals;
+
+    for (const auto& fname : targets) {
+        Totals t; t.filename = fname;
+        const auto hist = db.historyFor(fname, rowLimit);
+        t.rowsScanned = hist.size();
+
+        std::printf("\n== %s (%zu rows) ==\n", fname.c_str(), hist.size());
+        std::size_t printed = 0;
+
+        // Walk NEWEST FIRST so the top of the section is always the
+        // most recent snapshot containing the item -- that's the row
+        // the user usually wants to restore.
+        for (const auto& hr : hist) {
+            if (hr.state == d2r::BackupDb::State::Deleted) continue;
+            if (hr.sizeBytes <= 0) continue;
+            auto row = db.at(fname, hr.date);
+            if (!row || row->data.empty()) continue;
+
+            // Collect matches for this row. `matches` uses a small
+            // vector to preserve on-file order (character inv, then
+            // merc, then corpse, then golem, or stash-tab order).
+            struct Hit {
+                std::string location;
+                std::string displayName;
+                std::string code;
+                d2r::ItemQuality quality = d2r::ItemQuality::None;
+                std::uint32_t    fingerprint = 0;
+            };
+            std::vector<Hit> matches;
+
+            auto emit = [&](const std::vector<d2r::Item>& items,
+                            std::string_view loc) {
+                for (const auto& it : items) {
+                    if (itemMatches(it)) {
+                        matches.push_back(Hit{
+                            std::string(loc),
+                            resolveItemDisplayName(refDb, it),
+                            it.code,
+                            it.quality,
+                            it.fingerprint,
+                        });
+                    }
+                    for (const auto& s : it.socketedItems) {
+                        if (itemMatches(s)) {
+                            matches.push_back(Hit{
+                                std::string(loc) + " (socketed)",
+                                resolveItemDisplayName(refDb, s),
+                                s.code,
+                                s.quality,
+                                s.fingerprint,
+                            });
+                        }
+                    }
+                }
+            };
+
+            try {
+                if (endsWithIgnoreCase(fname, ".d2s")) {
+                    const auto ch = d2r::parseCharacter(row->data);
+                    if (ch.itemsOffset) {
+                        emit(itemParser.parseItems(row->data, ch.itemsOffset), fname);
+                    }
+                    if (ch.mercItemsJMOffset) {
+                        emit(itemParser.parseItems(row->data, ch.mercItemsJMOffset),
+                             std::string(fname) + " (merc)");
+                    }
+                    if (ch.corpseJMOffset && ch.corpseItemCount == 1) {
+                        emit(itemParser.parseItems(row->data, ch.corpseJMOffset + 16),
+                             std::string(fname) + " (corpse)");
+                    }
+                    if (ch.hasIronGolem && ch.ironGolemItemOffset) {
+                        std::vector<d2r::Item> golem{
+                            itemParser.parseSingleItem(row->data, ch.ironGolemItemOffset)};
+                        emit(golem, std::string(fname) + " (iron golem)");
+                    }
+                } else {
+                    // Shared stash.
+                    const auto ss = stashParser.parse(row->data);
+                    for (std::size_t ti = 0; ti < ss.tabs.size(); ++ti) {
+                        emit(ss.tabs[ti].items,
+                             fname + " (tab " + std::to_string(ti + 1) + ")");
+                    }
+                }
+            } catch (const std::exception&) {
+                // Partial parse: any hits we already collected still count.
+            }
+
+            if (matches.empty()) continue;
+
+            t.rowsMatched += 1;
+            if (t.firstMatch == 0 || hr.date < t.firstMatch) t.firstMatch = hr.date;
+            if (hr.date > t.lastMatch) t.lastMatch = hr.date;
+
+            if (printed < printLimit) {
+                for (const auto& m : matches) {
+                    // "unique / mau8 / Earthshaker  fp=0x12345678"
+                    std::printf("  %-20s  %-14s  %-32s  %-8s  %s  fp=0x%08x\n",
+                                formatBackupDate(hr.date).c_str(),
+                                stateName(hr.state),
+                                m.location.c_str(),
+                                m.code.c_str(),
+                                m.displayName.c_str(),
+                                m.fingerprint);
+                }
+                ++printed;
+            } else if (printed == printLimit) {
+                std::printf("  ... (further matches suppressed; pass --limit-matches N to see more)\n");
+                ++printed;
+            }
+        }
+
+        if (t.rowsMatched == 0) {
+            std::printf("  (no matches)\n");
+        }
+        totals.push_back(std::move(t));
+    }
+
+    std::printf("\nsummary\n");
+    for (const auto& t : totals) {
+        if (t.rowsMatched == 0) {
+            std::printf("  %-40s   0 matching rows (scanned %zu)\n",
+                        t.filename.c_str(), t.rowsScanned);
+        } else {
+            std::printf("  %-40s  %2zu matching rows   first %s  last %s\n",
+                        t.filename.c_str(), t.rowsMatched,
+                        formatBackupDate(t.firstMatch).c_str(),
+                        formatBackupDate(t.lastMatch).c_str());
+        }
+    }
+    return 0;
+}
+
 int cmdBackupsPrune(std::vector<std::string_view> args) {
     int days = 30, sessions = 100;
     for (std::size_t i = 2; i < args.size(); ++i) {
@@ -1074,21 +1389,24 @@ int cmdBackupsSnapshot(const std::filesystem::path& savePath) {
 }
 
 int cmdBackups(std::vector<std::string_view>       args,
-               const std::filesystem::path&        primarySavePath) {
+               const std::filesystem::path&        primarySavePath,
+               const std::filesystem::path&        exePath,
+               std::string_view                    referenceDbOverride) {
     if (args.size() < 2) {
         printBackupsUsage();
         return 2;
     }
     try {
         const auto sub = args[1];
-        if (sub == "summary")  return cmdBackupsSummary();
-        if (sub == "list")     return cmdBackupsList(args);
-        if (sub == "sessions") return cmdBackupsSessions(args);
-        if (sub == "show")     return cmdBackupsShow(args);
-        if (sub == "diff")     return cmdBackupsDiff(args);
-        if (sub == "recover")  return cmdBackupsRecover(args, primarySavePath);
-        if (sub == "prune")    return cmdBackupsPrune(args);
-        if (sub == "snapshot") return cmdBackupsSnapshot(primarySavePath);
+        if (sub == "summary")   return cmdBackupsSummary();
+        if (sub == "list")      return cmdBackupsList(args);
+        if (sub == "sessions")  return cmdBackupsSessions(args);
+        if (sub == "show")      return cmdBackupsShow(args);
+        if (sub == "diff")      return cmdBackupsDiff(args);
+        if (sub == "find-item") return cmdBackupsFindItem(args, exePath, referenceDbOverride);
+        if (sub == "recover")   return cmdBackupsRecover(args, primarySavePath);
+        if (sub == "prune")     return cmdBackupsPrune(args);
+        if (sub == "snapshot")  return cmdBackupsSnapshot(primarySavePath);
         if (sub == "-h" || sub == "--help") { printBackupsUsage(); return 0; }
         std::fprintf(stderr, "error: unknown backups subcommand '%.*s'\n\n",
                      static_cast<int>(sub.size()), sub.data());
@@ -2283,8 +2601,10 @@ int main(int argc, char** argv) {
         watchCompatible = false;
         std::vector<std::string_view> subArgs(positional.begin(), positional.end());
         auto sp = savePath;  // may be empty; recover checks
-        runCommand = [subArgs = std::move(subArgs), sp]{
-            return cmdBackups(subArgs, sp);
+        runCommand = [subArgs = std::move(subArgs), sp,
+                      exe = std::string(argv[0]),
+                      r   = std::string(referenceDbOverride)]{
+            return cmdBackups(subArgs, sp, exe, r);
         };
     }
 #endif
