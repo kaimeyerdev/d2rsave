@@ -50,8 +50,60 @@ Rough sub-plan:
   really is unused upstream (a `grep` in the Java repo showed no test
   references, but a manual pass would help).
 * Add a CI harness (GitHub Actions or similar) that runs
-  `cmake --preset debug && ctest --preset debug` in a container with
+  `cmake --preset Debug && ctest --preset Debug` in a container with
   vcpkg pre-bootstrapped. Right now the suite runs only on my machine.
+
+### Replace `tests/fixtures/live-snapshot/` with a user-scripted recipe
+
+The `tests/fixtures/live-snapshot/` tier is a pile of committed binary
+`.d2s` / `.d2i` files coupled to my personal characters. Two problems:
+
+1. Binary blobs don't belong in git -- they inflate history, resist
+   diffing, and mix personal save state with the parser codebase.
+2. The fixtures drift every time I play, so ground-truth assertions
+   (levels, item counts, quest states) go stale silently.
+
+Replace with a **recipe-driven** procedure any contributor can follow
+locally, producing byte-identical (or at least assertion-compatible)
+fixtures on demand.
+
+Plan:
+
+* Author `docs/test-fixtures.md` describing, per required fixture,
+  the exact in-game steps to reproduce it. Per-character sections
+  should specify:
+    * Class + character name (e.g. "Warlock named `Kai`",
+      "Amazon named `Amazon`")
+    * Difficulty / act / quest state to land in before saving
+    * Level target and any specific stat/skill point allocation
+    * Required inventory (e.g. "buy 4 minor healing potions, 2
+      town portal scrolls, identify tomes as noted")
+    * Required stash contents (per tab where relevant)
+    * Waypoints activated, merc hired / equipped, iron-golem state
+    * Any shared-stash `.d2i` contents
+* Contributor plays through the recipe in D2R, then copies the
+  produced files into `debug-artifacts/Test_Saves/` (which is
+  gitignored under the `debug-artifacts/` umbrella).
+* Test wiring:
+    * Add `D2R_USER_SAVES_DIR="${CMAKE_SOURCE_DIR}/debug-artifacts/Test_Saves"`
+      to `tests/CMakeLists.txt` alongside the existing
+      `D2R_TEST_FIXTURE_DIR` / `D2R_TEST_VENDOR_DIR` compile
+      definitions.
+    * Introduce a `[user-fixtures]` Catch2 tag. Tests in this tag
+      check `std::filesystem::exists(D2R_USER_SAVES_DIR)` and the
+      individual fixture files at startup; when absent, they
+      `SKIP` (Catch2 supports skipping with a message) so `ctest`
+      stays green for anyone who hasn't run the recipe.
+    * Port TEST_CASEs currently reading from
+      `D2R_TEST_FIXTURE_DIR` onto the new path one at a time,
+      re-capturing ground truth from the recipe-produced files.
+* Once the migration is complete and CI can regenerate fixtures
+  (or the recipe is fully documented and reproducible), delete
+  the committed `tests/fixtures/live-snapshot/` binaries and drop
+  the `D2R_TEST_FIXTURE_DIR` compile definition.
+* Explicitly out of scope for this item: `tests/fixtures/vendor/`
+  stays -- it's an upstream corpus with documented provenance
+  from paladijn's Java project, not personal state.
 
 ## Chronicle reporting
 

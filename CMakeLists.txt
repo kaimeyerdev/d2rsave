@@ -129,7 +129,7 @@ if(D2R_USE_VCPKG)
         )
         add_dependencies(d2r_tz_forecast reference_db)
     else()
-        message(WARNING "d2rsave: D2R_USE_VCPKG=ON but sqlite3/fmt not found. Run ./bootstrap-vcpkg.sh.")
+        message(WARNING "d2rsave: D2R_USE_VCPKG=ON but sqlite3/fmt not found. Run ./setup-vcpkg.sh.")
     endif()
 
     # -----------------------------------------------------------------------

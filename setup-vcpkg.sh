@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# One-time vcpkg bootstrap. Clones vcpkg into ./.vcpkg and builds the manifest deps.
-# After this runs, `cmake --preset debug` will use it via CMakePresets.json.
+# One-time vcpkg setup. Clones microsoft/vcpkg into ./.vcpkg and builds the
+# vcpkg binary. Manifest deps are installed later by `cmake --preset Debug`.
+# (`bootstrap-vcpkg.sh` below is vcpkg's own internal script, not this one.)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -17,4 +18,4 @@ if [[ ! -x "$VCPKG_DIR/vcpkg" ]]; then
 fi
 
 echo "vcpkg ready at $VCPKG_DIR"
-echo "Next: cmake --preset debug && cmake --build --preset debug"
+echo "Next: cmake --preset Debug && cmake --build --preset Debug"

@@ -7,5 +7,5 @@ compile_commands.json
 *.o
 *.obj
 build
-D2R_Saves
+debug-artifacts/
 *.sqlite

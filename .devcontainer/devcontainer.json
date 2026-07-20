@@ -26,10 +26,10 @@
       ],
       "settings": {
         "cmake.configureOnOpen": false,
-        "C_Cpp.default.compileCommands": "${workspaceFolder}/build/debug/compile_commands.json",
+        "C_Cpp.default.compileCommands": "${workspaceFolder}/build/Debug/compile_commands.json",
         "chat.agent.sandbox.enabled": "off"
       }
     }
   },
-  "postCreateCommand": "sudo chown -R vscode:vscode /home/vscode/.cache/vcpkg && ./bootstrap-vcpkg.sh"
+  "postCreateCommand": "sudo chown -R vscode:vscode /home/vscode/.cache/vcpkg && ./setup-vcpkg.sh"
 }

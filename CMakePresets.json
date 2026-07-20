@@ -15,17 +15,8 @@
       }
     },
     {
-      "name": "minimal-debug",
-      "displayName": "Debug (no vcpkg, Phase 3 only)",
-      "inherits": "base",
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Debug",
-        "D2R_USE_VCPKG": "OFF"
-      }
-    },
-    {
-      "name": "debug",
-      "displayName": "Debug (vcpkg, full features)",
+      "name": "Debug",
+      "displayName": "Debug",
       "inherits": "base",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
@@ -34,17 +25,17 @@
       }
     },
     {
-      "name": "release",
-      "displayName": "Release (vcpkg)",
-      "inherits": "debug",
+      "name": "Release",
+      "displayName": "Release with debug info",
+      "inherits": "Debug",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release"
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
       }
     },
     {
-      "name": "asan",
-      "displayName": "Debug + ASan/UBSan (vcpkg)",
-      "inherits": "debug",
+      "name": "ASan",
+      "displayName": "Debug + ASan/UBSan",
+      "inherits": "Debug",
       "cacheVariables": {
         "CMAKE_CXX_FLAGS_DEBUG": "-g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer",
         "CMAKE_EXE_LINKER_FLAGS_DEBUG": "-fsanitize=address,undefined"
@@ -52,13 +43,13 @@
     }
   ],
   "buildPresets": [
-    { "name": "minimal-debug", "configurePreset": "minimal-debug" },
-    { "name": "debug", "configurePreset": "debug" },
-    { "name": "release", "configurePreset": "release" },
-    { "name": "asan", "configurePreset": "asan" }
+    { "name": "Debug", "configurePreset": "Debug" },
+    { "name": "Release", "configurePreset": "Release" },
+    { "name": "ASan", "configurePreset": "ASan" }
   ],
   "testPresets": [
-    { "name": "debug", "configurePreset": "debug", "output": { "outputOnFailure": true } },
-    { "name": "asan", "configurePreset": "asan", "output": { "outputOnFailure": true } }
+    { "name": "Debug", "configurePreset": "Debug", "output": { "outputOnFailure": true } },
+    { "name": "Release", "configurePreset": "Release", "output": { "outputOnFailure": true } },
+    { "name": "ASan", "configurePreset": "ASan", "output": { "outputOnFailure": true } }
   ]
 }
