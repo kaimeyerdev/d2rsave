@@ -155,29 +155,57 @@ std::string lookupBaseName(RefDb& db, std::string_view code) {
     return std::string(code);
 }
 
-// Return the tier of every base code (armor/weapons three-tier, misc = Misc).
-std::unordered_map<std::string, ChronicleTier> loadTierMap(RefDb& db) {
-    std::unordered_map<std::string, ChronicleTier> out;
+// Small text-to-int helper for reference-DB columns (all stored as
+// TEXT). Empty / non-numeric -> 0.
+int parseInt(std::string_view s) noexcept {
+    if (s.empty()) return 0;
+    try { return std::stoi(std::string(s)); }
+    catch (const std::exception&) { return 0; }
+}
+
+// Return the tier of every base code (armor/weapons three-tier, misc = Misc)
+// alongside a family map: base code -> Normal-tier sibling code, a
+// type map: base code -> `type` slug (e.g. "swor", "tors"), and a
+// level map: base code -> `level` (qlvl). The Uniques "By Tier" view
+// keys off the family, groups families under the Normal-tier's item-
+// class type, and orders families within each group by their Normal-
+// tier base level (weakest -> strongest). Misc codes only appear in
+// the tier map with tier=Misc; their level is captured for future use.
+struct TierMaps {
+    std::unordered_map<std::string, ChronicleTier> tier;
+    std::unordered_map<std::string, std::string>   family;
+    std::unordered_map<std::string, std::string>   type;
+    std::unordered_map<std::string, int>           level;
+};
+TierMaps loadTierMap(RefDb& db) {
+    TierMaps out;
     auto st = db.prepare(
-        "SELECT code, normcode, ubercode, ultracode FROM armor "
+        "SELECT code, normcode, ubercode, ultracode, type, level FROM armor "
         "UNION ALL "
-        "SELECT code, normcode, ubercode, ultracode FROM weapons");
+        "SELECT code, normcode, ubercode, ultracode, type, level FROM weapons");
     while (st.step()) {
         const auto code = st.columnText(0);
         if (code.empty()) continue;
         const auto norm  = st.columnText(1);
         const auto uber  = st.columnText(2);
         const auto ultra = st.columnText(3);
+        const auto ty    = st.columnText(4);
+        const auto lvl   = parseInt(st.columnText(5));
         ChronicleTier t = ChronicleTier::None;
         if      (code == norm)  t = ChronicleTier::Normal;
         else if (code == uber)  t = ChronicleTier::Exceptional;
         else if (code == ultra) t = ChronicleTier::Elite;
-        out.emplace(code, t);
+        out.tier.emplace(code, t);
+        if (!norm.empty()) out.family.emplace(code, norm);
+        if (!ty.empty())   out.type.emplace(code, ty);
+        out.level.emplace(code, lvl);
     }
-    auto stMisc = db.prepare("SELECT code FROM misc");
+    auto stMisc = db.prepare("SELECT code, level FROM misc");
     while (stMisc.step()) {
         const auto code = stMisc.columnText(0);
-        if (!code.empty()) out.emplace(code, ChronicleTier::Misc);
+        if (code.empty()) continue;
+        out.tier.emplace(code, ChronicleTier::Misc);
+        out.level.emplace(code, parseInt(stMisc.columnText(1)));
     }
     return out;
 }
@@ -501,7 +529,14 @@ bool refreshD2iIfNeeded(
 
 // Ensure the process-lifetime RefDb tables are loaded on the cache.
 void ensureCacheTables(RefDb& db, DashboardFileCache& cache) {
-    if (!cache.tierByCode)          cache.tierByCode          = loadTierMap(db);
+    if (!cache.tierByCode || !cache.familyByCode ||
+        !cache.typeByCode || !cache.levelByCode) {
+        auto maps = loadTierMap(db);
+        cache.tierByCode   = std::move(maps.tier);
+        cache.familyByCode = std::move(maps.family);
+        cache.typeByCode   = std::move(maps.type);
+        cache.levelByCode  = std::move(maps.level);
+    }
     if (!cache.collectableUniqueIds) cache.collectableUniqueIds = loadCollectable(db, "uniqueitems", "code");
     if (!cache.collectableSetIds)    cache.collectableSetIds    = loadCollectable(db, "setitems",    "item");
 }
@@ -706,6 +741,24 @@ DashboardSnapshot aggregateDashboardSnapshot(RefDb&              db,
         auto it = tierByCode.find(std::string(code));
         return it == tierByCode.end() ? ChronicleTier::None : it->second;
     };
+    const auto& familyByCode = *cache.familyByCode;
+    auto familyOf = [&](std::string_view code) -> std::string {
+        if (code.empty()) return {};
+        auto it = familyByCode.find(std::string(code));
+        return it == familyByCode.end() ? std::string{} : it->second;
+    };
+    const auto& typeByCode = *cache.typeByCode;
+    auto typeOf = [&](std::string_view code) -> std::string {
+        if (code.empty()) return {};
+        auto it = typeByCode.find(std::string(code));
+        return it == typeByCode.end() ? std::string{} : it->second;
+    };
+    const auto& levelByCode = *cache.levelByCode;
+    auto levelOf = [&](std::string_view code) -> int {
+        if (code.empty()) return 0;
+        auto it = levelByCode.find(std::string(code));
+        return it == levelByCode.end() ? 0 : it->second;
+    };
 
     // Chronicle rows treat sunder-charm sibling ids as equivalent (owning
     // or discovering a Renewed variant satisfies its Latent pair and vice
@@ -757,7 +810,17 @@ DashboardSnapshot aggregateDashboardSnapshot(RefDb&              db,
             r.id          = static_cast<std::uint32_t>(st.columnInt64(0));
             r.displayName = st.columnText(1);
             r.baseName    = st.columnText(2);
-            r.tier        = tierOf(st.columnText(3));
+            const auto baseCode = st.columnText(3);
+            r.baseCode    = baseCode;
+            r.tier        = tierOf(baseCode);
+            r.familyKey   = familyOf(baseCode);
+            // Group families by the item-class type of their Normal-
+            // tier sibling so every member of the Crystal Sword /
+            // Dimensional Blade / Phase Blade family reports as
+            // "swor" (Swords). Falls back to the row's own type when
+            // the family key is missing.
+            r.familyType  = typeOf(!r.familyKey.empty() ? r.familyKey : baseCode);
+            r.familyLevel = levelOf(!r.familyKey.empty() ? r.familyKey : baseCode);
             r.discovered  = discoveredUnique(r.id);
             if (auto it = uniqueLocations.find(r.id); it != uniqueLocations.end()) {
                 r.location = it->second;

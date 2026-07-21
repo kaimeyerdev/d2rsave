@@ -101,6 +101,31 @@ struct ChronicleRow {
     bool          discovered   = false;
     std::string   location;
     std::string   setName;       // populated for Set rows (parent set)
+    // Base item code (3-char, e.g. "crs" for Crystal Sword). Populated
+    // for Unique rows; empty for Sets/Runewords.
+    std::string   baseCode;
+    // Family key = the code of this base's Normal-tier sibling
+    // (armor/weapons `normcode`). Every unique in the Crystal Sword /
+    // Dimensional Blade / Phase Blade family shares the same key,
+    // which the Uniques "By Tier" view uses to align tier siblings on
+    // the same row. Empty for Misc-tier uniques (rings, amulets,
+    // jewels, charms) and for Sets/Runewords.
+    std::string   familyKey;
+    // Item-class slug of the family's Normal-tier base (armor/weapons
+    // `type` column, e.g. "swor", "tors", "abow"). The By-Tier view
+    // maps this to a human-readable header (Swords, Body Armor, ...)
+    // and groups families under it. Empty for Misc-tier / non-Unique
+    // rows.
+    std::string   familyType;
+    // Base item level (armor/weapons/misc `level` column) of the
+    // family's Normal-tier sibling -- the canonical "power tier" for
+    // the family. Every member of the Crystal Sword / Dimensional
+    // Blade / Phase Blade family reports the same value (Crystal
+    // Sword's level, 11). The By-Tier view sorts families within
+    // each item-class banner by this value so Body Armor reads
+    // Quilted (1) -> Leather (3) -> ... -> Ancient Armor (40). 0
+    // for Misc-tier / non-Unique rows.
+    int           familyLevel = 0;
 };
 
 // One item found in inventory / stash. Used by the global inventory-search
@@ -225,6 +250,21 @@ struct DashboardFileCache {
     // Memoised RefDb lookup tables. Populated on the first refresh; never
     // invalidated (the reference DB is process-lifetime read-only).
     std::optional<std::unordered_map<std::string, ChronicleTier>> tierByCode;
+    // Base code -> Normal-tier sibling code (armor/weapons `normcode`).
+    // Consumed by the "By Tier" Uniques view to group tier families.
+    // Absent entries (e.g. misc codes) mean "no family".
+    std::optional<std::unordered_map<std::string, std::string>>   familyByCode;
+    // Base code -> `type` slug (armor/weapons `type` column, e.g.
+    // "swor", "tors", "abow"). The "By Tier" Uniques view uses the
+    // family key's type to bucket families into item-class sections
+    // (Swords, Body Armor, ...). Absent for misc codes.
+    std::optional<std::unordered_map<std::string, std::string>>   typeByCode;
+    // Base code -> `level` (armor/weapons/misc `level` column). Used
+    // by the "By Tier" Uniques view to sort families within each
+    // item-class section by base power (Quilted -> ... -> Ancient
+    // Armor). Populated for every armor/weapons/misc row (0 means
+    // "unranked").
+    std::optional<std::unordered_map<std::string, int>>           levelByCode;
     std::optional<std::unordered_set<std::uint32_t>>              collectableUniqueIds;
     std::optional<std::unordered_set<std::uint32_t>>              collectableSetIds;
 };

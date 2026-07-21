@@ -8,6 +8,7 @@
 #include <nlohmann/json.hpp>
 #include <sqlite3.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <stdexcept>
@@ -111,6 +112,7 @@ std::string_view toString(PaneSortKey k) {
         case PaneSortKey::Name:  return "name";
         case PaneSortKey::Base:  return "base";
         case PaneSortKey::Owned: return "owned";
+        case PaneSortKey::Tier:  return "tier";
     }
     return "base";
 }
@@ -197,6 +199,7 @@ OwnershipFilter ownershipFromString(std::string_view s) {
 PaneSortKey sortKeyFromString(std::string_view s) {
     if (s == "name")  return PaneSortKey::Name;
     if (s == "owned") return PaneSortKey::Owned;
+    if (s == "tier")  return PaneSortKey::Tier;
     return PaneSortKey::Base;
 }
 
@@ -280,6 +283,10 @@ nlohmann::json toJson(const PaneNode& n) {
      || c.type == PaneType::Reconcile) {
         j["searchQuery"] = c.searchQuery;
     }
+    // Layout weight defaults to 1; omit when unchanged to keep the
+    // stored JSON tidy for the common case.
+    if (c.paneWeight != 1) j["paneWeight"] = c.paneWeight;
+    if (c.infoLevel  != 1) j["infoLevel"]  = c.infoLevel;
     return j;
 }
 
@@ -330,6 +337,8 @@ PaneNode fromJson(const nlohmann::json& j) {
          || n.config.type == PaneType::Reconcile) {
             n.config.searchQuery = j.value("searchQuery", std::string());
         }
+        n.config.paneWeight = std::max(1, j.value("paneWeight", 1));
+        n.config.infoLevel  = std::clamp(j.value("infoLevel", 1), 1, 3);
     } catch (const std::exception&) {
         // Corrupt / unexpected shape at this subtree: substitute a blank leaf.
         n = PaneNode{};

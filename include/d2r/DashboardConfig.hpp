@@ -49,7 +49,7 @@ enum class OwnershipFilter : std::uint8_t {
     DiscoveredOnly,  // Hide unowned rows.
 };
 
-enum class PaneSortKey : std::uint8_t { Name, Base, Owned };
+enum class PaneSortKey : std::uint8_t { Name, Base, Owned, Tier };
 
 // Vertical split   = side-by-side (a vertical separator between two panes).
 // Horizontal split = stacked      (a horizontal separator between two panes).
@@ -110,6 +110,24 @@ struct PaneConfig {
 
     // Chronicle + Inventory + Reconcile.
     std::string       searchQuery;
+
+    // Layout size weight (>=1). Applied by the pane-tree renderer as
+    // the leaf's contribution to widthShare / heightShare, so a leaf
+    // with paneWeight=2 takes twice the room of a weight-1 sibling on
+    // whichever axis its parent split divides. Enables asymmetric
+    // layouts like 25% / 25% / 50% along a vertical chain of three
+    // panes (weights 1, 1, 2).
+    int               paneWeight   = 1;
+
+    // Per-pane detail level (1..3). Currently only consumed by the
+    // Uniques (all) "By Tier" grid:
+    //   1 -- compact: three tier cells only (default).
+    //   2 -- adds a leading column with the family's Normal-tier
+    //        base name (e.g. "Crystal Sword").
+    //   3 -- level 2 plus every cell shows its own base name in
+    //        parentheses next to the unique name.
+    // Other renderers ignore this field; it costs nothing to carry.
+    int               infoLevel    = 1;
 
     // Runtime-only (not persisted): scroll cursor.
     int               cursor       = 0;

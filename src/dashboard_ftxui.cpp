@@ -368,6 +368,7 @@ std::string sortKeyLabel(PaneSortKey k) {
         case PaneSortKey::Name:  return "name";
         case PaneSortKey::Base:  return "base";
         case PaneSortKey::Owned: return "owned";
+        case PaneSortKey::Tier:  return "tier";
     }
     return "?";
 }
@@ -410,6 +411,11 @@ std::vector<const ChronicleRow*> filterForLeaf(const PaneConfig& c,
             case PaneSortKey::Name:  return lc(a->displayName) < lc(b->displayName);
             case PaneSortKey::Base:  return lc(a->baseName)    < lc(b->baseName);
             case PaneSortKey::Owned: return a->discovered && !b->discovered;
+            // Tier is handled by renderChronicleByTier's own grouping.
+            // If we reach this comparator with Tier active (e.g. a
+            // Sets pane loaded stale JSON), fall back to base-name
+            // order so the flat list is still coherent.
+            case PaneSortKey::Tier:  return lc(a->baseName)    < lc(b->baseName);
         }
         return false;
     };
@@ -479,10 +485,395 @@ Element cellText(const std::string& s, int contentW) {
     return text(" " + s) | size(WIDTH, EQUAL, contentW + kCellPad);
 }
 
+// Render the Uniques "By Tier" grid: one row per tier family with three
+// columns (Normal / Exceptional / Elite). Families with more than one
+// unique in some tier expand into consecutive rows -- row i takes the
+// i-th unique in each tier's bucket, or a blank cell when that bucket
+// is shorter. Families are further bucketed by the item-class type of
+// their Normal-tier base (Swords, Body Armor, ...); each item-class
+// bucket gets a small header banner and a leading separator, but rows
+// within a bucket are separated only by their natural whitespace so
+// the grid stays scannable.
+//
+// The renderer skips filterForLeaf's per-row filter and applies
+// ownership + search filters at family level (a family stays visible
+// if at least one of its cells satisfies both filters), so the
+// Normal/Ex/Elite alignment isn't lost when some cells fail the
+// filter.
+//
+// Only called when c.category == UniquesAll and c.sortKey == Tier.
+Element renderChronicleByTier(const PaneConfig& c, const DashboardSnapshot& s,
+                              bool focused, bool searchMode) {
+    // Family record: three ordered buckets (Normal / Exceptional /
+    // Elite) plus a sort key derived from the Normal-tier base name
+    // (fallback: Exceptional, then Elite) plus the family's item-class
+    // slug (used to group families into headed sections).
+    struct Family {
+        std::array<std::vector<const ChronicleRow*>, 3> buckets{};
+        std::string sortKey;   // lowercased Normal-tier base name (fallback below)
+        std::string typeSlug;  // familyType of any member (all share it)
+        int         level = 0; // familyLevel of any member (all share it)
+    };
+    auto lc = [](std::string t) {
+        for (auto& ch : t) ch = std::tolower(static_cast<unsigned char>(ch));
+        return t;
+    };
+    auto tierSlot = [](ChronicleTier t) -> int {
+        switch (t) {
+            case ChronicleTier::Normal:      return 0;
+            case ChronicleTier::Exceptional: return 1;
+            case ChronicleTier::Elite:       return 2;
+            default:                          return -1;
+        }
+    };
+
+    // Group: familyKey (fallback baseCode) -> Family.
+    std::unordered_map<std::string, Family> byKey;
+    for (const auto& r : s.chronicle) {
+        if (r.kind != ChronicleKind::Unique) continue;
+        const int slot = tierSlot(r.tier);
+        if (slot < 0) continue;  // Misc-tier uniques don't join the grid.
+        std::string key = !r.familyKey.empty() ? r.familyKey : r.baseCode;
+        if (key.empty()) continue;
+        auto& fam = byKey[key];
+        fam.buckets[slot].push_back(&r);
+        if (fam.typeSlug.empty()) fam.typeSlug = r.familyType;
+        if (fam.level == 0)       fam.level    = r.familyLevel;
+    }
+    if (byKey.empty()) {
+        Element titleEl = text(" " + paneTitle(c) + " ");
+        if (focused) titleEl = titleEl | inverted;
+        return window(titleEl,
+            vbox({ text(" (no tier families)") | dim }) | flex);
+    }
+
+    // Stable-sort within each bucket by displayName and compute each
+    // family's sortKey.
+    for (auto& [key, fam] : byKey) {
+        for (auto& bucket : fam.buckets) {
+            std::stable_sort(bucket.begin(), bucket.end(),
+                [&](const ChronicleRow* a, const ChronicleRow* b) {
+                    return lc(a->displayName) < lc(b->displayName);
+                });
+        }
+        for (int t = 0; t < 3; ++t) {
+            if (!fam.buckets[t].empty()) {
+                fam.sortKey = lc(fam.buckets[t].front()->baseName);
+                break;
+            }
+        }
+    }
+
+    // Family-level filter: hide only when every non-blank cell fails.
+    auto familySurvives = [&](const Family& fam) {
+        const bool hasQuery = !c.searchQuery.empty();
+        for (int t = 0; t < 3; ++t) {
+            for (const auto* r : fam.buckets[t]) {
+                if (r->discovered  && c.ownership == OwnershipFilter::RemainingOnly)  continue;
+                if (!r->discovered && c.ownership == OwnershipFilter::DiscoveredOnly) continue;
+                if (hasQuery) {
+                    const bool hit = containsCI(r->displayName, c.searchQuery)
+                                  || containsCI(r->baseName,    c.searchQuery);
+                    if (!hit) continue;
+                }
+                return true;
+            }
+        }
+        return false;
+    };
+
+    // Item-class banner + sort priority per `type` slug. Priority
+    // orders armor (100s) before generic weapons (200s) before class-
+    // restricted weapons (400s); alphabetic tiebreak by display name
+    // for anything not in the table.
+    struct GroupInfo { const char* name; int rank; };
+    auto groupInfoFor = [](std::string_view slug) -> GroupInfo {
+        // clang-format off
+        if (slug == "tors") return {"Body Armor",          100};
+        if (slug == "helm") return {"Helms",               110};
+        if (slug == "pelt") return {"Druid Pelts",         111};
+        if (slug == "phlm") return {"Barbarian Helms",     112};
+        if (slug == "circ") return {"Circlets",            113};
+        if (slug == "shie") return {"Shields",             120};
+        if (slug == "head") return {"Necromancer Heads",   121};
+        if (slug == "ashd") return {"Paladin Shields",     122};
+        if (slug == "grim") return {"Warlock Tomes",      123};
+        if (slug == "glov") return {"Gloves",              130};
+        if (slug == "boot") return {"Boots",               140};
+        if (slug == "belt") return {"Belts",               150};
+        if (slug == "swor") return {"Swords",              200};
+        if (slug == "axe")  return {"Axes",                210};
+        if (slug == "mace") return {"Maces",               220};
+        if (slug == "hamm") return {"Hammers",             221};
+        if (slug == "club") return {"Clubs",               222};
+        if (slug == "scep") return {"Scepters",            230};
+        if (slug == "pole") return {"Polearms",            240};
+        if (slug == "spea") return {"Spears",              241};
+        if (slug == "jave") return {"Javelins",            250};
+        if (slug == "knif") return {"Daggers",             260};
+        if (slug == "taxe") return {"Throwing Axes",       261};
+        if (slug == "tkni") return {"Throwing Knives",     262};
+        if (slug == "tpot") return {"Throwing Potions",    263};
+        if (slug == "staf") return {"Staves",              270};
+        if (slug == "wand") return {"Wands",               271};
+        if (slug == "bow")  return {"Bows",                280};
+        if (slug == "xbow") return {"Crossbows",           281};
+        if (slug == "h2h" || slug == "h2h2")
+                            return {"Assassin Claws",      400};
+        if (slug == "abow") return {"Amazon Bows",         410};
+        if (slug == "ajav") return {"Amazon Javelins",     411};
+        if (slug == "aspe") return {"Amazon Spears",       412};
+        if (slug == "orb")  return {"Sorceress Orbs",      420};
+        return {"Other",                                   999};
+        // clang-format on
+    };
+
+    // Assemble surviving families and sort them by (group rank, family
+    // base name) so all Swords sit together, all Body Armor sits
+    // together, etc.
+    std::vector<const Family*> families;
+    families.reserve(byKey.size());
+    for (const auto& [key, fam] : byKey) {
+        if (familySurvives(fam)) families.push_back(&fam);
+    }
+    auto groupNameOf = [&](const Family* f) {
+        return groupInfoFor(f->typeSlug).name;
+    };
+    auto groupRankOf = [&](const Family* f) {
+        return groupInfoFor(f->typeSlug).rank;
+    };
+    std::stable_sort(families.begin(), families.end(),
+        [&](const Family* a, const Family* b) {
+            const int ra = groupRankOf(a);
+            const int rb = groupRankOf(b);
+            if (ra != rb) return c.sortAsc ? ra < rb : ra > rb;
+            const std::string na = groupNameOf(a);
+            const std::string nb = groupNameOf(b);
+            if (na != nb) return c.sortAsc ? na < nb : na > nb;
+            // Primary within-group order: base item level (qlvl) so
+            // Body Armor reads Quilted (1) -> Leather (3) -> ... ->
+            // Ancient Armor (40). Base name is the tiebreaker so
+            // families with equal levels (rare but possible) still
+            // have a deterministic order.
+            if (a->level != b->level)
+                return c.sortAsc ? a->level < b->level
+                                 : a->level > b->level;
+            return c.sortAsc ? a->sortKey < b->sortKey
+                             : a->sortKey > b->sortKey;
+        });
+
+    // Column widths: cap similar to measureChronicle. Discovered mark
+    // ("✓ ") lives inside the cell string so cell width just accounts
+    // for the widest per-cell text (which grows at info level 3 to
+    // include "ItemName (BaseName)").
+    const int infoLevel = std::clamp(c.infoLevel, 1, 3);
+    auto cellTextFor = [&](const ChronicleRow* r) -> std::string {
+        if (!r) return {};
+        std::string s = r->discovered ? "\xE2\x9C\x93 " : "  ";
+        s += r->displayName;
+        if (infoLevel >= 3 && !r->baseName.empty()) {
+            s += " (" + r->baseName + ")";
+        }
+        return s;
+    };
+    // Family-label column width (info level >=2): widest Normal-tier
+    // base name (fallback Exceptional -> Elite when Normal missing).
+    auto familyLabelFor = [](const Family* fam) -> std::string {
+        for (int t = 0; t < 3; ++t) {
+            if (!fam->buckets[t].empty()) return fam->buckets[t].front()->baseName;
+        }
+        return {};
+    };
+    std::array<int, 3> colW{4, 4, 4};
+    for (const auto* fam : families) {
+        for (int t = 0; t < 3; ++t) {
+            for (const auto* r : fam->buckets[t]) {
+                const int w = static_cast<int>(cellTextFor(r).size()) + 2;
+                // Cap widens at higher info levels so "(BaseName)"
+                // suffixes don't get truncated.
+                const int cap = infoLevel >= 3 ? 56 : 36;
+                colW[t] = std::min(cap, std::max(colW[t], w));
+            }
+        }
+    }
+    int famLabelW = 0;
+    if (infoLevel >= 2) {
+        famLabelW = 6;   // header text "Family" fallback minimum
+        for (const auto* fam : families) {
+            const int w = static_cast<int>(familyLabelFor(fam).size()) + 2;
+            famLabelW = std::min(28, std::max(famLabelW, w));
+        }
+    }
+
+    // Header row: [Family] Normal | Exceptional | Elite.
+    Elements header;
+    if (infoLevel >= 2) header.push_back(cellText("Family", famLabelW));
+    header.push_back(cellText("Normal",      colW[0]));
+    header.push_back(cellText("Exceptional", colW[1]));
+    header.push_back(cellText("Elite",       colW[2]));
+
+    // Flatten families into display rows. Each row is either a
+    // group-header banner or a data row; the cursor only lands on
+    // data rows. `familyLabel` is populated on the first data row of
+    // each family (info level >=2 only) so the label doesn't repeat
+    // on continuation rows for multi-unique families.
+    struct DisplayRow {
+        std::array<const ChronicleRow*, 3> cells{};
+        std::string  header;         // non-empty when this is a group banner
+        std::string  familyLabel;    // first data row of a family (info level >=2)
+        bool         allOwned = false;  // whole family owned -> dim the label
+    };
+    std::vector<DisplayRow> display;
+    display.reserve(families.size() * 2);
+    std::string lastGroup;
+    for (const auto* fam : families) {
+        const std::string grp = groupNameOf(fam);
+        if (grp != lastGroup) {
+            DisplayRow banner;
+            banner.header = grp;
+            display.push_back(banner);
+            lastGroup = grp;
+        }
+        std::size_t rowCount = 0;
+        for (int t = 0; t < 3; ++t) rowCount = std::max(rowCount, fam->buckets[t].size());
+        // Compute the "all owned" flag once per family for dimming.
+        bool allOwned = true;
+        bool anyRow = false;
+        for (int t = 0; t < 3; ++t) {
+            for (const auto* r : fam->buckets[t]) {
+                anyRow = true;
+                if (!r->discovered) { allOwned = false; break; }
+            }
+            if (!allOwned) break;
+        }
+        allOwned = allOwned && anyRow;
+        for (std::size_t i = 0; i < rowCount; ++i) {
+            DisplayRow dr;
+            for (int t = 0; t < 3; ++t) {
+                dr.cells[t] = i < fam->buckets[t].size() ? fam->buckets[t][i] : nullptr;
+            }
+            if (i == 0) {
+                dr.familyLabel = familyLabelFor(fam);
+                dr.allOwned    = allOwned;
+            }
+            display.push_back(dr);
+        }
+    }
+
+    // Map absolute display-row index -> is-data-row so cursor
+    // navigation skips banners. We store the count of data rows for
+    // clamping; navigation logic elsewhere still moves by ±1 across
+    // all display rows -- landing on a banner just doesn't highlight.
+    const int shown = static_cast<int>(display.size());
+    int dataRowsBefore = 0;
+    for (const auto& dr : display) {
+        if (dr.header.empty()) ++dataRowsBefore;
+    }
+    const int maxCursor = std::max(0, dataRowsBefore - 1);
+    const int clampedDataCursor = std::clamp(c.cursor, 0, maxCursor);
+    // Translate the data-row cursor into an absolute display-row index.
+    int cursorRow = -1;
+    {
+        int dataIdx = 0;
+        for (int i = 0; i < shown; ++i) {
+            if (!display[static_cast<std::size_t>(i)].header.empty()) continue;
+            if (dataIdx == clampedDataCursor) { cursorRow = i; break; }
+            ++dataIdx;
+        }
+    }
+
+    Elements body;
+    body.reserve(static_cast<std::size_t>(shown + 2));
+    body.push_back(hbox(std::move(header)) | bold);
+    body.push_back(separator());
+    bool firstBanner = true;
+    for (int i = 0; i < shown; ++i) {
+        const auto& dr = display[static_cast<std::size_t>(i)];
+        if (!dr.header.empty()) {
+            // The column-header row above already draws a separator,
+            // so skip the extra one for the very first banner --
+            // otherwise we get two horizontal lines back-to-back.
+            if (!firstBanner) {
+                body.push_back(separator() | dim);
+            }
+            body.push_back(text(" " + dr.header + " ") | bold);
+            firstBanner = false;
+            continue;
+        }
+        Elements cells;
+        if (infoLevel >= 2) {
+            Element label = cellText(dr.familyLabel, famLabelW);
+            if (dr.familyLabel.empty())    label = label;               // blank continuation row
+            else if (dr.allOwned)          label = label | dim;
+            else                           label = label | bold;
+            cells.push_back(label);
+        }
+        for (int t = 0; t < 3; ++t) {
+            const auto* r = dr.cells[t];
+            const std::string txt = cellTextFor(r);
+            // Dim owned cells individually so a row with mixed
+            // ownership keeps the unowned tiers at full brightness.
+            Element cell = cellText(txt, colW[t]);
+            if (r && r->discovered) cell = cell | dim;
+            cells.push_back(cell);
+        }
+        Element row = hbox(std::move(cells));
+        if (focused && i == cursorRow) row = row | inverted | ftxui::focus;
+        body.push_back(row);
+    }
+
+    // Status + title mirror renderChronicleLeaf so panes feel consistent.
+    std::string status = "sort: " + sortKeyLabel(c.sortKey)
+                       + (c.sortAsc ? " asc" : " desc")
+                       + " | show: " + ownershipLabel(c.ownership);
+    if (!c.searchQuery.empty() && !searchMode) {
+        status += " | q=\"" + c.searchQuery + "\"";
+    }
+
+    // Title stats: fraction of Normal+Exceptional+Elite Uniques
+    // discovered (matches what the grid actually covers -- excludes
+    // Misc-tier uniques).
+    int categoryTotal = 0;
+    int categoryDiscovered = 0;
+    for (const auto& r : s.chronicle) {
+        if (r.kind != ChronicleKind::Unique) continue;
+        if (tierSlot(r.tier) < 0) continue;
+        ++categoryTotal;
+        if (r.discovered) ++categoryDiscovered;
+    }
+    const int categoryRemaining = categoryTotal - categoryDiscovered;
+    const bool remainingLabel   = c.ownership == OwnershipFilter::RemainingOnly;
+    const int numerator = remainingLabel ? categoryRemaining : categoryDiscovered;
+
+    std::string title = " " + paneTitle(c) + "  "
+                      + std::to_string(numerator) + "/"
+                      + std::to_string(categoryTotal) + " "
+                      + (remainingLabel ? "remaining" : "discovered") + " ";
+    Element titleEl = text(title);
+    if (focused) titleEl = titleEl | inverted;
+
+    Element topLine = focused && searchMode
+        ? hbox({ text(" search: ") | bold,
+                 text(c.searchQuery),
+                 text("_") | blink }) | inverted
+        : text(status) | dim;
+
+    return window(titleEl, vbox({
+        topLine,
+        separator(),
+        vbox(std::move(body)) | vscroll_indicator | yframe | flex,
+    }));
+}
+
 // Render a leaf as a Chronicle pane. `focused` controls the highlighted
 // row + the inverted title.
 Element renderChronicleLeaf(const PaneConfig& c, const DashboardSnapshot& s,
                              bool focused, bool searchMode) {
+    // Uniques (all) + Tier sort => dispatch to the 3-column grid.
+    if (c.category == ChronicleCategory::UniquesAll &&
+        c.sortKey  == PaneSortKey::Tier) {
+        return renderChronicleByTier(c, s, focused, searchMode);
+    }
     const auto rows = filterForLeaf(c, s);
     const auto kt = categoryToKindTier(c.category);
     const bool isSet = kt.kind == ChronicleKind::Set;
@@ -1570,6 +1961,8 @@ struct ConfigMenuItem {
         ResetSession,
         PickSessionAnchor,
         UnpinSessionAnchor,
+        CyclePaneWeight,
+        CycleInfoLevel,
         SplitVertical, SplitHorizontal, DeletePane, Close,
     } kind;
     // Extra payload used when kind == ToggleQuality.
@@ -1614,6 +2007,14 @@ std::vector<ConfigMenuItem> buildConfigMenu(const PaneConfig& c, bool canDelete)
                           ConfigMenuItem::ToggleSortDir});
         items.push_back({"ownership:   " + ownershipLabel(c.ownership),
                           ConfigMenuItem::CycleOwnership});
+        // Info level only affects the Uniques (all) "By Tier" grid;
+        // hide it elsewhere so the menu stays tight.
+        if (c.category == ChronicleCategory::UniquesAll &&
+            c.sortKey  == PaneSortKey::Tier) {
+            items.push_back({"info level:  " + std::to_string(std::clamp(c.infoLevel, 1, 3))
+                             + "  (cycle 1..3)",
+                             ConfigMenuItem::CycleInfoLevel});
+        }
     }
     if (c.type == PaneType::Reconcile) {
         items.push_back({"kind filter: " + reconcileKindLabel(c.reconcileKind),
@@ -1646,6 +2047,13 @@ std::vector<ConfigMenuItem> buildConfigMenu(const PaneConfig& c, bool canDelete)
         items.push_back({"reset session anchor now",
                           ConfigMenuItem::ResetSession});
     }
+    // Size weight is universal -- affects width in a vertical (side-
+    // by-side) parent and height in a horizontal (stacked) parent.
+    // Cycled 1 -> 2 -> 3 -> 4 -> 1 so the user can push a pane out to
+    // twice / triple / quadruple the neighbors' allotment.
+    items.push_back({"size weight: " + std::to_string(std::max(1, c.paneWeight))
+                     + "  (cycle 1..4)",
+                     ConfigMenuItem::CyclePaneWeight});
     items.push_back({"split vertical   (side-by-side)", ConfigMenuItem::SplitVertical});
     items.push_back({"split horizontal (stacked)",       ConfigMenuItem::SplitHorizontal});
     if (canDelete) {
@@ -1676,21 +2084,23 @@ Element renderConfigMenu(const UiState& ui, const PaneConfig& c, bool canDelete)
 
 // How many independent vertical strips this subtree needs to render
 // (i.e. its horizontal weight when it appears inside a vertical split).
-// A leaf is 1. A vertical split (side-by-side) sums its children; a
-// horizontal split (stacked) takes the max because both children share
-// the same horizontal band.
+// A leaf contributes `paneWeight` (>=1; the user-adjustable size
+// weight from PaneConfig). A vertical split (side-by-side) sums its
+// children; a horizontal split (stacked) takes the max because both
+// children share the same horizontal band.
 int widthShare(const PaneNode& n) {
-    if (!n.isSplit) return 1;
+    if (!n.isSplit) return std::max(1, n.config.paneWeight);
     if (n.direction == SplitDirection::Vertical)
         return widthShare(*n.a) + widthShare(*n.b);
     return std::max(widthShare(*n.a), widthShare(*n.b));
 }
 
-// Vertical counterpart to `widthShare`. A leaf is 1; a horizontal split
-// (stacked) sums; a vertical split (side-by-side) takes the max because
-// both children share the same vertical band.
+// Vertical counterpart to `widthShare`. A leaf contributes
+// `paneWeight`; a horizontal split (stacked) sums; a vertical split
+// (side-by-side) takes the max because both children share the same
+// vertical band.
 int heightShare(const PaneNode& n) {
-    if (!n.isSplit) return 1;
+    if (!n.isSplit) return std::max(1, n.config.paneWeight);
     if (n.direction == SplitDirection::Horizontal)
         return heightShare(*n.a) + heightShare(*n.b);
     return std::max(heightShare(*n.a), heightShare(*n.b));
@@ -1886,23 +2296,30 @@ PaneNode* deletePane(PaneNode& root, PaneNode& leaf) {
 }
 
 // Cycle helpers.
+//
+// `dir` picks direction: +1 advances to the next value (Enter / Right
+// arrow); -1 rewinds to the previous value (Left arrow). Both wrap at
+// the ends. Other magnitudes are treated as +1.
 template <typename Enum>
-Enum cycleEnum(Enum current, std::initializer_list<Enum> values) {
+Enum cycleEnum(Enum current, std::initializer_list<Enum> values, int dir = 1) {
+    if (values.size() == 0) return current;
     auto* it = std::find(values.begin(), values.end(), current);
-    if (it == values.end() || std::next(it) == values.end()) return *values.begin();
-    return *std::next(it);
+    const int n = static_cast<int>(values.size());
+    int idx = (it == values.end()) ? 0 : static_cast<int>(it - values.begin());
+    idx = ((idx + (dir < 0 ? -1 : 1)) % n + n) % n;
+    return *(values.begin() + idx);
 }
 
-void cyclePaneType(PaneNode& leaf) {
-    // Blank -> Chronicle -> Inventory -> Reconcile -> Backups
-    //       -> BackupLog -> Session -> Blank
-    leaf.config.type = leaf.config.type == PaneType::Blank     ? PaneType::Chronicle
-                     : leaf.config.type == PaneType::Chronicle ? PaneType::Inventory
-                     : leaf.config.type == PaneType::Inventory ? PaneType::Reconcile
-                     : leaf.config.type == PaneType::Reconcile ? PaneType::Backups
-                     : leaf.config.type == PaneType::Backups   ? PaneType::BackupLog
-                     : leaf.config.type == PaneType::BackupLog ? PaneType::Session
-                                                                : PaneType::Blank;
+void cyclePaneType(PaneNode& leaf, int dir = 1) {
+    leaf.config.type = cycleEnum(leaf.config.type, {
+        PaneType::Blank,
+        PaneType::Chronicle,
+        PaneType::Inventory,
+        PaneType::Reconcile,
+        PaneType::Backups,
+        PaneType::BackupLog,
+        PaneType::Session,
+    }, dir);
     leaf.config.cursor = 0;
     // Reset the Backups sub-mode so a freshly-cycled-into pane always
     // opens on the summary view rather than orphaned detail.
@@ -1910,7 +2327,7 @@ void cyclePaneType(PaneNode& leaf) {
     leaf.config.selectedBackupFile.clear();
 }
 
-void cycleCategory(PaneNode& leaf) {
+void cycleCategory(PaneNode& leaf, int dir = 1) {
     leaf.config.category = cycleEnum(leaf.config.category, {
         ChronicleCategory::Sets,
         ChronicleCategory::UniquesNormal,
@@ -1918,30 +2335,47 @@ void cycleCategory(PaneNode& leaf) {
         ChronicleCategory::UniquesElite,
         ChronicleCategory::UniquesMisc,
         ChronicleCategory::UniquesAll,
-    });
+    }, dir);
+    // PaneSortKey::Tier is only meaningful for the Uniques (all) view
+    // (three-tier grid). Snap back to Base if the user cycles away.
+    if (leaf.config.sortKey == PaneSortKey::Tier &&
+        leaf.config.category != ChronicleCategory::UniquesAll) {
+        leaf.config.sortKey = PaneSortKey::Base;
+    }
     leaf.config.cursor = 0;
 }
 
-void cycleSortKey(PaneConfig& c) {
-    c.sortKey = cycleEnum(c.sortKey, {
-        PaneSortKey::Name, PaneSortKey::Base, PaneSortKey::Owned,
-    });
+void cycleSortKey(PaneConfig& c, int dir = 1) {
+    // Tier sort renders a Normal/Exceptional/Elite grid and is only
+    // meaningful for the Uniques (all) category. Omit it from the
+    // cycle for every other pane so users can't get stuck on a
+    // degenerate one-column layout.
+    if (c.category == ChronicleCategory::UniquesAll) {
+        c.sortKey = cycleEnum(c.sortKey, {
+            PaneSortKey::Name, PaneSortKey::Base,
+            PaneSortKey::Owned, PaneSortKey::Tier,
+        }, dir);
+    } else {
+        c.sortKey = cycleEnum(c.sortKey, {
+            PaneSortKey::Name, PaneSortKey::Base, PaneSortKey::Owned,
+        }, dir);
+    }
 }
 
-void cycleOwnership(PaneConfig& c) {
+void cycleOwnership(PaneConfig& c, int dir = 1) {
     c.ownership = cycleEnum(c.ownership, {
         OwnershipFilter::All,
         OwnershipFilter::RemainingOnly,
         OwnershipFilter::DiscoveredOnly,
-    });
+    }, dir);
 }
 
-void cycleReconcileKind(PaneConfig& c) {
+void cycleReconcileKind(PaneConfig& c, int dir = 1) {
     c.reconcileKind = cycleEnum(c.reconcileKind, {
         ReconcileKindFilter::Both,
         ReconcileKindFilter::UniquesOnly,
         ReconcileKindFilter::SetsOnly,
-    });
+    }, dir);
     c.cursor = 0;
 }
 
@@ -2665,21 +3099,66 @@ int runDashboard(const std::filesystem::path& savePath,
             }
             if (e == Event::ArrowUp)   { ui.configMenu = cyclei(ui.configMenu - 1, n); return true; }
             if (e == Event::ArrowDown) { ui.configMenu = cyclei(ui.configMenu + 1, n); return true; }
-            if (e == Event::Return) {
-                const auto& item = items[ui.configMenu];
-                const auto action = item.kind;
-                switch (action) {
-                    case ConfigMenuItem::CycleType:      cyclePaneType(*leaf); break;
-                    case ConfigMenuItem::CycleCategory:  cycleCategory(*leaf); break;
-                    case ConfigMenuItem::CycleSort:      cycleSortKey(leaf->config); break;
-                    case ConfigMenuItem::ToggleSortDir:  leaf->config.sortAsc = !leaf->config.sortAsc; break;
-                    case ConfigMenuItem::CycleOwnership: cycleOwnership(leaf->config); break;
-                    case ConfigMenuItem::CycleReconcileKind: cycleReconcileKind(leaf->config); break;
-                    case ConfigMenuItem::ToggleQuality: {
+            // Left/Right shortcut the highlighted item's cycler in
+            // reverse / forward. Non-cyclable actions (splits, delete,
+            // close, one-shots like ClearBackupLog) require Enter.
+            auto applyCyclable = [&](const ConfigMenuItem& item, int dir) -> bool {
+                switch (item.kind) {
+                    case ConfigMenuItem::CycleType:      cyclePaneType(*leaf, dir); return true;
+                    case ConfigMenuItem::CycleCategory:  cycleCategory(*leaf, dir); return true;
+                    case ConfigMenuItem::CycleSort:      cycleSortKey(leaf->config, dir); return true;
+                    case ConfigMenuItem::ToggleSortDir:  leaf->config.sortAsc = !leaf->config.sortAsc; return true;
+                    case ConfigMenuItem::CycleOwnership: cycleOwnership(leaf->config, dir); return true;
+                    case ConfigMenuItem::CycleReconcileKind: cycleReconcileKind(leaf->config, dir); return true;
+                    case ConfigMenuItem::ToggleQuality:
                         leaf->config.inventoryQualityMask ^= qualityBit(item.quality);
                         leaf->config.cursor = 0;
-                        break;
+                        return true;
+                    case ConfigMenuItem::CyclePaneWeight: {
+                        // 1..4 wrap in either direction.
+                        int w = std::max(1, leaf->config.paneWeight);
+                        w = ((w - 1 + (dir < 0 ? -1 : 1)) % 4 + 4) % 4 + 1;
+                        leaf->config.paneWeight = w;
+                        return true;
                     }
+                    case ConfigMenuItem::CycleInfoLevel: {
+                        int lvl = std::clamp(leaf->config.infoLevel, 1, 3);
+                        lvl = ((lvl - 1 + (dir < 0 ? -1 : 1)) % 3 + 3) % 3 + 1;
+                        leaf->config.infoLevel = lvl;
+                        return true;
+                    }
+                    default: return false;
+                }
+            };
+            if (e == Event::ArrowLeft || e == Event::ArrowRight) {
+                if (n > 0) {
+                    if (applyCyclable(items[ui.configMenu],
+                                       e == Event::ArrowLeft ? -1 : 1)) {
+                        persistLayout();
+                    }
+                }
+                return true;
+            }
+            if (e == Event::Return) {
+                const auto& item = items[ui.configMenu];
+                if (applyCyclable(item, 1)) {
+                    persistLayout();
+                    return true;
+                }
+                const auto action = item.kind;
+                switch (action) {
+                    // Cyclables handled above; the remaining actions
+                    // are one-shots that only respond to Enter.
+                    case ConfigMenuItem::CycleType:
+                    case ConfigMenuItem::CycleCategory:
+                    case ConfigMenuItem::CycleSort:
+                    case ConfigMenuItem::ToggleSortDir:
+                    case ConfigMenuItem::CycleOwnership:
+                    case ConfigMenuItem::CycleReconcileKind:
+                    case ConfigMenuItem::ToggleQuality:
+                    case ConfigMenuItem::CyclePaneWeight:
+                    case ConfigMenuItem::CycleInfoLevel:
+                        break;
                     case ConfigMenuItem::ClearBackupLog: {
                         std::lock_guard<std::mutex> g(ui.backupLogMutex);
                         ui.backupLog.clear();
