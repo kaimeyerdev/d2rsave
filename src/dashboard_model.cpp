@@ -773,7 +773,7 @@ DashboardSnapshot aggregateDashboardSnapshot(RefDb&              db,
             "       COALESCE(inm_idx.en_us, t.\"index\") AS display_name, "
             "       COALESCE(inm.en_us, b.name)         AS base_name, "
             "       t.item AS base_code, "
-            "       t.\"set\" AS set_name "
+            "       COALESCE(inm_set.en_us, t.\"set\") AS set_name "
             "FROM setitems t "
             "LEFT JOIN (SELECT code, name, namestr, quest FROM armor "
             "           UNION ALL SELECT code, name, namestr, quest FROM weapons "
@@ -781,6 +781,7 @@ DashboardSnapshot aggregateDashboardSnapshot(RefDb&              db,
             "  ON b.code = t.item "
             "LEFT JOIN item_names inm     ON inm.\"key\"     = b.namestr "
             "LEFT JOIN item_names inm_idx ON inm_idx.\"key\" = t.\"index\" "
+            "LEFT JOIN item_names inm_set ON inm_set.\"key\" = t.\"set\" "
             "WHERE t.id IS NOT NULL AND t.id != '' "
             "AND CAST(t.spawnable AS INT)=1 "
             "AND (t.disablechronicle IS NULL OR t.disablechronicle != '1') "
@@ -1108,7 +1109,9 @@ void clearSharedStashInSnapshot(DashboardSnapshot& snap) {
 // the ftxui layer can call it after applying the character + stash
 // byte overrides to a working snapshot.
 SessionAnchor makeSessionAnchorFromSnapshot(const DashboardSnapshot& snap,
-                                            std::int64_t             anchorEpoch) {
+                                            std::int64_t             anchorEpoch,
+                                            std::int64_t             sessionStartEpoch,
+                                            std::int64_t             sessionEndEpoch) {
     SessionAnchor out;
     out.hasActivePlayer = snap.hasActivePlayer;
     if (snap.hasActivePlayer) {
@@ -1117,7 +1120,9 @@ SessionAnchor makeSessionAnchorFromSnapshot(const DashboardSnapshot& snap,
         out.level        = snap.activePlayer.level;
         out.expInLevel   = snap.activePlayer.expInLevel;
     }
-    out.anchorEpoch = anchorEpoch;
+    out.anchorEpoch       = anchorEpoch;
+    out.sessionStartEpoch = sessionStartEpoch;
+    out.sessionEndEpoch   = sessionEndEpoch;
     // Pre-computed lookup set: identified Unique/Set items with a
     // non-zero fingerprint. Renderer's diff loop just probes contains().
     out.itemKeys.reserve(snap.inventory.size() / 8 + 16);

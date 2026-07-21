@@ -80,14 +80,6 @@ std::string formatWithThousands(std::uint64_t n) {
     return out;
 }
 
-std::string formatTime(std::uint64_t epoch) {
-    if (epoch == 0) return "-";
-    std::time_t t = static_cast<std::time_t>(epoch);
-    char buf[32] = {};
-    std::strftime(buf, sizeof(buf), "%H:%M:%S", std::localtime(&t));
-    return buf;
-}
-
 bool containsCI(std::string_view hay, std::string_view needle) {
     if (needle.empty()) return true;
     auto lc = [](unsigned char c) { return std::tolower(c); };
@@ -339,8 +331,8 @@ Element renderColossalAncients(const ColossalAncientsQuest& q) {
         text(" Colossal Ancients "),
         vbox({
             row("Talic's Anguish",       q.talicAnguish),
-            row("Madawc's Ire",          q.madawcIre),
             row("Korlic's Pain",         q.korlicPain),
+            row("Madawc's Ire",          q.madawcIre),
             row("Bul-Kathos' Nightmare", q.bulKathosNightmare),
             row("Worusk's End",          q.woruskEnd),
             separator(),
@@ -357,12 +349,6 @@ Element renderTerrorZones(const TerrorZones& t) {
             text(std::to_string(n)) | bold | align_right | size(WIDTH, EQUAL, 6),
         });
     };
-    auto zoneLine = [](const char* label, const std::optional<std::string>& z) {
-        return hbox({
-            text(label) | size(WIDTH, EQUAL, 12),
-            text(z.value_or("unavailable")) | (z ? bold : dim),
-        });
-    };
     return window(
         text(" Terror Zones "),
         vbox({
@@ -371,9 +357,6 @@ Element renderTerrorZones(const TerrorZones& t) {
             row("Southern Worldstone Shard", t.shardSouthern),
             row("Deep Worldstone Shard",     t.shardDeep),
             row("Northern Worldstone Shard", t.shardNorthern),
-            separator(),
-            zoneLine("Current : ", t.currentZone),
-            zoneLine("Next    : ", t.nextZone),
         })
     );
 }
@@ -1275,10 +1258,11 @@ Element renderSessionLeaf(const DashboardSnapshot& now,
     }
 
     Elements body;
-    // Header line: character + session duration since the anchor moment.
-    // Session duration uses the anchor's stamped epoch (S&E backup date)
-    // vs wall-clock `now`, so the display keeps advancing between
-    // snapshot rebuilds rather than freezing at the last refresh.
+    // Header line: character + session duration. Duration is the span
+    // between the oldest and newest backup of the CURRENT play session
+    // (see buildSessionAnchor for the session boundary definition).
+    // Backup-quantised on purpose -- a single-backup session reads as
+    // 0h 00m 00s, and the timer only changes when a new save lands.
     Elements header;
     if (now.hasActivePlayer) {
         header.push_back(text(now.activePlayer.name) | bold);
@@ -1287,11 +1271,12 @@ Element renderSessionLeaf(const DashboardSnapshot& now,
     } else {
         header.push_back(text("(no active player)") | dim);
     }
-    if (anchor->anchorEpoch != 0) {
-        const auto anchorEpoch = anchor->anchorEpoch;
-        const auto nowEpoch    = static_cast<std::int64_t>(std::time(nullptr));
-        std::int64_t secs = nowEpoch - anchorEpoch;
-        if (secs < 0) secs = 0;
+    {
+        std::int64_t secs = 0;
+        if (anchor->sessionStartEpoch != 0 && anchor->sessionEndEpoch != 0) {
+            secs = anchor->sessionEndEpoch - anchor->sessionStartEpoch;
+            if (secs < 0) secs = 0;
+        }
         const std::int64_t h =  secs / 3600;
         const std::int64_t m = (secs % 3600) / 60;
         const std::int64_t s =  secs % 60;
@@ -1842,9 +1827,7 @@ Element renderStatus(const UiState& ui, const DashboardSnapshot& s) {
         ? paneTitle(ui.leaves[ui.focusedLeaf]->config)
         : "-";
     std::string line;
-    line += "watching " + ui.watchedPath;
-    line += "  |  last refresh " + formatTime(s.refreshedAtEpoch);
-    line += "  |  " + std::to_string(s.inventory.size()) + " items indexed";
+    line += std::to_string(s.inventory.size()) + " items indexed";
     line += "  |  panes " + std::to_string(ui.leaves.size());
     line += "  |  focus: " + focus;
     line += "  |  mode: " + mode;
@@ -2093,12 +2076,34 @@ int runDashboard(const std::filesystem::path& savePath,
         if (filename.empty()) return anchorFromCurrent();
 
         // Step 1: resolve the CHARACTER-side anchor date (row lookup).
-        std::optional<BackupDb::Row> row;
-        std::int64_t                 anchorDate = 0;
+        // Also compute the CURRENT session's oldest/newest backup dates
+        // -- consumed later by the pane's duration display. Definitions:
+        //   * "Current session" = all backups newer than the boundary
+        //     S&E (auto mode), or newer than the pinned date (pinned).
+        //     When hist[0] itself is an S&E (just-quit case), the
+        //     terminating S&E is part of that session too.
+        //   * "No S&E on record" fallback: treat the entire history
+        //     as one session -- newest to oldest.
+        //   * Pinned + no newer backups: session window collapses to
+        //     the pin (rendered as 0h 00m 00s).
+        std::optional<BackupDb::Row>      row;
+        std::int64_t                      anchorDate        = 0;
+        std::int64_t                      sessionStartEpoch = 0;
+        std::int64_t                      sessionEndEpoch   = 0;
+        std::vector<BackupDb::HistoryRow> hist;
+        try { hist = backupDb->historyFor(filename, 200); }
+        catch (const std::exception&) {}
         if (pinnedDate) {
             try { row = backupDb->at(filename, *pinnedDate); }
             catch (const std::exception&) { row.reset(); }
             if (row) anchorDate = *pinnedDate;
+            // Session window = newest backup with date > pin down to
+            // the oldest such. If none, both stay 0 -> renders as 0.
+            for (const auto& h : hist) {
+                if (h.date <= *pinnedDate) break;   // hist is date DESC
+                if (sessionEndEpoch == 0) sessionEndEpoch = h.date;
+                sessionStartEpoch = h.date;
+            }
         } else {
             // Auto mode: the anchor is the LATEST SAVE of the PREVIOUS
             // session -- i.e., the S&E that ended it. Diff = latest save
@@ -2120,9 +2125,6 @@ int runDashboard(const std::filesystem::path& savePath,
             //     the oldest known save so the diff still says something
             //     (represents "everything since the DB started tracking
             //     this character").
-            std::vector<BackupDb::HistoryRow> hist;
-            try { hist = backupDb->historyFor(filename, 200); }
-            catch (const std::exception&) { return anchorFromCurrent(); }
             if (hist.empty()) return anchorFromCurrent();
             const int seThreshold =
                 (hist.front().state == BackupDb::State::SaveAndExit) ? 2 : 1;
@@ -2140,6 +2142,25 @@ int runDashboard(const std::filesystem::path& savePath,
             try { row = backupDb->at(filename, pick.date); }
             catch (const std::exception&) { row.reset(); }
             if (row) anchorDate = pick.date;
+
+            // Session window: current session's backup range.
+            // Boundary present: hist[0..boundaryIdx-1] are strictly
+            // newer than the boundary S&E and belong to the current
+            // session. In the just-quit case (hist[0] is S&E)
+            // boundaryIdx points at the PREVIOUS session's S&E, so
+            // hist[0..boundaryIdx-1] still correctly captures the
+            // just-ended session INCLUDING its terminating S&E.
+            // No boundary: treat the entire history as the session.
+            if (boundaryIdx > 0) {
+                sessionEndEpoch   = hist.front().date;
+                sessionStartEpoch = hist[static_cast<std::size_t>(boundaryIdx - 1)].date;
+            } else if (boundaryIdx < 0 && !hist.empty()) {
+                sessionEndEpoch   = hist.front().date;
+                sessionStartEpoch = hist.back().date;
+            }
+            // boundaryIdx == 0: current session is empty (hist[0] is
+            // the previous session's S&E itself, or a just-quit with
+            // no PRIOR session). Leave both at 0 -> renders as 0.
         }
         if (!row || row->data.empty()) return anchorFromCurrent();
 
@@ -2187,7 +2208,20 @@ int runDashboard(const std::filesystem::path& savePath,
             pinnedDate.value_or(0),
         };
         if (ui.sessionAnchor && ui.sessionAnchorCacheKey == key) {
-            return ui.sessionAnchor;
+            // Item-diff fields (playerName/level/itemKeys) are still
+            // valid, but the session window advances every time a new
+            // autosave lands. Clone-and-patch is cheap (itemKeys uses
+            // shallow copy of the same hash buckets) and lets the
+            // timer stay live during autosave bursts without paying
+            // for the deep byte-parse in the miss path below.
+            if (ui.sessionAnchor->sessionStartEpoch == sessionStartEpoch &&
+                ui.sessionAnchor->sessionEndEpoch   == sessionEndEpoch) {
+                return ui.sessionAnchor;
+            }
+            auto patched = std::make_shared<SessionAnchor>(*ui.sessionAnchor);
+            patched->sessionStartEpoch = sessionStartEpoch;
+            patched->sessionEndEpoch   = sessionEndEpoch;
+            return patched;
         }
 
         // Step 4: miss path -- build a fresh anchor. Start from a
@@ -2214,7 +2248,9 @@ int runDashboard(const std::filesystem::path& savePath,
         }
 
         auto anchor = std::make_shared<SessionAnchor>(
-            makeSessionAnchorFromSnapshot(temp, anchorDate));
+            makeSessionAnchorFromSnapshot(temp, anchorDate,
+                                          sessionStartEpoch,
+                                          sessionEndEpoch));
         ui.sessionAnchorCacheKey = key;
         return anchor;
 #else

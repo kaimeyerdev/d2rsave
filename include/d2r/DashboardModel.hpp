@@ -332,9 +332,18 @@ struct SessionAnchor {
     std::uint32_t  level           = 0;
     std::uint64_t  expInLevel      = 0;
     // When the anchor was taken (unix seconds; 0 when unavailable).
-    // The Session pane subtracts this from wall-clock time to render
-    // the elapsed session duration.
+    // This is the boundary S&E that separates the previous session from
+    // the current one; the item-diff loop uses it as the reference
+    // point, but the pane's duration display uses the two epochs below.
     std::int64_t   anchorEpoch     = 0;
+    // Oldest and newest backup dates observed within the CURRENT play
+    // session (the range of saves newer than `anchorEpoch`, or the
+    // whole history in the fallback "no S&E on record" case). Both 0
+    // when the current session has no backups yet. The Session pane
+    // renders `sessionEndEpoch - sessionStartEpoch` as elapsed play
+    // time; a single-backup session therefore reads as 0.
+    std::int64_t   sessionStartEpoch = 0;
+    std::int64_t   sessionEndEpoch   = 0;
     // Pre-computed set of (fingerprint, quality) for every identified
     // Unique / Set item that existed in the anchor's character-side
     // AND shared-stash inventory. The renderer's diff loop only needs
@@ -346,10 +355,14 @@ struct SessionAnchor {
 // Extract a SessionAnchor from a fully-populated DashboardSnapshot.
 // Used by the ftxui layer after overlaying the anchor bytes onto a
 // working DashboardSnapshot. `anchorEpoch` should be the unix time of
-// the underlying backup row (character-side); it drives the pane's
-// duration display.
+// the underlying backup row (character-side); `sessionStartEpoch` and
+// `sessionEndEpoch` bound the current play session's backup range and
+// drive the pane's duration display.
 [[nodiscard]] SessionAnchor makeSessionAnchorFromSnapshot(
-    const DashboardSnapshot& snap, std::int64_t anchorEpoch);
+    const DashboardSnapshot& snap,
+    std::int64_t             anchorEpoch,
+    std::int64_t             sessionStartEpoch = 0,
+    std::int64_t             sessionEndEpoch   = 0);
 
 // Experience needed to reach `level` from a fresh character. Levels
 // outside [1..99] clamp to the boundary. Values are the standard D2/D2R
