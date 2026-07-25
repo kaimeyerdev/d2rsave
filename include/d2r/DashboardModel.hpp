@@ -46,12 +46,17 @@ struct ActivePlayer {
 
 // Hellfire Torch side-quest counts. `torchesHellfire` counts the actual
 // unique Hellfire Torch (cm2 large charm, uniqueId 400); stackable inputs
-// (keys) are summed by stack size, not item count.
+// (keys) are summed by stack size, not item count. The three uber-boss
+// drops (Diablo's Horn / Mephisto's Brain / Baal's Eye) are the outputs
+// from running the ubers; the Uber pane groups them alongside the keys.
 struct HellfireTorchQuest {
     std::uint32_t keysTerror       = 0;   // pk1 (stackable)
     std::uint32_t keysHate         = 0;   // pk2 (stackable)
     std::uint32_t keysDestruction  = 0;   // pk3 (stackable)
     std::uint32_t torchesHellfire  = 0;   // unique cm2
+    std::uint32_t diablosHorn      = 0;   // dhn (uber drop)
+    std::uint32_t mephistosBrain   = 0;   // mbr (uber drop)
+    std::uint32_t baalsEye         = 0;   // bey (uber drop)
 };
 
 // Colossal Ancients side-quest materials. Codes ua1..ua5 correspond to the

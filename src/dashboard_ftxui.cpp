@@ -769,6 +769,101 @@ Element renderSessionLootPane(const PaneConfig&        cfg,
                   vbox(std::move(body)) | vscroll_indicator | yframe | flex);
 }
 
+// -----------------------------------------------------------------------
+// Uber pane (configurable top-row): keys + torch + optional uber-boss
+// drops + Ancients statues + optional per-class Hellfire Torch tally.
+// -----------------------------------------------------------------------
+
+Element renderUberPane(const PaneConfig&         cfg,
+                       const DashboardSnapshot&  s,
+                       const DashboardFileCache& cache,
+                       bool                      focused) {
+    Element titleEl = text(" Uber ");
+    if (focused) titleEl = titleEl | inverted;
+
+    // Compact "label ......  N" row. Right-aligned count column of
+    // fixed width so a stack of rows lines up.
+    auto row = [](const char* label, std::uint32_t n, int labelWidth = 22) {
+        return hbox({
+            text(label) | size(WIDTH, EQUAL, labelWidth),
+            filler(),
+            text(std::to_string(n)) | bold | align_right | size(WIDTH, EQUAL, 6),
+        });
+    };
+
+    const auto& hf = s.hellfireTorch;
+    const auto& ca = s.colossalAncients;
+
+    Elements body;
+
+    // ---- Keys + Torch (always visible) ----
+    body.push_back(row("Key of Terror",       hf.keysTerror));
+    body.push_back(row("Key of Hate",         hf.keysHate));
+    body.push_back(row("Key of Destruction",  hf.keysDestruction));
+    body.push_back(row("Hellfire Torch",      hf.torchesHellfire));
+
+    // ---- Uber drops (optional) ----
+    if (cfg.uberShowUbers) {
+        body.push_back(separator());
+        body.push_back(row("Diablo's Horn",     hf.diablosHorn));
+        body.push_back(row("Mephisto's Brain",  hf.mephistosBrain));
+        body.push_back(row("Baal's Eye",        hf.baalsEye));
+    }
+
+    // ---- Ancients (always visible) ----
+    body.push_back(separator());
+    body.push_back(row("Talic's Anguish",       ca.talicAnguish));
+    body.push_back(row("Korlic's Pain",         ca.korlicPain));
+    body.push_back(row("Madawc's Ire",          ca.madawcIre));
+    body.push_back(row("Bul-Kathos' Nightmare", ca.bulKathosNightmare));
+    body.push_back(row("Worusk's End",          ca.woruskEnd));
+
+    // ---- Torch by class (optional) ----
+    if (cfg.uberShowTorchByClass) {
+        body.push_back(separator());
+        body.push_back(text(" Torches by class ") | bold | color(kHighlightColor));
+
+        // Aggregate per-character-owned torches by that character's class.
+        // Iterate the file cache directly rather than walking snap.inventory
+        // since D2sEntry.hellfire.torchesHellfire is already per-file.
+        std::unordered_map<CharacterClass, std::uint32_t> byClass;
+        std::uint32_t stashTorches = 0;
+        for (const auto& [name, entry] : cache.d2s) {
+            if (entry.hellfire.torchesHellfire == 0) continue;
+            byClass[entry.character.characterClass] += entry.hellfire.torchesHellfire;
+        }
+        if (cache.stash) {
+            stashTorches = cache.stash->hellfire.torchesHellfire;
+        }
+
+        // Stable render order: Amazon, Sorc, Nec, Pal, Barb, Druid, Assn,
+        // Stash. Rows with zero counts are dimmed so the pane still
+        // fits a compact height with 8 slots.
+        struct Row { const char* label; std::uint32_t count; };
+        std::vector<Row> rows{
+            {"Amazon",      byClass[CharacterClass::Amazon]},
+            {"Sorceress",   byClass[CharacterClass::Sorceress]},
+            {"Necromancer", byClass[CharacterClass::Necromancer]},
+            {"Paladin",     byClass[CharacterClass::Paladin]},
+            {"Barbarian",   byClass[CharacterClass::Barbarian]},
+            {"Druid",       byClass[CharacterClass::Druid]},
+            {"Assassin",    byClass[CharacterClass::Assassin]},
+            {"Stash",       stashTorches},
+        };
+        for (const auto& r : rows) {
+            auto lineHbox = hbox({
+                text(std::string(" ") + r.label) | size(WIDTH, EQUAL, 22),
+                filler(),
+                text(std::to_string(r.count)) | bold | align_right | size(WIDTH, EQUAL, 6),
+            });
+            body.push_back(r.count == 0 ? (lineHbox | dim) : lineHbox);
+        }
+    }
+
+    return window(titleEl,
+                  vbox(std::move(body)) | vscroll_indicator | yframe | flex);
+}
+
 // -------------------------- chronicle rendering -----------------------------
 
 std::string sortKeyLabel(PaneSortKey k) {
@@ -2406,6 +2501,9 @@ struct ConfigMenuItem {
         UnpinSessionAnchor,
         PickCharacter,
         ResetCharacterToAuto,
+        ToggleUberShowUbers,
+        ToggleUberShowTorchByClass,
+        ToggleSessionLootShowRunes,
         CyclePaneWeight,
         CycleInfoLevel,
         SplitVertical, SplitHorizontal, DeletePane, Close,
@@ -2505,6 +2603,22 @@ std::vector<ConfigMenuItem> buildConfigMenu(const PaneConfig& c, bool canDelete)
             items.push_back({"reset character to auto (newest saved)",
                               ConfigMenuItem::ResetCharacterToAuto});
         }
+    }
+    if (c.type == PaneType::Uber) {
+        items.push_back({
+            std::string("show uber drops:      ")
+              + (c.uberShowUbers ? "on" : "off"),
+            ConfigMenuItem::ToggleUberShowUbers});
+        items.push_back({
+            std::string("show torch by class:  ")
+              + (c.uberShowTorchByClass ? "on" : "off"),
+            ConfigMenuItem::ToggleUberShowTorchByClass});
+    }
+    if (c.type == PaneType::SessionLoot) {
+        items.push_back({
+            std::string("show new runes:       ")
+              + (c.sessionLootShowRunes ? "on" : "off"),
+            ConfigMenuItem::ToggleSessionLootShowRunes});
     }
     // Size weight is universal -- affects width in a vertical (side-
     // by-side) parent and height in a horizontal (stacked) parent.
@@ -2660,11 +2774,10 @@ Element renderPane(PaneNode& node, const UiState& ui,
             leafEl = renderSessionLootPane(node.config, s,
                                             ui.sessionAnchor.get(), focused);
             break;
-        // TODO(dashboard-redesign phases 4-5): real renderers land in the
-        // following phases. Until then, these fall through to the same
-        // blank placeholder so the pane type is selectable via the
-        // config menu without crashing the layout.
         case PaneType::Uber:
+            leafEl = renderUberPane(node.config, s, ui.fileCache, focused);
+            break;
+        // TODO(dashboard-redesign phase 5): real renderer for TerrorZone.
         case PaneType::TerrorZone:
             leafEl = renderBlankLeaf(focused);
             break;
@@ -3771,6 +3884,21 @@ int runDashboard(const std::filesystem::path& savePath,
                     case ConfigMenuItem::ResetCharacterToAuto: {
                         leaf->config.characterSelection.clear();
                         ui.configMode = false;
+                        persistLayout();
+                        break;
+                    }
+                    case ConfigMenuItem::ToggleUberShowUbers: {
+                        leaf->config.uberShowUbers = !leaf->config.uberShowUbers;
+                        persistLayout();
+                        break;
+                    }
+                    case ConfigMenuItem::ToggleUberShowTorchByClass: {
+                        leaf->config.uberShowTorchByClass = !leaf->config.uberShowTorchByClass;
+                        persistLayout();
+                        break;
+                    }
+                    case ConfigMenuItem::ToggleSessionLootShowRunes: {
+                        leaf->config.sessionLootShowRunes = !leaf->config.sessionLootShowRunes;
                         persistLayout();
                         break;
                     }

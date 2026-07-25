@@ -251,6 +251,9 @@ void countQuestItem(const Item& it,
     if      (code == "pk1") hf.keysTerror      += qty;
     else if (code == "pk2") hf.keysHate        += qty;
     else if (code == "pk3") hf.keysDestruction += qty;
+    else if (code == "dhn") hf.diablosHorn     += qty;
+    else if (code == "mbr") hf.mephistosBrain  += qty;
+    else if (code == "bey") hf.baalsEye        += qty;
     else if (code == "ua1") ca.talicAnguish       += qty;
     else if (code == "ua2") ca.korlicPain         += qty;   // ua2 = Korlic (not Madawc)
     else if (code == "ua3") ca.madawcIre          += qty;
@@ -443,6 +446,9 @@ void mergeQuestCounts(HellfireTorchQuest&       dst,
     dst.keysHate        += src.keysHate;
     dst.keysDestruction += src.keysDestruction;
     dst.torchesHellfire += src.torchesHellfire;
+    dst.diablosHorn     += src.diablosHorn;
+    dst.mephistosBrain  += src.mephistosBrain;
+    dst.baalsEye        += src.baalsEye;
 }
 void mergeQuestCounts(ColossalAncientsQuest&       dst,
                       const ColossalAncientsQuest& src) {
