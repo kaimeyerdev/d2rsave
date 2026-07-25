@@ -864,6 +864,35 @@ Element renderUberPane(const PaneConfig&         cfg,
                   vbox(std::move(body)) | vscroll_indicator | yframe | flex);
 }
 
+// -----------------------------------------------------------------------
+// Terror Zone pane (configurable top-row): the five Worldstone shard
+// tallies from the current terror-zone rotation drops. No configurable
+// options today; kept as its own pane type so it can slot into any
+// layout position.
+// -----------------------------------------------------------------------
+
+Element renderTerrorZonePane(const DashboardSnapshot& s, bool focused) {
+    Element titleEl = text(" Terror Zone ");
+    if (focused) titleEl = titleEl | inverted;
+
+    auto row = [](const char* label, std::uint32_t n) {
+        return hbox({
+            text(label) | size(WIDTH, EQUAL, 28),
+            filler(),
+            text(std::to_string(n)) | bold | align_right | size(WIDTH, EQUAL, 6),
+        });
+    };
+
+    const auto& t = s.terrorZones;
+    return window(titleEl, vbox({
+        row("Western Worldstone Shard",  t.shardWestern),
+        row("Eastern Worldstone Shard",  t.shardEastern),
+        row("Southern Worldstone Shard", t.shardSouthern),
+        row("Deep Worldstone Shard",     t.shardDeep),
+        row("Northern Worldstone Shard", t.shardNorthern),
+    }));
+}
+
 // -------------------------- chronicle rendering -----------------------------
 
 std::string sortKeyLabel(PaneSortKey k) {
@@ -2777,9 +2806,8 @@ Element renderPane(PaneNode& node, const UiState& ui,
         case PaneType::Uber:
             leafEl = renderUberPane(node.config, s, ui.fileCache, focused);
             break;
-        // TODO(dashboard-redesign phase 5): real renderer for TerrorZone.
         case PaneType::TerrorZone:
-            leafEl = renderBlankLeaf(focused);
+            leafEl = renderTerrorZonePane(s, focused);
             break;
     }
     // Pin the leaf so ftxui doesn't grow it to fit larger content (which
