@@ -796,6 +796,28 @@ DashboardSnapshot aggregateDashboardSnapshot(RefDb&              db,
 
     // Uniques.
     {
+        // Rainbow Facet variants (uniqueids 392..399) all share the
+        // display name "Rainbow Facet" but differ by element proc +
+        // trigger. Bake a distinguishing suffix into displayName so
+        // every renderer (chronicle, reconcile, search) can tell them
+        // apart without new plumbing. Derived from the game data
+        // (data/sql/08_uniqueitems.sql:485-492) which is fixed at
+        // 8 combinations of {Lightning,Cold,Fire,Poison} x {Death,
+        // Level-Up}.
+        auto rainbowFacetSuffix = [](std::uint32_t id) -> const char* {
+            switch (id) {
+                case 392: return "Lightning (Death)";
+                case 393: return "Cold (Death)";
+                case 394: return "Fire (Death)";
+                case 395: return "Poison (Death)";
+                case 396: return "Lightning (Level-Up)";
+                case 397: return "Cold (Level-Up)";
+                case 398: return "Fire (Level-Up)";
+                case 399: return "Poison (Level-Up)";
+                default:  return nullptr;
+            }
+        };
+
         auto st = db.prepare(
             "SELECT t.id, "
             "       COALESCE(inm_idx.en_us, t.\"index\") AS display_name, "
@@ -819,6 +841,10 @@ DashboardSnapshot aggregateDashboardSnapshot(RefDb&              db,
             r.kind        = ChronicleKind::Unique;
             r.id          = static_cast<std::uint32_t>(st.columnInt64(0));
             r.displayName = st.columnText(1);
+            if (const char* suf = rainbowFacetSuffix(r.id)) {
+                r.displayName += " \xE2\x80\x94 ";   // em dash
+                r.displayName += suf;
+            }
             r.baseName    = st.columnText(2);
             const auto baseCode = st.columnText(3);
             r.baseCode    = baseCode;
