@@ -626,6 +626,149 @@ Element renderCharacterPane(const PaneConfig&        cfg,
     return window(titleEl, vbox(std::move(body)) | vscroll_indicator | frame);
 }
 
+// -----------------------------------------------------------------------
+// Session Loot pane (configurable top-row): new uniques, sets, and
+// runes gained during the current play session. Diffs the snapshot's
+// inventory against the SessionAnchor's item keys (for uniques/sets)
+// and against the anchor's rune stack map (for runes).
+// -----------------------------------------------------------------------
+
+// True when `code` is a rune base code -- r00..r99 shape. Runes actually
+// stop at r33 today, but the predicate stays code-shape rather than
+// value-bound so a future expansion doesn't silently drop matches.
+bool isRuneCode(const std::string& code) {
+    return code.size() == 3
+        && code[0] == 'r'
+        && code[1] >= '0' && code[1] <= '9'
+        && code[2] >= '0' && code[2] <= '9';
+}
+
+Element renderSessionLootPane(const PaneConfig&        cfg,
+                              const DashboardSnapshot& s,
+                              const SessionAnchor*     anchor,
+                              bool                     focused) {
+    Element titleEl = text(" Session Loot ");
+    if (focused) titleEl = titleEl | inverted;
+
+    if (!anchor) {
+        return window(titleEl, vbox({
+            filler(),
+            hbox({ filler(),
+                   text("Session anchor not yet initialised.") | dim,
+                   filler() }),
+            filler(),
+        }));
+    }
+
+    // ---- Uniques / Sets diff ----
+    // Identified named items not present in the anchor's key set. Same
+    // logic that used to live inside renderSessionLeaf.
+    std::vector<const InventoryItem*> newUniques;
+    std::vector<const InventoryItem*> newSets;
+    for (const auto& it : s.inventory) {
+        if (!it.identified) continue;
+        if (it.fingerprint == 0) continue;
+        if (it.quality != ItemQuality::Unique && it.quality != ItemQuality::Set)
+            continue;
+        if (anchor->itemKeys.contains({it.fingerprint, it.quality})) continue;
+        (it.quality == ItemQuality::Unique ? newUniques : newSets).push_back(&it);
+    }
+
+    // ---- Runes diff ----
+    // Build "now" per-code counts by scanning inventory; subtract the
+    // anchor's stacks; keep only positive deltas. Look up display
+    // names from the current inventory (one exemplar item per code).
+    struct RuneDelta {
+        std::string  code;
+        std::string  name;
+        std::int32_t delta = 0;   // positive only
+    };
+    std::vector<RuneDelta> runeDeltas;
+    if (cfg.sessionLootShowRunes) {
+        std::unordered_map<std::string, std::uint32_t> nowStacks;
+        std::unordered_map<std::string, std::string>   nameByCode;
+        for (const auto& it : s.inventory) {
+            if (!isRuneCode(it.code)) continue;
+            ++nowStacks[it.code];
+            // First occurrence wins; runes always share the same name
+            // for a given code so any exemplar is fine.
+            nameByCode.try_emplace(it.code, it.name);
+        }
+        for (const auto& [code, now] : nowStacks) {
+            const auto it = anchor->runeStacks.find(code);
+            const std::uint32_t before = (it == anchor->runeStacks.end()) ? 0u : it->second;
+            if (now > before) {
+                RuneDelta d;
+                d.code  = code;
+                d.name  = nameByCode.count(code) ? nameByCode[code] : code;
+                d.delta = static_cast<std::int32_t>(now - before);
+                runeDeltas.push_back(std::move(d));
+            }
+        }
+        // Runes sort in tier order (r01 lowest, r33 highest) which is
+        // also lexicographic on the 3-char code.
+        std::sort(runeDeltas.begin(), runeDeltas.end(),
+                  [](const RuneDelta& a, const RuneDelta& b) {
+                      return a.code < b.code;
+                  });
+    }
+
+    // ---- Render helpers ----
+    auto renderItemList = [](std::string_view header,
+                             const std::vector<const InventoryItem*>& xs) {
+        Elements rows;
+        rows.push_back(hbox({
+            text(std::string(header)) | bold | color(kHighlightColor),
+            text("  "),
+            text("(" + std::to_string(xs.size()) + ")") | dim,
+        }));
+        if (xs.empty()) {
+            rows.push_back(text("  (none)") | dim);
+        } else {
+            for (const auto* it : xs) {
+                rows.push_back(hbox({
+                    text("  "),
+                    text(it->name) | flex,
+                    text("  "),
+                    text(it->location) | dim,
+                }));
+            }
+        }
+        return vbox(std::move(rows));
+    };
+
+    Elements body;
+    body.push_back(renderItemList("New Uniques", newUniques));
+    body.push_back(text(""));
+    body.push_back(renderItemList("New Sets", newSets));
+
+    if (cfg.sessionLootShowRunes) {
+        body.push_back(text(""));
+        Elements runeRows;
+        runeRows.push_back(hbox({
+            text("New Runes") | bold | color(kHighlightColor),
+            text("  "),
+            text("(" + std::to_string(runeDeltas.size()) + ")") | dim,
+        }));
+        if (runeDeltas.empty()) {
+            runeRows.push_back(text("  (none)") | dim);
+        } else {
+            for (const auto& d : runeDeltas) {
+                runeRows.push_back(hbox({
+                    text("  "),
+                    text(d.name) | flex,
+                    text("  "),
+                    text("+" + std::to_string(d.delta)) | bold | color(kHighlightColor),
+                }));
+            }
+        }
+        body.push_back(vbox(std::move(runeRows)));
+    }
+
+    return window(titleEl,
+                  vbox(std::move(body)) | vscroll_indicator | yframe | flex);
+}
+
 // -------------------------- chronicle rendering -----------------------------
 
 std::string sortKeyLabel(PaneSortKey k) {
@@ -2034,45 +2177,14 @@ Element renderSessionLeaf(const DashboardSnapshot& now,
     }));
     body.push_back(separator());
 
-    // New identified Uniques / Sets since anchor. Diff by fingerprint
-    // against the pre-computed anchor->itemKeys set (built once at
-    // anchor construction time; no per-render hash rebuild).
-    std::vector<const InventoryItem*> newUniques;
-    std::vector<const InventoryItem*> newSets;
-    for (const auto& it : now.inventory) {
-        if (!it.identified) continue;
-        if (it.fingerprint == 0) continue;
-        if (it.quality != ItemQuality::Unique && it.quality != ItemQuality::Set)
-            continue;
-        if (anchor->itemKeys.contains({it.fingerprint, it.quality})) continue;
-        (it.quality == ItemQuality::Unique ? newUniques : newSets).push_back(&it);
-    }
-
-    auto renderItemList = [](std::string_view header,
-                             const std::vector<const InventoryItem*>& xs) {
-        Elements rows;
-        rows.push_back(hbox({
-            text(std::string(header)) | bold,
-            text("  "),
-            text("(" + std::to_string(xs.size()) + ")") | dim,
-        }));
-        if (xs.empty()) {
-            rows.push_back(text("  (none)") | dim);
-        } else {
-            for (const auto* it : xs) {
-                rows.push_back(hbox({
-                    text("  "),
-                    text(it->name) | flex,
-                    text("  "),
-                    text(it->location) | dim,
-                }));
-            }
-        }
-        return vbox(std::move(rows));
-    };
-    body.push_back(renderItemList("New Uniques", newUniques));
-    body.push_back(text(""));
-    body.push_back(renderItemList("New Sets", newSets));
+    // New-item lists (uniques / sets / runes since the anchor) moved
+    // to PaneType::SessionLoot as part of the configurable-top-row
+    // work. This bottom-row pane now focuses purely on XP + duration;
+    // add a Session Loot pane to see the loot rundown.
+    body.push_back(text("Add a 'Session Loot' pane to see new items,")
+                   | dim);
+    body.push_back(text("uniques, and rune drops for this session.")
+                   | dim);
 
     Element footer = text(" reset anchor from [c] configure ") | dim;
     return window(titleEl, vbox({
@@ -2544,11 +2656,14 @@ Element renderPane(PaneNode& node, const UiState& ui,
                                           ui.fileCache, focused,
                                           node.config.sessionAnchorPinned);
             break;
-        // TODO(dashboard-redesign phases 3-5): real renderers land in the
+        case PaneType::SessionLoot:
+            leafEl = renderSessionLootPane(node.config, s,
+                                            ui.sessionAnchor.get(), focused);
+            break;
+        // TODO(dashboard-redesign phases 4-5): real renderers land in the
         // following phases. Until then, these fall through to the same
         // blank placeholder so the pane type is selectable via the
         // config menu without crashing the layout.
-        case PaneType::SessionLoot:
         case PaneType::Uber:
         case PaneType::TerrorZone:
             leafEl = renderBlankLeaf(focused);

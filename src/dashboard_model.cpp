@@ -319,6 +319,7 @@ DashboardFileCache::D2sEntry parseD2sIntoEntry(
             InventoryItem inv;
             inv.name        = primaryName(db, it);
             inv.baseName    = lookupBaseName(db, it.code);
+            inv.code        = it.code;
             inv.location    = loc;
             inv.quality     = it.quality;
             inv.fingerprint = it.fingerprint;
@@ -342,6 +343,7 @@ DashboardFileCache::D2sEntry parseD2sIntoEntry(
                 InventoryItem sInv;
                 sInv.name        = primaryName(db, s);
                 sInv.baseName    = lookupBaseName(db, s.code);
+                sInv.code        = s.code;
                 sInv.location    = loc;
                 sInv.quality     = s.quality;
                 sInv.fingerprint = s.fingerprint;
@@ -401,6 +403,7 @@ DashboardFileCache::D2iEntry parseD2iIntoEntry(
             InventoryItem inv;
             inv.name        = primaryName(db, it);
             inv.baseName    = lookupBaseName(db, it.code);
+            inv.code        = it.code;
             inv.location    = loc;
             inv.quality     = it.quality;
             inv.fingerprint = it.fingerprint;
@@ -416,6 +419,7 @@ DashboardFileCache::D2iEntry parseD2iIntoEntry(
                 InventoryItem sInv;
                 sInv.name        = primaryName(db, s);
                 sInv.baseName    = lookupBaseName(db, s.code);
+                sInv.code        = s.code;
                 sInv.location    = loc;
                 sInv.quality     = s.quality;
                 sInv.fingerprint = s.fingerprint;
@@ -1027,6 +1031,7 @@ bool overrideActivePlayerFromBytes(DashboardSnapshot&         snap,
                 InventoryItem inv;
                 inv.name        = primaryName(db, it);
                 inv.baseName    = lookupBaseName(db, it.code);
+                inv.code        = it.code;
                 inv.location    = loc;
                 inv.quality     = it.quality;
                 inv.fingerprint = it.fingerprint;
@@ -1036,6 +1041,7 @@ bool overrideActivePlayerFromBytes(DashboardSnapshot&         snap,
                     InventoryItem sInv;
                     sInv.name        = primaryName(db, s);
                     sInv.baseName    = lookupBaseName(db, s.code);
+                    sInv.code        = s.code;
                     sInv.location    = loc;
                     sInv.quality     = s.quality;
                     sInv.fingerprint = s.fingerprint;
@@ -1135,6 +1141,7 @@ bool overrideSharedStashFromBytes(DashboardSnapshot&         snap,
             InventoryItem inv;
             inv.name        = primaryName(db, it);
             inv.baseName    = lookupBaseName(db, it.code);
+            inv.code        = it.code;
             inv.location    = loc;
             inv.quality     = it.quality;
             inv.fingerprint = it.fingerprint;
@@ -1144,6 +1151,7 @@ bool overrideSharedStashFromBytes(DashboardSnapshot&         snap,
                 InventoryItem sInv;
                 sInv.name        = primaryName(db, s);
                 sInv.baseName    = lookupBaseName(db, s.code);
+                sInv.code        = s.code;
                 sInv.location    = loc;
                 sInv.quality     = s.quality;
                 sInv.fingerprint = s.fingerprint;
@@ -1195,6 +1203,18 @@ SessionAnchor makeSessionAnchorFromSnapshot(const DashboardSnapshot& snap,
             continue;
         if (it.fingerprint == 0) continue;
         out.itemKeys.insert({it.fingerprint, it.quality});
+    }
+
+    // Rune counts per base code -- one entry per rune instance in the
+    // anchor's inventory. Session Loot pane subtracts these from the
+    // current snapshot's per-code counts to surface positive deltas.
+    // Filter: code begins with 'r' and is exactly 3 chars ("r01".."r33").
+    for (const auto& it : snap.inventory) {
+        if (it.code.size() == 3 && it.code[0] == 'r'
+            && it.code[1] >= '0' && it.code[1] <= '9'
+            && it.code[2] >= '0' && it.code[2] <= '9') {
+            ++out.runeStacks[it.code];
+        }
     }
     return out;
 }

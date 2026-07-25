@@ -17,6 +17,7 @@ add_executable(d2rsave_tests
     test_backup_scheduler.cpp
     test_recovery.cpp
     test_dashboard_config.cpp
+    test_dashboard_model.cpp
 )
 target_link_libraries(d2rsave_tests PRIVATE
     d2rsave_core

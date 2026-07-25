@@ -151,12 +151,16 @@ if(D2R_USE_VCPKG)
             message(WARNING "d2rsave: nlohmann_json missing; dashboard config persistence disabled.")
         endif()
 
+        # Dashboard data model (buildSnapshot, incremental file cache,
+        # SessionAnchor). Pure C++, no FTXUI, so it lives in d2rsave_core
+        # alongside the config; tests exercise the SessionAnchor helpers.
+        target_sources(d2rsave_core PRIVATE src/dashboard_model.cpp)
+
         find_package(ftxui CONFIG QUIET)
         if(TARGET ftxui::screen AND TARGET ftxui::dom AND TARGET ftxui::component
            AND TARGET nlohmann_json::nlohmann_json)
             message(STATUS "d2rsave: ftxui available; enabling 'dashboard' subcommand.")
             target_sources(d2rsave PRIVATE
-                src/dashboard_model.cpp
                 src/dashboard_ftxui.cpp
             )
             target_link_libraries(d2rsave PRIVATE

@@ -134,6 +134,12 @@ struct InventoryItem {
     std::string      name;         // primary display name
     std::string      baseName;     // base item type (may equal name)
     std::string      location;     // e.g. "Kai.d2s" or "stash tab 3"
+    // Base item code (3 chars, e.g. "r15" for Hel Rune, "pk1" for Key
+    // of Terror). Used by the Session Loot pane to bucket runes by
+    // code without a name-string dance; empty when the item didn't
+    // come from a base-code source (defensive; the aggregator always
+    // fills this today).
+    std::string      code;
     ItemQuality      quality  = ItemQuality::None;
     // Per-instance identity read from item bytes. Populated for magic-
     // and-better items (D2R stores it in the extended block); left at 0
@@ -390,6 +396,14 @@ struct SessionAnchor {
     // to query `itemKeys.contains(...)` per current item -- no
     // per-render hash-set rebuild.
     std::unordered_set<SessionAnchorItemKey, SessionAnchorItemKeyHash> itemKeys;
+
+    // Rune counts at anchor time, keyed on base code (r01..r33). The
+    // Session Loot pane diffs these against the current snapshot's
+    // per-code counts to surface newly-picked-up runes. Runes are
+    // stackable-by-code (each rune is its own InventoryItem instance),
+    // so this is a straight count-of-instances map rather than a
+    // stack-size sum.
+    std::unordered_map<std::string, std::uint32_t> runeStacks;
 };
 
 // Extract a SessionAnchor from a fully-populated DashboardSnapshot.
