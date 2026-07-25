@@ -1826,7 +1826,8 @@ std::string backupDisplayName(std::string_view filename) {
 
 Element renderBackupsSummary(const PaneConfig& config, BackupDb* db,
                              bool focused, int paneWidth,
-                             int daysRetention, int sessionsRetention) {
+                             int daysRetention, int sessionsRetention,
+                             std::string_view characterFilter) {
     Element titleEl = text(" Backups ");
     if (focused) titleEl = titleEl | inverted;
 
@@ -1850,13 +1851,19 @@ Element renderBackupsSummary(const PaneConfig& config, BackupDb* db,
     }
 
     // Partition: stash (.d2i) rows pinned at top, characters below.
+    // When `characterFilter` is set (from the layout's first Character
+    // pane), keep only the matching character; stash is always shown
+    // since it's account-wide.
     std::vector<const BackupDb::FileSummary*> stash;
     std::vector<const BackupDb::FileSummary*> chars;
     stash.reserve(sums.size());
     chars.reserve(sums.size());
     for (const auto& fs : sums) {
-        if (isSharedStashName(fs.filename)) stash.push_back(&fs);
-        else                                chars.push_back(&fs);
+        if (isSharedStashName(fs.filename)) {
+            stash.push_back(&fs);
+        } else if (characterFilter.empty() || fs.filename == characterFilter) {
+            chars.push_back(&fs);
+        }
     }
 
     // Adaptive date column: include the wall-clock time when the pane
@@ -2098,17 +2105,22 @@ Element renderBackupsDetail(const PaneConfig& config, BackupDb* db,
 Element renderBackupsLeaf(const PaneConfig& config, BackupDb* db,
                           const UiState& ui,
                           bool focused, int paneWidth, int pageHeight,
-                          int daysRetention, int sessionsRetention) {
+                          int daysRetention, int sessionsRetention,
+                          std::string_view characterFilter) {
     return config.backupViewMode == BackupViewMode::Detail
         ? renderBackupsDetail(config, db, ui, focused, pageHeight)
         : renderBackupsSummary(config, db, focused, paneWidth,
-                                daysRetention, sessionsRetention);
+                                daysRetention, sessionsRetention,
+                                characterFilter);
 }
 
 // Returns the ordered filename list for the summary view (shared stash
 // pinned at the top, characters below), or empty on DB failure. The
 // order matches the rendered rows, so cursor N indexes into result[N].
-std::vector<std::string> backupsSummaryOrder(BackupDb* db) {
+// `characterFilter` mirrors renderBackupsSummary's filtering so the
+// Enter-to-detail navigation lines up with what the user sees.
+std::vector<std::string> backupsSummaryOrder(BackupDb* db,
+                                             std::string_view characterFilter) {
     std::vector<std::string> out;
     if (!db) return out;
     std::vector<BackupDb::FileSummary> sums;
@@ -2118,9 +2130,33 @@ std::vector<std::string> backupsSummaryOrder(BackupDb* db) {
         if (isSharedStashName(fs.filename)) out.push_back(fs.filename);
     }
     for (const auto& fs : sums) {
-        if (!isSharedStashName(fs.filename)) out.push_back(fs.filename);
+        if (isSharedStashName(fs.filename)) continue;
+        if (!characterFilter.empty() && fs.filename != characterFilter) continue;
+        out.push_back(fs.filename);
     }
     return out;
+}
+
+// Determine which character (if any) the Backups pane should filter to.
+// Walks the pane tree for the FIRST `PaneType::Character` leaf and
+// resolves that pane's selection: an explicit basename (with .d2s
+// appended if the user stored the bare stem), or the auto snapshot's
+// active-player file when the selection is empty. Returns "" if no
+// Character pane exists (backward-compatible: shows every backup).
+std::string resolveBackupsCharacterFilter(const PaneNode& root,
+                                          const DashboardSnapshot& s) {
+    for (const auto* leaf : flattenLeaves(root)) {
+        if (leaf->config.type != PaneType::Character) continue;
+        const auto& sel = leaf->config.characterSelection;
+        if (!sel.empty()) {
+            const bool hasExt = sel.size() >= 4
+                && (sel.compare(sel.size() - 4, 4, ".d2s") == 0
+                 || sel.compare(sel.size() - 4, 4, ".D2S") == 0);
+            return hasExt ? sel : (sel + ".d2s");
+        }
+        return s.hasActivePlayer ? s.activePlayer.file : std::string{};
+    }
+    return {};
 }
 
 // ---- BackupLog pane (ephemeral this-process ring buffer) -------------------
@@ -2779,8 +2815,12 @@ Element renderPane(PaneNode& node, const UiState& ui,
         case PaneType::Backups: {
             const int days = ui.backupScheduler ? ui.backupScheduler->retention().days : 30;
             const int sess = ui.backupScheduler ? ui.backupScheduler->retention().sessionsPerFile : 100;
+            // The Backups pane follows whichever character the first
+            // Character pane in the layout resolves to (auto or pinned).
+            // No Character pane -> no filter -> shows everything.
+            const std::string filter = resolveBackupsCharacterFilter(ui.rootPane, s);
             leafEl = renderBackupsLeaf(node.config, ui.backupDb, ui, focused,
-                                        width, height, days, sess);
+                                        width, height, days, sess, filter);
             break;
         }
         case PaneType::BackupLog:
@@ -3372,6 +3412,15 @@ int runDashboard(const std::filesystem::path& savePath,
     auto currentSnapshot = [&]() {
         std::lock_guard g(ui.snapshotMutex);
         return ui.snapshot;
+    };
+    // Resolve the current Backups pane character filter (same helper the
+    // renderer uses at draw time). The Enter-to-detail navigation and
+    // the shownRows count query both need this so cursor indexing lines
+    // up with what the user sees in the summary.
+    auto backupsCharFilter = [&]() -> std::string {
+        auto snap = currentSnapshot();
+        if (!snap) return {};
+        return resolveBackupsCharacterFilter(ui.rootPane, *snap);
     };
     auto rebuild = [&]() {
         // Drain the watcher's pending-change list. If non-empty, only
@@ -4004,7 +4053,7 @@ int runDashboard(const std::filesystem::path& savePath,
         if (leaf->config.type == PaneType::Backups) {
             if (e == Event::Return &&
                 leaf->config.backupViewMode == BackupViewMode::Summary) {
-                const auto order = backupsSummaryOrder(ui.backupDb);
+                const auto order = backupsSummaryOrder(ui.backupDb, backupsCharFilter());
                 if (!order.empty()) {
                     const int idx = std::clamp(leaf->config.cursor,
                                                 0, (int)order.size() - 1);
@@ -4091,7 +4140,7 @@ int runDashboard(const std::filesystem::path& savePath,
                             leaf->config.selectedBackupFile, 2048).size();
                     } catch (const std::exception&) { return 0; }
                 }
-                return (int)backupsSummaryOrder(ui.backupDb).size();
+                return (int)backupsSummaryOrder(ui.backupDb, backupsCharFilter()).size();
             }
             return 0;
         };
