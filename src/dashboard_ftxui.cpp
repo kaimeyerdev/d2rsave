@@ -96,6 +96,27 @@ bool containsCI(std::string_view hay, std::string_view needle) {
     return it != hay.end();
 }
 
+// Formatter for signed integer deltas with thousands separators and a
+// leading '+' / '-'. Zero renders as "+0" so the pane always shows a
+// concrete delta.
+std::string formatSignedDelta(std::int64_t v) {
+    if (v == 0) return "+0";
+    const bool neg = v < 0;
+    std::uint64_t mag = neg ? static_cast<std::uint64_t>(-v)
+                            : static_cast<std::uint64_t>(v);
+    std::string body = formatWithThousands(mag);
+    return (neg ? "-" : "+") + body;
+}
+
+// Total XP earned at `level - 1` (i.e. baseline for the current level).
+// experienceToReachLevel returns the *end* of `level`, so this is the
+// value we need to convert `(level, expInLevel)` -> cumulative XP.
+std::uint64_t cumulativeXp(std::uint32_t level, std::uint64_t inLevel) {
+    if (level == 0) return inLevel;
+    const std::uint64_t prev = experienceToReachLevel(level - 1);
+    return prev + inLevel;
+}
+
 // ---------------------- chronicle category dispatch -------------------------
 
 struct KindTier { ChronicleKind kind; std::uint32_t tierMask; };
@@ -249,124 +270,360 @@ struct UiState {
         int                               cursor = 0;
     } sessionPicker;
     bool                                      sessionPickerVisible = false;
+
+    // Character picker modal, opened from a Character pane's config
+    // menu via ConfigMenuItem::PickCharacter. `options[0] == ""` always
+    // represents "auto (newest saved)"; the rest are basenames from
+    // ui.fileCache.d2s in a stable sort order.
+    struct CharacterPicker {
+        PaneNode*                target = nullptr;
+        std::vector<std::string> options;   // "" for auto, else basenames
+        int                      cursor = 0;
+    } characterPicker;
+    bool                                      characterPickerVisible = false;
 };
 
-// ------------------------- top summary panels -------------------------------
+// -----------------------------------------------------------------------
+// Character pane (configurable top-row): combined active-player summary
+// + session XP delta for a resolved character. Auto mode (empty
+// characterSelection) tracks the newest-saved .d2s; pinned mode locks
+// to a specific file stem via the pane's character picker.
+// -----------------------------------------------------------------------
 
-Element renderActivePlayer(const DashboardSnapshot& s) {
-    if (!s.hasActivePlayer) {
-        return window(text(" Active Player "), text(" (no .d2s files found)"));
+// Character.locations -> highest active difficulty index (0..2) + act (1..5).
+// Mirror of the anonymous computeDifficulty() in dashboard_model.cpp; kept
+// here so the renderer doesn't need to reach into the model TU. Cheap
+// duplication -- 5 lines -- so we don't leak an internal helper.
+void characterDifficultyAct(const Character& c,
+                            std::uint8_t& outDiff, std::uint8_t& outAct) {
+    outDiff = 0;
+    outAct  = 1;
+    for (std::uint8_t i = 0; i < 3; ++i) {
+        if (c.locations[i].active) {
+            outDiff = i;
+            outAct  = c.locations[i].act ? c.locations[i].act : 1;
+        }
     }
-    const auto& p = s.activePlayer;
-    const auto lvlLine = "Level " + std::to_string(p.level)
-                       + " " + std::string(difficultyName(p.difficulty))
-                       + " A" + std::to_string(p.act);
-    const auto pctForBar = std::clamp(p.expPercent / 100.0, 0.0, 1.0);
-    const bool tableStale = p.expForLevel > 0 && p.expInLevel > p.expForLevel;
-    const auto pctLbl = [&]{
+}
+
+// Distilled per-character render inputs. Populated either from the
+// snapshot's ActivePlayer (auto mode) or from a cache entry's Character
+// (pinned mode). Keeping this a POD lets renderCharacterPane share one
+// draw path across both cases.
+struct CharacterPaneInput {
+    bool           present         = false;
+    std::string    file;               // ""    if snapshot's activePlayer had no file
+    std::string    name;
+    CharacterClass characterClass  = CharacterClass::Unknown;
+    std::uint32_t  level           = 0;
+    std::uint32_t  experience      = 0;
+    std::uint64_t  expInLevel      = 0;
+    std::uint64_t  expForLevel     = 0;
+    double         expPercent      = 0.0;
+    bool           hardcore        = false;
+    bool           died            = false;
+    std::uint8_t   difficulty      = 0;
+    std::uint8_t   act             = 1;
+    std::uint32_t  mapSeed         = 0;
+};
+
+CharacterPaneInput characterInputFromActivePlayer(const ActivePlayer& p) {
+    CharacterPaneInput out;
+    out.present        = true;
+    out.file           = p.file;
+    out.name           = p.name;
+    out.characterClass = p.characterClass;
+    out.level          = p.level;
+    out.experience     = p.experience;
+    out.expInLevel     = p.expInLevel;
+    out.expForLevel    = p.expForLevel;
+    out.expPercent     = p.expPercent;
+    out.hardcore       = p.hardcore;
+    out.died           = p.died;
+    out.difficulty     = p.difficulty;
+    out.act            = p.act;
+    out.mapSeed        = p.mapSeed;
+    return out;
+}
+
+CharacterPaneInput characterInputFromCache(const std::string& file,
+                                            const Character& c) {
+    CharacterPaneInput out;
+    out.present        = true;
+    out.file           = file;
+    out.name           = c.name;
+    out.characterClass = c.characterClass;
+    out.level          = c.attributes.level ? c.attributes.level
+                                            : c.level;
+    out.experience     = c.attributes.experience;
+    out.hardcore       = c.hardcore;
+    out.died           = c.died;
+    out.mapSeed        = c.mapId;
+    characterDifficultyAct(c, out.difficulty, out.act);
+
+    // Progress within the current level -- same math the model uses to
+    // populate ActivePlayer, duplicated here so pinned characters don't
+    // require re-running buildSnapshot.
+    const std::uint64_t curFloor  = experienceToReachLevel(out.level);
+    const std::uint64_t nextFloor = experienceToReachLevel(out.level + 1);
+    if (nextFloor > curFloor) {
+        out.expForLevel = nextFloor - curFloor;
+        out.expInLevel  = out.experience > curFloor
+                            ? out.experience - curFloor : 0;
+        out.expPercent  = 100.0 * static_cast<double>(out.expInLevel)
+                                 / static_cast<double>(out.expForLevel);
+    } else {
+        out.expForLevel = 0;
+        out.expInLevel  = 0;
+        out.expPercent  = 100.0;
+    }
+    return out;
+}
+
+// Resolve a Character pane's target: auto (empty selection -> snapshot's
+// active player) or pinned (look up cache by filename). Returns a POD
+// with `present == false` when neither path produced anything usable.
+CharacterPaneInput resolveCharacterPaneInput(const PaneConfig& c,
+                                             const DashboardSnapshot& s,
+                                             const DashboardFileCache& cache) {
+    if (c.characterSelection.empty()) {
+        return s.hasActivePlayer
+            ? characterInputFromActivePlayer(s.activePlayer)
+            : CharacterPaneInput{};
+    }
+    // Selection may be stored as either a bare stem ("Kai") or the
+    // full basename ("Kai.d2s"). Try both to be forgiving.
+    const std::string sel = c.characterSelection;
+    auto it = cache.d2s.find(sel);
+    if (it == cache.d2s.end()) {
+        it = cache.d2s.find(sel + ".d2s");
+    }
+    if (it == cache.d2s.end()) return CharacterPaneInput{};
+    return characterInputFromCache(it->first, it->second.character);
+}
+
+// Draw a compact two-color XP bar. The `anchorFrac` region is filled in
+// white (progress at session start), the `[anchorFrac, nowFrac]` region
+// in `kHighlightColor` (progress gained during the session), and the
+// remainder is dim '-'. Bar total width is fixed at `barW` characters;
+// callers should give it enough horizontal space (`filler()` after is
+// fine).
+Element renderExpBar(double anchorFrac, double nowFrac, int barW = 40) {
+    barW = std::max(4, barW);
+    anchorFrac = std::clamp(anchorFrac, 0.0, 1.0);
+    nowFrac    = std::clamp(nowFrac,    0.0, 1.0);
+    if (nowFrac < anchorFrac) nowFrac = anchorFrac;   // XP can't drop mid-level
+    int anchorChars = static_cast<int>(std::round(anchorFrac * barW));
+    int nowChars    = static_cast<int>(std::round(nowFrac    * barW));
+    if (nowChars < anchorChars) nowChars = anchorChars;
+    if (nowChars > barW)        nowChars = barW;
+    const int gainChars  = nowChars - anchorChars;
+    const int emptyChars = barW - nowChars;
+    // U+2588 FULL BLOCK for filled cells; U+2591 LIGHT SHADE for empty
+    // so the bar has visible extent even when there's no progress yet.
+    auto repeat = [](int n, std::string_view glyph) {
+        std::string out;
+        out.reserve(static_cast<std::size_t>(n) * glyph.size());
+        for (int i = 0; i < n; ++i) out.append(glyph);
+        return out;
+    };
+    return hbox({
+        text(repeat(anchorChars, "\xE2\x96\x88")) | color(Color::White),
+        text(repeat(gainChars,   "\xE2\x96\x88")) | color(kHighlightColor),
+        text(repeat(emptyChars,  "\xE2\x96\x91")) | dim,
+    });
+}
+
+// Full renderer for PaneType::Character. Composes the ActivePlayer
+// summary (name, class, level+difficulty, seed, badges) with the
+// session block (duration, XP delta, two-color exp bar). The session
+// portion uses the *auto* SessionAnchor (`ui.sessionAnchor`); per-
+// character anchors are tracked in a follow-up commit. A mismatch
+// between the pane's target and the anchor's tracked player is called
+// out in a warning line so the delta still renders but is annotated
+// as "from the auto anchor".
+Element renderCharacterPane(const PaneConfig&        cfg,
+                            const DashboardSnapshot& s,
+                            const SessionAnchor*     anchor,
+                            const DashboardFileCache& cache,
+                            bool                     focused,
+                            bool                     anchorPinned) {
+    // Title reflects mode: " Character " (auto) or
+    // " Character  Kai " (pinned to Kai).
+    std::string titleStr = " Character ";
+    if (!cfg.characterSelection.empty()) {
+        titleStr = " Character  " + cfg.characterSelection + " ";
+    } else if (anchorPinned) {
+        titleStr = " Character (pinned) ";
+    }
+    Element titleEl = text(titleStr);
+    if (focused) titleEl = titleEl | inverted;
+
+    const auto in = resolveCharacterPaneInput(cfg, s, cache);
+    if (!in.present) {
+        return window(titleEl, vbox({
+            filler(),
+            hbox({ filler(),
+                   text(cfg.characterSelection.empty()
+                       ? "(no .d2s files found)"
+                       : ("(no cached data for '" + cfg.characterSelection + "')"))
+                       | dim,
+                   filler() }),
+            filler(),
+        }));
+    }
+
+    // ---- Identity row + badges ----
+    Elements badges;
+    if (in.hardcore) badges.push_back(text(" HC ") | inverted | bold);
+    if (!in.died)    badges.push_back(text(" alive ") | inverted);
+    Element badgeLine = badges.empty() ? filler() : hbox(std::move(badges));
+
+    const std::string lvlLine = "Level " + std::to_string(in.level)
+                              + "  " + std::string(difficultyName(in.difficulty))
+                              + " A" + std::to_string(in.act);
+    const bool tableStale = in.expForLevel > 0 && in.expInLevel > in.expForLevel;
+
+    // ---- Session XP delta ----
+    // Only meaningful when the anchor tracks a real player and the pane's
+    // target matches (otherwise the delta compares apples/oranges).
+    std::int64_t xpDelta    = 0;
+    std::int32_t levelDelta = 0;
+    double       pctDelta   = 0.0;
+    bool         deltaValid = false;
+    bool         anchorMismatch = false;
+    if (anchor && anchor->hasActivePlayer) {
+        anchorMismatch = (anchor->playerName != in.name);
+        if (!anchorMismatch) {
+            const std::uint64_t aCum = cumulativeXp(anchor->level, anchor->expInLevel);
+            const std::uint64_t nCum = cumulativeXp(in.level, in.expInLevel);
+            xpDelta = static_cast<std::int64_t>(nCum) - static_cast<std::int64_t>(aCum);
+            levelDelta = static_cast<std::int32_t>(in.level)
+                       - static_cast<std::int32_t>(anchor->level);
+            const std::uint64_t anchorFloor = experienceToReachLevel(anchor->level);
+            const std::uint64_t anchorCeil  = experienceToReachLevel(anchor->level + 1);
+            const std::uint64_t anchorSpan  = anchorCeil > anchorFloor
+                                                ? anchorCeil - anchorFloor : 0;
+            const double anchorFrac = (anchorSpan > 0)
+                ? static_cast<double>(anchor->expInLevel)
+                  / static_cast<double>(anchorSpan) : 0.0;
+            const double nowFrac = (in.expForLevel > 0)
+                ? static_cast<double>(in.expInLevel)
+                  / static_cast<double>(in.expForLevel) : 0.0;
+            pctDelta = 100.0 * (static_cast<double>(levelDelta)
+                                + nowFrac - anchorFrac);
+            deltaValid = true;
+        }
+    }
+
+    // ---- Exp bar ----
+    // Anchor fraction only makes sense when the anchor tracks this
+    // character AND we haven't leveled up since (levelDelta == 0).
+    // Otherwise start the bar's "white" segment at zero and show all
+    // current progress as the highlight-colored gain -- reads as
+    // "everything you see in this bar was earned this session".
+    const double nowFrac = (in.expForLevel > 0)
+        ? std::clamp(static_cast<double>(in.expInLevel)
+                     / static_cast<double>(in.expForLevel), 0.0, 1.0)
+        : 0.0;
+    double anchorFrac = 0.0;
+    if (deltaValid && levelDelta == 0 && anchor->expInLevel > 0) {
+        const std::uint64_t aFloor = experienceToReachLevel(anchor->level);
+        const std::uint64_t aCeil  = experienceToReachLevel(anchor->level + 1);
+        if (aCeil > aFloor) {
+            anchorFrac = std::clamp(static_cast<double>(anchor->expInLevel)
+                                    / static_cast<double>(aCeil - aFloor), 0.0, 1.0);
+        }
+    }
+
+    // ---- Session duration ----
+    std::string durStr = "";
+    if (anchor && anchor->sessionStartEpoch != 0 && anchor->sessionEndEpoch != 0) {
+        std::int64_t secs = anchor->sessionEndEpoch - anchor->sessionStartEpoch;
+        if (secs < 0) secs = 0;
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%lldh %02lldm %02llds",
+                      static_cast<long long>(secs / 3600),
+                      static_cast<long long>((secs % 3600) / 60),
+                      static_cast<long long>(secs % 60));
+        durStr = buf;
+    }
+
+    // ---- Format delta strings ----
+    char pctBuf[32];
+    if (deltaValid) std::snprintf(pctBuf, sizeof(pctBuf), "%+.2f%%", pctDelta);
+    else            std::snprintf(pctBuf, sizeof(pctBuf), "---");
+
+    const std::string pctLbl = [&]{
         char b[24];
-        std::snprintf(b, sizeof(b), "%.2f%%%s", p.expPercent,
+        std::snprintf(b, sizeof(b), "%.2f%%%s", in.expPercent,
                       tableStale ? " *" : "");
         return std::string(b);
     }();
-    const auto expLine = formatWithThousands(p.expInLevel) + " / "
-                       + formatWithThousands(p.expForLevel);
+    const std::string expValues = formatWithThousands(in.expInLevel) + " / "
+                                + formatWithThousands(in.expForLevel);
 
-    // Status badges: show only asymmetric conditions.
-    // - "Hardcore" appears only when true (softcore is the common case).
-    // - "Has not died" appears only when false (dying is the exceptional
-    //   permanent state on a HC or Warlock character worth flagging).
-    Elements badges;
-    if (p.hardcore) badges.push_back(text(" Hardcore ") | inverted | bold);
-    if (!p.died)    badges.push_back(text(" Has not died ") | inverted);
-    Element badgeLine = badges.empty() ? text("") : hbox(std::move(badges));
+    // ---- Compose ----
+    Elements body;
+    body.push_back(hbox({
+        text(in.name) | bold,
+        text("  "),
+        text("(" + classString(in.characterClass) + ")") | dim,
+        filler(),
+        badgeLine,
+    }));
+    body.push_back(hbox({
+        text(lvlLine),
+        filler(),
+        text("Seed " + std::to_string(in.mapSeed)) | dim,
+    }));
+    if (anchorMismatch) {
+        body.push_back(text("* anchor was " + anchor->playerName
+                            + "; delta not shown") | color(Color::Yellow));
+    } else if (!deltaValid && anchor && !anchor->hasActivePlayer) {
+        body.push_back(text("* session anchor not yet initialised") | dim);
+    }
+    body.push_back(separator());
+    // Session summary line: duration + delta bundled together.
+    {
+        Elements segs;
+        segs.push_back(text("Session  ") | bold);
+        segs.push_back(text(durStr.empty() ? "--" : durStr));
+        segs.push_back(text("   "));
+        if (deltaValid) {
+            segs.push_back(text(std::string(pctBuf)) | color(kHighlightColor));
+            segs.push_back(text("  "));
+            segs.push_back(text(formatSignedDelta(xpDelta)) | dim);
+            if (levelDelta != 0) {
+                segs.push_back(text("  "));
+                segs.push_back(text("(+" + std::to_string(levelDelta) + " lvl)")
+                               | color(kHighlightColor));
+            }
+        } else {
+            segs.push_back(text("--") | dim);
+        }
+        body.push_back(hbox(std::move(segs)));
+    }
+    // XP progress row (percentage of the current level).
+    body.push_back(hbox({
+        text("Exp  ") | bold,
+        text(pctLbl),
+    }));
+    // Two-color XP bar. Bar width is fixed so it fits inside even the
+    // narrower top-row panes; extra pane width falls to the right as
+    // filler.
+    body.push_back(hbox({
+        renderExpBar(anchorFrac, nowFrac, 40),
+        filler(),
+    }));
+    body.push_back(text(expValues) | dim);
+    body.push_back(text("total  " + formatWithThousands(in.experience)) | dim);
+    if (tableStale) {
+        body.push_back(text("* exp table stale for L" + std::to_string(in.level)
+                            + "; % may be off") | dim);
+    }
 
-    // Map seed formatted as decimal for copy/paste into `d2rsave set-seed`.
-    // The alias-lookup layer described in TODO.md will replace this with a
-    // human-friendly name (e.g. "Cows-2A") when available.
-    const std::string seedStr = std::to_string(p.mapSeed);
-
-    return window(
-        text(" Active Player "),
-        vbox({
-            hbox({ text(p.name), text("  "),
-                   text("(" + classString(p.characterClass) + ")") | dim }),
-            text(lvlLine),
-            hbox({ text("Map Seed  "), text(seedStr) | bold }),
-            badgeLine,
-            separator(),
-            hbox({ text("Exp "), text(pctLbl) }),
-            gauge(static_cast<float>(pctForBar)),
-            text(expLine) | dim,
-            text("total  " + formatWithThousands(p.experience)) | dim,
-            tableStale
-                ? text("* exp table stale for L" + std::to_string(p.level)
-                       + "; % may be off") | dim
-                : text(""),
-        })
-    );
-}
-
-Element renderHellfireTorch(const HellfireTorchQuest& q) {
-    auto row = [](const char* label, std::uint32_t n) {
-        return hbox({
-            text(label) | size(WIDTH, EQUAL, 24),
-            filler(),
-            text(std::to_string(n)) | bold | align_right | size(WIDTH, EQUAL, 6),
-        });
-    };
-    return window(
-        text(" Hellfire Torch "),
-        vbox({
-            row("Key of Terror",       q.keysTerror),
-            row("Key of Hate",         q.keysHate),
-            row("Key of Destruction",  q.keysDestruction),
-            separator(),
-            row("Hellfire Torch",      q.torchesHellfire),
-        })
-    );
-}
-
-Element renderColossalAncients(const ColossalAncientsQuest& q) {
-    auto row = [](const char* label, std::uint32_t n) {
-        return hbox({
-            text(label) | size(WIDTH, EQUAL, 26),
-            filler(),
-            text(std::to_string(n)) | bold | align_right | size(WIDTH, EQUAL, 6),
-        });
-    };
-    return window(
-        text(" Colossal Ancients "),
-        vbox({
-            row("Talic's Anguish",       q.talicAnguish),
-            row("Korlic's Pain",         q.korlicPain),
-            row("Madawc's Ire",          q.madawcIre),
-            row("Bul-Kathos' Nightmare", q.bulKathosNightmare),
-            row("Worusk's End",          q.woruskEnd),
-            separator(),
-            row("Colossal Jewel",        q.colossalJewels),
-        })
-    );
-}
-
-Element renderTerrorZones(const TerrorZones& t) {
-    auto row = [](const char* label, std::uint32_t n) {
-        return hbox({
-            text(label) | size(WIDTH, EQUAL, 28),
-            filler(),
-            text(std::to_string(n)) | bold | align_right | size(WIDTH, EQUAL, 6),
-        });
-    };
-    return window(
-        text(" Terror Zones "),
-        vbox({
-            row("Western Worldstone Shard",  t.shardWestern),
-            row("Eastern Worldstone Shard",  t.shardEastern),
-            row("Southern Worldstone Shard", t.shardSouthern),
-            row("Deep Worldstone Shard",     t.shardDeep),
-            row("Northern Worldstone Shard", t.shardNorthern),
-        })
-    );
+    return window(titleEl, vbox(std::move(body)) | vscroll_indicator | frame);
 }
 
 // -------------------------- chronicle rendering -----------------------------
@@ -1659,27 +1916,6 @@ Element renderBackupLogLeaf(const UiState& ui, bool focused) {
 
 namespace {
 
-// Formatter for signed integer deltas with thousands separators and a
-// leading '+' / '-'. Zero renders as "+0" so the pane always shows a
-// concrete delta.
-std::string formatSignedDelta(std::int64_t v) {
-    if (v == 0) return "+0";
-    const bool neg = v < 0;
-    std::uint64_t mag = neg ? static_cast<std::uint64_t>(-v)
-                            : static_cast<std::uint64_t>(v);
-    std::string body = formatWithThousands(mag);
-    return (neg ? "-" : "+") + body;
-}
-
-// Total XP earned at `level - 1` (i.e. baseline for the current level).
-// experienceToReachLevel returns the *end* of `level`, so this is the
-// value we need to convert `(level, expInLevel)` -> cumulative XP.
-std::uint64_t cumulativeXp(std::uint32_t level, std::uint64_t inLevel) {
-    if (level == 0) return inLevel;
-    const std::uint64_t prev = experienceToReachLevel(level - 1);
-    return prev + inLevel;
-}
-
 } // namespace
 
 Element renderSessionLeaf(const DashboardSnapshot& now,
@@ -2003,6 +2239,45 @@ Element renderSessionPickerModal(const UiState::SessionPicker& p) {
     return window(titleEl, vbox(std::move(body)) | size(WIDTH, GREATER_THAN, 60));
 }
 
+// Rendered on top of the pane layout when `ui.characterPickerVisible`.
+// Reuses the same shape as the session picker for consistency: a
+// vertical list with the current cursor row inverted and a fixed
+// hint footer. The first entry is always "(auto -- newest saved)".
+Element renderCharacterPickerModal(const UiState::CharacterPicker& p) {
+    Element titleEl = text(" Pick character ");
+    if (p.options.empty()) {
+        return window(titleEl, vbox({
+            text("No characters cached yet.") | dim,
+            text("Press [Esc] to close.") | dim,
+        }) | size(WIDTH, GREATER_THAN, 40));
+    }
+    const int n      = static_cast<int>(p.options.size());
+    const int cursor = std::clamp(p.cursor, 0, n - 1);
+    constexpr int kVisible = 20;
+    int start = std::max(0, cursor - kVisible / 2);
+    if (start + kVisible > n) start = std::max(0, n - kVisible);
+    const int end = std::min(n, start + kVisible);
+
+    Elements body;
+    for (int i = start; i < end; ++i) {
+        const auto& opt = p.options[i];
+        const std::string label = opt.empty()
+            ? std::string(" (auto -- newest saved) ")
+            : std::string(" ") + opt + " ";
+        Element row = text(label);
+        if (i == cursor) row = row | inverted;
+        else if (opt.empty()) row = row | dim;
+        body.push_back(row);
+    }
+    body.push_back(separator());
+    body.push_back(hbox({
+        text(" " + std::to_string(cursor + 1) + "/" + std::to_string(n)) | dim,
+        filler(),
+        text("[Up/Down] navigate  [Enter] select  [Esc] cancel ") | dim,
+    }));
+    return window(titleEl, vbox(std::move(body)) | size(WIDTH, GREATER_THAN, 40));
+}
+
 // ---- Config-mode menu -------------------------------------------------------
 
 struct ConfigMenuItem {
@@ -2017,6 +2292,8 @@ struct ConfigMenuItem {
         ResetSession,
         PickSessionAnchor,
         UnpinSessionAnchor,
+        PickCharacter,
+        ResetCharacterToAuto,
         CyclePaneWeight,
         CycleInfoLevel,
         SplitVertical, SplitHorizontal, DeletePane, Close,
@@ -2102,6 +2379,20 @@ std::vector<ConfigMenuItem> buildConfigMenu(const PaneConfig& c, bool canDelete)
         }
         items.push_back({"reset session anchor now",
                           ConfigMenuItem::ResetSession});
+    }
+    if (c.type == PaneType::Character) {
+        // Character selection picker + auto-reset. Mirrors the session-
+        // anchor menu structure: one pick-a-target row that opens the
+        // modal, plus a shortcut to snap back to auto tracking.
+        const std::string current = c.characterSelection.empty()
+            ? std::string("auto (newest saved)")
+            : c.characterSelection;
+        items.push_back({"character:   " + current + "  --  [pick...]",
+                          ConfigMenuItem::PickCharacter});
+        if (!c.characterSelection.empty()) {
+            items.push_back({"reset character to auto (newest saved)",
+                              ConfigMenuItem::ResetCharacterToAuto});
+        }
     }
     // Size weight is universal -- affects width in a vertical (side-
     // by-side) parent and height in a horizontal (stacked) parent.
@@ -2247,11 +2538,16 @@ Element renderPane(PaneNode& node, const UiState& ui,
         case PaneType::Blank:
             leafEl = renderBlankLeaf(focused);
             break;
-        // TODO(dashboard-redesign phases 2-5): real renderers land in the
+        case PaneType::Character:
+            leafEl = renderCharacterPane(node.config, s,
+                                          ui.sessionAnchor.get(),
+                                          ui.fileCache, focused,
+                                          node.config.sessionAnchorPinned);
+            break;
+        // TODO(dashboard-redesign phases 3-5): real renderers land in the
         // following phases. Until then, these fall through to the same
         // blank placeholder so the pane type is selectable via the
         // config menu without crashing the layout.
-        case PaneType::Character:
         case PaneType::SessionLoot:
         case PaneType::Uber:
         case PaneType::TerrorZone:
@@ -2385,6 +2681,10 @@ void cyclePaneType(PaneNode& leaf, int dir = 1) {
         PaneType::Backups,
         PaneType::BackupLog,
         PaneType::Session,
+        PaneType::Character,
+        PaneType::SessionLoot,
+        PaneType::Uber,
+        PaneType::TerrorZone,
     }, dir);
     leaf.config.cursor = 0;
     // Reset the Backups sub-mode so a freshly-cycled-into pane always
@@ -2862,22 +3162,15 @@ int runDashboard(const std::filesystem::path& savePath,
             ui.focusedLeaf = 0;
         }
 
-        Element topRow = hbox({
-            renderActivePlayer(s)                      | flex,
-            renderHellfireTorch(s.hellfireTorch)       | flex,
-            renderColossalAncients(s.colossalAncients) | flex,
-            renderTerrorZones(s.terrorZones)           | flex,
-        }) | size(HEIGHT, EQUAL, 12);
-
         int leafIdx = 0;
-        // Top panels take 12 rows; the status footer takes 1. Whatever is
-        // left is what the pane tree can use. `renderPane` returns an
-        // element with pinned size(W,H) so we don't need `| flex` here --
-        // adding flex on top of pinned size lets ftxui expand the outer
-        // element and lose our split-symmetry guarantees.
+        // The pane tree gets every row except the status footer. The
+        // top row (Character / Uber / TerrorZone / SessionLoot) is now
+        // a real horizontal split at the root, so paneWeight biases
+        // its 12/40 share of the terminal height instead of us carving
+        // out a fixed 12 rows.
         const auto dims = ui.printSizeOverride.value_or(ftxui::Terminal::Size());
         const int paneWidth  = std::max(1, dims.dimx);
-        const int paneHeight = std::max(1, dims.dimy - 12 - 1);
+        const int paneHeight = std::max(1, dims.dimy - 1);
         Element panes = renderPane(ui.rootPane, ui, s, leafIdx,
                                     paneWidth, paneHeight);
 
@@ -2887,7 +3180,6 @@ int runDashboard(const std::filesystem::path& savePath,
         else                    globalHint = " [Tab] focus  [c] config  [/] search  [q] quit  [?] help ";
 
         Element root = vbox({
-            topRow,
             panes,
             hbox({ renderStatus(ui, s) | flex, text(globalHint) | dim }),
         });
@@ -2910,6 +3202,11 @@ int runDashboard(const std::filesystem::path& savePath,
         if (ui.sessionPickerVisible) {
             root = dbox({ root,
                 renderSessionPickerModal(ui.sessionPicker)
+                    | clear_under | center });
+        }
+        if (ui.characterPickerVisible) {
+            root = dbox({ root,
+                renderCharacterPickerModal(ui.characterPicker)
                     | clear_under | center });
         }
         return root;
@@ -3134,6 +3431,43 @@ int runDashboard(const std::filesystem::path& savePath,
             return true;   // swallow everything else while modal is up
         }
 
+        // ---- CHARACTER PICKER modal ----
+        // Same shape as the session-anchor picker, keyed off the
+        // pane's characterSelection field. options[0] is always the
+        // empty string == "auto (newest saved)".
+        if (ui.characterPickerVisible) {
+            auto& p = ui.characterPicker;
+            const int n = static_cast<int>(p.options.size());
+            if (e == Event::Escape) {
+                ui.characterPickerVisible = false;
+                p.target = nullptr;
+                p.options.clear();
+                return true;
+            }
+            if (n == 0) return true;
+            if (e == Event::ArrowUp)   { p.cursor = std::max(0, p.cursor - 1); return true; }
+            if (e == Event::ArrowDown) { p.cursor = std::min(n - 1, p.cursor + 1); return true; }
+            if (e == Event::PageUp)    { p.cursor = std::max(0, p.cursor - 10); return true; }
+            if (e == Event::PageDown)  { p.cursor = std::min(n - 1, p.cursor + 10); return true; }
+            if (e == Event::Home)      { p.cursor = 0; return true; }
+            if (e == Event::End)       { p.cursor = n - 1; return true; }
+            if (e == Event::Return) {
+                if (p.target) {
+                    p.target->config.characterSelection = p.options[p.cursor];
+                }
+                ui.characterPickerVisible = false;
+                p.target = nullptr;
+                p.options.clear();
+                persistLayout();
+                // No anchor rebuild required -- the character selection
+                // only changes what renderCharacterPane resolves to;
+                // the anchor cache continues to auto-track the newest
+                // save. Per-character anchors are a follow-up.
+                return true;
+            }
+            return true;
+        }
+
         // ---- CONFIG mode ----
         if (ui.configMode) {
             auto* leaf = focusedLeaf();
@@ -3294,6 +3628,35 @@ int runDashboard(const std::filesystem::path& savePath,
                         ui.configMode = false;
                         persistLayout();
                         rebuild();   // return to auto = newest S&E
+                        break;
+                    }
+                    case ConfigMenuItem::PickCharacter: {
+                        // Build the option list from the file cache:
+                        // sorted basenames, prepended with "" == auto.
+                        std::vector<std::string> opts;
+                        opts.push_back("");
+                        for (const auto& [name, _] : ui.fileCache.d2s) opts.push_back(name);
+                        std::sort(opts.begin() + 1, opts.end());
+                        int cursor = 0;
+                        if (!leaf->config.characterSelection.empty()) {
+                            for (int i = 0; i < (int)opts.size(); ++i) {
+                                if (opts[i] == leaf->config.characterSelection) {
+                                    cursor = i;
+                                    break;
+                                }
+                            }
+                        }
+                        ui.characterPicker.target  = leaf;
+                        ui.characterPicker.options = std::move(opts);
+                        ui.characterPicker.cursor  = cursor;
+                        ui.characterPickerVisible  = true;
+                        ui.configMode              = false;
+                        break;
+                    }
+                    case ConfigMenuItem::ResetCharacterToAuto: {
+                        leaf->config.characterSelection.clear();
+                        ui.configMode = false;
+                        persistLayout();
                         break;
                     }
                     case ConfigMenuItem::SplitVertical:

@@ -26,6 +26,13 @@ PaneNode makeLeaf(PaneType t, ChronicleCategory c) {
     return n;
 }
 
+PaneNode makeLeaf(PaneType t) {
+    PaneNode n;
+    n.isSplit = false;
+    n.config.type = t;
+    return n;
+}
+
 // Build a right-leaning vertical split chain from a list of leaves, so
 // they render left-to-right in the given order.
 PaneNode buildVerticalChain(std::vector<PaneNode>&& leaves) {
@@ -48,23 +55,48 @@ PaneNode buildVerticalChain(std::vector<PaneNode>&& leaves) {
     return acc;
 }
 
+// Set every leaf's paneWeight in-place. Used by makeDefaultLayout to
+// bias the top row toward a compact 12-row-equivalent share of the
+// terminal height, matching the pre-refactor hardcoded top-row look.
+void setLeafWeight(PaneNode& root, int w) {
+    if (root.isSplit) {
+        if (root.a) setLeafWeight(*root.a, w);
+        if (root.b) setLeafWeight(*root.b, w);
+        return;
+    }
+    root.config.paneWeight = std::max(1, w);
+}
+
 } // namespace
 
 // ---- Constructors -----------------------------------------------------------
 
 PaneNode makeDefaultLayout() {
-    // Three vertical panes: Sets | Uniques (all) | Inventory.
-    auto sets = makeLeaf(PaneType::Chronicle, ChronicleCategory::Sets);
-    auto uniques = makeLeaf(PaneType::Chronicle, ChronicleCategory::UniquesAll);
-    PaneNode inv;
-    inv.isSplit = false;
-    inv.config.type = PaneType::Inventory;
+    // Two-row layout: a top row of four configurable summary panes
+    // stacked over the classic chronicle chain. Weights bias the split
+    // roughly 12/40 vertically (the pre-refactor hardcoded top row was
+    // 12 rows tall); leaves inside each row keep equal-width defaults.
+    std::vector<PaneNode> top;
+    top.push_back(makeLeaf(PaneType::Character));
+    top.push_back(makeLeaf(PaneType::Uber));
+    top.push_back(makeLeaf(PaneType::TerrorZone));
+    top.push_back(makeLeaf(PaneType::SessionLoot));
+    auto topRow = buildVerticalChain(std::move(top));
+    setLeafWeight(topRow, 12);
 
-    std::vector<PaneNode> panes;
-    panes.push_back(std::move(sets));
-    panes.push_back(std::move(uniques));
-    panes.push_back(std::move(inv));
-    return buildVerticalChain(std::move(panes));
+    std::vector<PaneNode> bottom;
+    bottom.push_back(makeLeaf(PaneType::Chronicle, ChronicleCategory::Sets));
+    bottom.push_back(makeLeaf(PaneType::Chronicle, ChronicleCategory::UniquesAll));
+    bottom.push_back(makeLeaf(PaneType::Inventory));
+    auto bottomRow = buildVerticalChain(std::move(bottom));
+    setLeafWeight(bottomRow, 40);
+
+    PaneNode root;
+    root.isSplit   = true;
+    root.direction = SplitDirection::Horizontal;   // stacked (top / bottom)
+    root.a = std::make_unique<PaneNode>(std::move(topRow));
+    root.b = std::make_unique<PaneNode>(std::move(bottomRow));
+    return root;
 }
 
 // ---- String conversions -----------------------------------------------------
@@ -393,6 +425,48 @@ PaneNode fromJson(const nlohmann::json& j) {
     return n;
 }
 
+// Detect whether a loaded tree contains any of the configurable-top-row
+// pane types. Legacy dashboards (before the configurable-top-row work)
+// stored a flat vertical chain of Chronicle / Inventory / etc. leaves
+// under a hardcoded top row that was never persisted. When we see such
+// a tree, wrap it beneath a fresh default top row on load so returning
+// users don't lose the summary panes they used to see.
+bool treeHasTopRowPane(const PaneNode& n) {
+    if (n.isSplit) {
+        return (n.a && treeHasTopRowPane(*n.a))
+            || (n.b && treeHasTopRowPane(*n.b));
+    }
+    switch (n.config.type) {
+        case PaneType::Character:
+        case PaneType::SessionLoot:
+        case PaneType::Uber:
+        case PaneType::TerrorZone:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Prepend the default top row (Character | Uber | TerrorZone | SessionLoot)
+// above `existing`, matching the shape produced by makeDefaultLayout().
+PaneNode migrateLegacyLayout(PaneNode&& existing) {
+    std::vector<PaneNode> top;
+    top.push_back(makeLeaf(PaneType::Character));
+    top.push_back(makeLeaf(PaneType::Uber));
+    top.push_back(makeLeaf(PaneType::TerrorZone));
+    top.push_back(makeLeaf(PaneType::SessionLoot));
+    auto topRow = buildVerticalChain(std::move(top));
+    setLeafWeight(topRow, 12);
+    setLeafWeight(existing, 40);
+
+    PaneNode root;
+    root.isSplit   = true;
+    root.direction = SplitDirection::Horizontal;
+    root.a = std::make_unique<PaneNode>(std::move(topRow));
+    root.b = std::make_unique<PaneNode>(std::move(existing));
+    return root;
+}
+
 } // namespace
 
 PaneNode loadPaneTree(sqlite3* db) {
@@ -415,7 +489,12 @@ PaneNode loadPaneTree(sqlite3* db) {
         }
     }
     sqlite3_finalize(stmt);
-    return got ? std::move(result) : makeDefaultLayout();
+    if (!got) return makeDefaultLayout();
+    // Auto-migrate a pre-top-row layout the first time we load it.
+    if (!treeHasTopRowPane(result)) {
+        result = migrateLegacyLayout(std::move(result));
+    }
+    return result;
 }
 
 void savePaneTree(sqlite3* db, const PaneNode& root) {
