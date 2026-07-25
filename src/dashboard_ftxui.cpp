@@ -32,6 +32,7 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <ctime>
 #include <deque>
@@ -712,6 +713,25 @@ Element renderChronicleByTier(const PaneConfig& c, const DashboardSnapshot& s,
     header.push_back(cellText("Exceptional", colW[1]));
     header.push_back(cellText("Elite",       colW[2]));
 
+    // Per-group discovered/total counts. Counts every Unique in the
+    // group regardless of the pane's ownership/search filters -- the
+    // banner should show "how much of this armor type do I own", not
+    // "how much of what's currently visible". Iterates byKey (which
+    // holds ALL families) so the counts stay stable as the user
+    // toggles filters.
+    struct GroupStats { int discovered = 0; int total = 0; };
+    std::unordered_map<std::string, GroupStats> statsByGroup;
+    for (const auto& [key, fam] : byKey) {
+        const std::string grp = groupInfoFor(fam.typeSlug).name;
+        auto& st = statsByGroup[grp];
+        for (int t = 0; t < 3; ++t) {
+            for (const auto* r : fam.buckets[t]) {
+                ++st.total;
+                if (r->discovered) ++st.discovered;
+            }
+        }
+    }
+
     // Flatten families into display rows. Each row is either a
     // group-header banner or a data row; the cursor only lands on
     // data rows. `familyLabel` is populated on the first data row of
@@ -796,7 +816,22 @@ Element renderChronicleByTier(const PaneConfig& c, const DashboardSnapshot& s,
             if (!firstBanner) {
                 body.push_back(separator() | dim);
             }
-            body.push_back(text(" " + dr.header + " ") | bold);
+            // Banner styling: bold + cyan makes item-class rows read
+            // as a section header instead of getting mistaken for a
+            // family label like "Quilted Armor" (which is bold black).
+            // The trailing "  N/M  (pct%)" is appended in dim so the
+            // group name stays visually dominant.
+            const auto& st  = statsByGroup[dr.header];
+            const int   pct = st.total > 0
+                ? static_cast<int>(std::round(100.0 * st.discovered / st.total))
+                : 0;
+            const std::string countTxt = "  " + std::to_string(st.discovered)
+                                       + "/" + std::to_string(st.total)
+                                       + "  (" + std::to_string(pct) + "%)";
+            body.push_back(hbox({
+                text(" " + dr.header) | bold | color(Color::Cyan),
+                text(countTxt) | dim,
+            }));
             firstBanner = false;
             continue;
         }
@@ -844,11 +879,19 @@ Element renderChronicleByTier(const PaneConfig& c, const DashboardSnapshot& s,
     const int categoryRemaining = categoryTotal - categoryDiscovered;
     const bool remainingLabel   = c.ownership == OwnershipFilter::RemainingOnly;
     const int numerator = remainingLabel ? categoryRemaining : categoryDiscovered;
+    // Progress percentage is always "discovered / total" -- the label
+    // (remaining vs discovered) only picks the numerator; the parenthetical
+    // percentage stays anchored to progress so a "5/135 remaining" pane
+    // reads as (96%) rather than (4%).
+    const int pctDiscovered = categoryTotal > 0
+        ? static_cast<int>(std::round(100.0 * categoryDiscovered / categoryTotal))
+        : 0;
 
     std::string title = " " + paneTitle(c) + "  "
                       + std::to_string(numerator) + "/"
                       + std::to_string(categoryTotal) + " "
-                      + (remainingLabel ? "remaining" : "discovered") + " ";
+                      + (remainingLabel ? "remaining" : "discovered")
+                      + " (" + std::to_string(pctDiscovered) + "%) ";
     Element titleEl = text(title);
     if (focused) titleEl = titleEl | inverted;
 
@@ -936,11 +979,17 @@ Element renderChronicleLeaf(const PaneConfig& c, const DashboardSnapshot& s,
     const int categoryRemaining = categoryTotal - categoryDiscovered;
     const bool remainingLabel   = c.ownership == OwnershipFilter::RemainingOnly;
     const int numerator = remainingLabel ? categoryRemaining : categoryDiscovered;
+    // Progress percentage is always "discovered / total"; a
+    // "5/135 remaining" pane still reads as (96%).
+    const int pctDiscovered = categoryTotal > 0
+        ? static_cast<int>(std::round(100.0 * categoryDiscovered / categoryTotal))
+        : 0;
 
     std::string title = " " + paneTitle(c) + "  "
                       + std::to_string(numerator) + "/"
                       + std::to_string(categoryTotal) + " "
-                      + (remainingLabel ? "remaining" : "discovered") + " ";
+                      + (remainingLabel ? "remaining" : "discovered")
+                      + " (" + std::to_string(pctDiscovered) + "%) ";
     Element titleEl = text(title);
     if (focused) titleEl = titleEl | inverted;
 
