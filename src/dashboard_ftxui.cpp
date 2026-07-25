@@ -1060,17 +1060,41 @@ Element renderChronicleByTier(const PaneConfig& c, const DashboardSnapshot& s,
     };
 
     // Group: familyKey (fallback baseCode) -> Family.
+    //
+    // No-tier uniques (Rainbow Facets, Colossal Jewels, and any other
+    // misc-based uniques with baseCode not in the tier map) also
+    // appear in this grid: they land in slot 0 (Normal), keyed on the
+    // display name so each variant becomes its own single-cell family
+    // (Rainbow Facets share baseCode "jew" but must not stack into one
+    // family). They're tagged with a sentinel typeSlug so the group
+    // ranker below places them in a "Miscellaneous" section at the
+    // end of the grid.
+    static constexpr const char* kMiscTypeSlug = "_misc_";
     std::unordered_map<std::string, Family> byKey;
     for (const auto& r : s.chronicle) {
         if (r.kind != ChronicleKind::Unique) continue;
-        const int slot = tierSlot(r.tier);
-        if (slot < 0) continue;  // Misc-tier uniques don't join the grid.
-        std::string key = !r.familyKey.empty() ? r.familyKey : r.baseCode;
-        if (key.empty()) continue;
+        int slot = tierSlot(r.tier);
+        std::string key;
+        bool isMisc = false;
+        if (slot < 0) {
+            // No tier -> misc. Force to Normal column, unique-per-name
+            // family so tier variants don't merge (Rainbow Facets all
+            // share "jew" but must render 8 rows, not 1).
+            slot   = 0;
+            isMisc = true;
+            key    = "misc:" + r.displayName;
+        } else {
+            key = !r.familyKey.empty() ? r.familyKey : r.baseCode;
+            if (key.empty()) continue;
+        }
         auto& fam = byKey[key];
         fam.buckets[slot].push_back(&r);
-        if (fam.typeSlug.empty()) fam.typeSlug = r.familyType;
-        if (fam.level == 0)       fam.level    = r.familyLevel;
+        if (isMisc) {
+            fam.typeSlug = kMiscTypeSlug;
+        } else if (fam.typeSlug.empty()) {
+            fam.typeSlug = r.familyType;
+        }
+        if (fam.level == 0) fam.level = r.familyLevel;
     }
     if (byKey.empty()) {
         Element titleEl = text(" " + paneTitle(c) + " ");
@@ -1156,6 +1180,13 @@ Element renderChronicleByTier(const PaneConfig& c, const DashboardSnapshot& s,
         if (slug == "ajav") return {"Amazon Javelins",     411};
         if (slug == "aspe") return {"Amazon Spears",       412};
         if (slug == "orb")  return {"Sorceress Orbs",      420};
+        // Sentinel used above for uniques whose base has no tier
+        // (jewels, misc charms without a tier map entry). Rank above
+        // "Other" so they sit at the very end of the grid; ascending
+        // sort therefore matches the user request "let them appear
+        // at the end". Descending sort naturally flips them to the
+        // top, which is the reasonable inverse.
+        if (slug == kMiscTypeSlug) return {"Miscellaneous", 1000};
         return {"Other",                                   999};
         // clang-format on
     };
