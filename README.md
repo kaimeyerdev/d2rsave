@@ -198,7 +198,7 @@ After a successful build:
 
 The `d2rsave` binary is safe to run against any `.d2s` / `.d2i`
 file; parsing is read-only unless you invoke a subcommand that
-explicitly writes (`rename`, `set-seed`, `backup restore`, etc.).
+explicitly writes (`rename`, `set-seed`, `set-difficulty`, `backup restore`, etc.).
 
 ### Optional presets
 

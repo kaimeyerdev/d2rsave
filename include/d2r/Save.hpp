@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <system_error>
@@ -24,6 +25,8 @@ inline constexpr std::size_t kChecksumOffset   = 0x0C;
 inline constexpr std::size_t kChecksumSize     = 4;
 inline constexpr std::size_t kMapSeedOffset    = 0x9B;
 inline constexpr std::size_t kMapSeedSize      = 4;
+inline constexpr std::size_t kDifficultyOffset = 0x98;  // 3 bytes: Normal, Nightmare, Hell
+inline constexpr std::size_t kDifficultySize   = 3;
 inline constexpr std::size_t kNameOffset       = 0x12B;
 inline constexpr std::size_t kNameSize         = 16;   // null-padded; max 15 printable chars
 
@@ -64,6 +67,17 @@ void writeFileAtomic(const std::filesystem::path& path, std::span<const std::byt
 // Convenience: read/write map seed as u32 LE.
 [[nodiscard]] std::uint32_t readMapSeed(std::span<const std::byte> bytes) noexcept;
 void writeMapSeed(std::span<std::byte> bytes, std::uint32_t seed) noexcept;
+
+// Read the index (0=Normal, 1=Nightmare, 2=Hell) of the currently active
+// difficulty, or std::nullopt if none of the three location bytes has the
+// 0x80 flag set (e.g. brand-new characters).
+[[nodiscard]] std::optional<std::uint8_t> readActiveDifficulty(std::span<const std::byte> bytes) noexcept;
+
+// Mark the given difficulty (0=Normal, 1=Nightmare, 2=Hell) as active. The
+// two other difficulty bytes have their high (active) bit cleared but keep
+// their low act bits; the target byte keeps its existing act (or defaults
+// to act 1 when it was blank). No-op if `difficulty` >= 3.
+void writeActiveDifficulty(std::span<std::byte> bytes, std::uint8_t difficulty) noexcept;
 
 // Read the stored checksum as u32 LE.
 [[nodiscard]] std::uint32_t readStoredChecksum(std::span<const std::byte> bytes) noexcept;

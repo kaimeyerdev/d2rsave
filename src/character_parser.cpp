@@ -16,7 +16,6 @@ constexpr std::size_t kProgressionOffset     = 0x15;   // 21
 constexpr std::size_t kClassOffset           = 0x18;   // 24
 constexpr std::size_t kLevelOffset           = 0x1B;   // 27
 constexpr std::size_t kTimestampOffset       = 0x20;   // 32
-constexpr std::size_t kDifficultyOffset      = 0x98;   // 152 (3 bytes)
 constexpr std::size_t kMercAliveOffset       = 0xA1;   // 161 u16
 constexpr std::size_t kMercIdOffset          = 0xA3;   // 163 u32
 constexpr std::size_t kMercNameIdOffset      = 0xA7;   // 167 u16

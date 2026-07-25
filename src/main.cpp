@@ -4,6 +4,7 @@
 //   verify   <file>              — print stored + computed checksum, name, seed.
 //   rename   <file> <name>       — overwrite the 16-byte name field, recompute checksum.
 //   set-seed <file> <u32>        — overwrite the map seed, recompute checksum.
+//   set-difficulty <file> <lvl>  — mark difficulty (normal/nightmare/hell) active, recompute checksum.
 //   checksum <file>              — recompute + write checksum only.
 //
 // Later phases will add: list-items, chronicle, dump.
@@ -78,6 +79,11 @@ int usage(const char* prog) {
         "  verify   <name>              Print header info, name, seed, and checksum status.\n"
         "  rename   <name> <newname>    Set character name (<=15 chars) and recompute checksum.\n"
         "  set-seed <name> <u32>        Set the map seed and recompute checksum.\n"
+        "  set-difficulty <name> <lvl>  Mark <lvl> (1|2|3 or normal|nightmare|hell)\n"
+        "                               as the character's active difficulty and\n"
+        "                               recompute checksum. Preserves act progress\n"
+        "                               on all three difficulties; only flips the\n"
+        "                               'active' bit onto <lvl>.\n"
         "  checksum <name>              Recompute and write the checksum.\n"
         "  dump     <name>              Parse the whole file and print all decoded fields.\n"
         "\n"
@@ -139,7 +145,7 @@ int usage(const char* prog) {
         "\n"
 #if D2R_HAVE_DASHBOARD
         "Interactive mode (mutually exclusive with --watch and the modifying\n"
-        "commands rename/set-seed/checksum):\n"
+        "commands rename/set-seed/set-difficulty/checksum):\n"
         "  dashboard [--print [--width W] [--height H]]\n"
         "                               Launch the interactive TUI dashboard.\n"
         "                               Panels: active player, Hellfire Torch quest,\n"
@@ -387,6 +393,50 @@ int cmdSetSeed(const std::string& path, std::string_view seedStr) {
     d2r::writeFileAtomic(path, bytes);
     std::printf("seed:     %u -> %u\n", oldSeed, seed);
     std::printf("checksum: 0x%08X\n", newChecksum);
+    return 0;
+}
+
+// Parse a difficulty specifier: "1"/"normal", "2"/"nightmare", "3"/"hell"
+// (case-insensitive). Returns 0/1/2 on success, std::nullopt otherwise.
+std::optional<std::uint8_t> parseDifficulty(std::string_view s) {
+    std::string lower;
+    lower.reserve(s.size());
+    for (char c : s) lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    if (lower == "1" || lower == "normal")    return std::uint8_t{0};
+    if (lower == "2" || lower == "nightmare") return std::uint8_t{1};
+    if (lower == "3" || lower == "hell")      return std::uint8_t{2};
+    return std::nullopt;
+}
+
+const char* difficultyLabel(std::uint8_t d) {
+    switch (d) {
+        case 0: return "Normal";
+        case 1: return "Nightmare";
+        case 2: return "Hell";
+        default: return "?";
+    }
+}
+
+int cmdSetDifficulty(const std::string& path, std::string_view diffStr) {
+    const auto target = parseDifficulty(diffStr);
+    if (!target) {
+        std::fprintf(stderr,
+            "error: difficulty must be one of: 1, 2, 3, normal, nightmare, hell\n");
+        return 1;
+    }
+    auto bytes = d2r::readFile(path);
+    if (!d2r::hasValidMagic(bytes)) {
+        std::fprintf(stderr, "error: %s: invalid magic\n", path.c_str());
+        return 1;
+    }
+    const auto oldActive = d2r::readActiveDifficulty(bytes);
+    d2r::writeActiveDifficulty(bytes, *target);
+    const auto newChecksum = d2r::recomputeAndWriteChecksum(bytes);
+    d2r::writeFileAtomic(path, bytes);
+    std::printf("difficulty: %s -> %s\n",
+                oldActive ? difficultyLabel(*oldActive) : "(none)",
+                difficultyLabel(*target));
+    std::printf("checksum:   0x%08X\n", newChecksum);
     return 0;
 }
 
@@ -2456,6 +2506,9 @@ int main(int argc, char** argv) {
     else if (cmd == "set-seed") { requirePath(); requireArgs(2); watchCompatible = false;
         runCommand = [p = resolveCharacter(savePath, positional[1]).string(),
                       s = std::string(positional[2])]{ return cmdSetSeed(p, s); }; }
+    else if (cmd == "set-difficulty") { requirePath(); requireArgs(2); watchCompatible = false;
+        runCommand = [p = resolveCharacter(savePath, positional[1]).string(),
+                      d = std::string(positional[2])]{ return cmdSetDifficulty(p, d); }; }
     else if (cmd == "dump")     { requirePath(); requireArgs(1);
         runCommand = [p = resolveCharacter(savePath, positional[1]).string()]{ return cmdDump(p); }; }
 #if D2R_HAVE_SQLITE

@@ -114,6 +114,31 @@ void writeMapSeed(std::span<std::byte> bytes, std::uint32_t seed) noexcept {
     writeU32LE(bytes, kMapSeedOffset, seed);
 }
 
+std::optional<std::uint8_t> readActiveDifficulty(std::span<const std::byte> bytes) noexcept {
+    if (bytes.size() < kDifficultyOffset + kDifficultySize) return std::nullopt;
+    const auto* p = reinterpret_cast<const std::uint8_t*>(bytes.data()) + kDifficultyOffset;
+    for (std::uint8_t i = 0; i < kDifficultySize; ++i) {
+        if (p[i] & 0x80u) return i;
+    }
+    return std::nullopt;
+}
+
+void writeActiveDifficulty(std::span<std::byte> bytes, std::uint8_t difficulty) noexcept {
+    if (difficulty >= kDifficultySize) return;
+    if (bytes.size() < kDifficultyOffset + kDifficultySize) return;
+    auto* p = reinterpret_cast<std::uint8_t*>(bytes.data()) + kDifficultyOffset;
+    for (std::uint8_t i = 0; i < kDifficultySize; ++i) {
+        if (i == difficulty) {
+            // Preserve any existing act progress; default to act 1 (low bits 0)
+            // when the byte was blank. High bit marks "active".
+            p[i] = static_cast<std::uint8_t>((p[i] & 0x07u) | 0x80u);
+        } else {
+            // Keep act bits, clear the active flag.
+            p[i] = static_cast<std::uint8_t>(p[i] & 0x07u);
+        }
+    }
+}
+
 std::uint32_t readStoredChecksum(std::span<const std::byte> bytes) noexcept {
     return readU32LE(bytes, kChecksumOffset);
 }
