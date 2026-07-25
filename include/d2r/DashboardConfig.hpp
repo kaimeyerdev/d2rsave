@@ -32,6 +32,12 @@ enum class PaneType : std::uint8_t {
                 // (or the just-ended one). A session ends with the
                 // active character's SaveAndExit backup; its diff base
                 // is the first save that opened it.
+
+    // Configurable top-row panes (see plan: configurable dashboard top row).
+    Character,   // Character summary + session XP for one character (or auto).
+    SessionLoot, // New uniques, sets, and runes since the session anchor.
+    Uber,        // Uber-key state: keys, torch, ubers, ancients, torch-by-class.
+    TerrorZone,  // Worldstone shard counts for terror-zone farming.
 };
 
 enum class ChronicleCategory : std::uint8_t {
@@ -105,8 +111,32 @@ struct PaneConfig {
     // plus the matching stash backup. When false, the anchor tracks
     // whatever SaveAndExit the scheduler last captured (auto mode).
     // Pins are per-pane and persisted across dashboard restarts.
+    //
+    // Also read by the Character and SessionLoot panes -- both build
+    // their anchor from the same fields, keyed on the resolved
+    // character (see `characterSelection`).
     bool              sessionAnchorPinned     = false;
     std::int64_t      sessionAnchorPinnedDate = 0;   // unix seconds
+
+    // Character / SessionLoot / Backups (via the first Character pane).
+    // Empty string means "auto" -- pick the character with the newest
+    // save timestamp. A non-empty value is the .d2s file stem
+    // (e.g. "Kai"), matching how BackupDb keys its rows.
+    std::string       characterSelection;
+
+    // Uber pane toggles. Keys, torches, and ancients are always
+    // shown; these gate optional sections.
+    bool              uberShowUbers        = false; // Diablo's Horn / Mephisto's Brain / Baal's Eye
+    bool              uberShowTorchByClass = false; // per-class Hellfire Torch counts
+
+    // SessionLoot pane toggle. Runes ride the same session-anchor diff
+    // as uniques/sets but need a separate stack-count snapshot.
+    bool              sessionLootShowRunes = true;
+
+    // Uniques Chronicle pane toggle. Surfaces the no-tier "Miscellaneous"
+    // section holding Rainbow Facets + Colossal Jewels (chronicled
+    // in-game but currently absent from every tier bucket).
+    bool              uniquesShowMisc      = true;
 
     // Chronicle + Inventory + Reconcile.
     std::string       searchQuery;
@@ -183,6 +213,13 @@ void     closeDashboardConfigDb(sqlite3* db);
 // the stored JSON fails to parse.
 PaneNode loadPaneTree(sqlite3* db);
 void     savePaneTree(sqlite3* db, const PaneNode& root);
+
+// Pure JSON round-trip helpers. Same encoding used by savePaneTree /
+// loadPaneTree; exposed so tests (and any future non-SQLite consumer)
+// can exercise the shape without touching the config DB. `fromJson`
+// substitutes a Blank leaf for any subtree that fails to parse.
+std::string serializePaneTree(const PaneNode& root);
+PaneNode    deserializePaneTree(std::string_view json);
 
 // Persisted retention config for the backup subsystem. Loaded from
 // `dashboard.sqlite`; stored back on Save from the Backups pane

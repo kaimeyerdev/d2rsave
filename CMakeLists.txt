@@ -138,21 +138,30 @@ if(D2R_USE_VCPKG)
     # when available for live refresh.
     # -----------------------------------------------------------------------
     if(D2R_FULL_STACK)
+        # Dashboard config model (PaneNode / PaneConfig / JSON round-trip
+        # + SQLite persistence) lives in the core library so both the
+        # dashboard renderer and the test binary can consume it. Only the
+        # FTXUI renderer itself is gated on ftxui below.
+        find_package(nlohmann_json CONFIG QUIET)
+        if(TARGET nlohmann_json::nlohmann_json)
+            target_sources(d2rsave_core PRIVATE src/dashboard_config.cpp)
+            target_link_libraries(d2rsave_core PRIVATE nlohmann_json::nlohmann_json)
+            target_compile_definitions(d2rsave_core PUBLIC D2R_HAVE_DASHBOARD_CONFIG=1)
+        else()
+            message(WARNING "d2rsave: nlohmann_json missing; dashboard config persistence disabled.")
+        endif()
+
         find_package(ftxui CONFIG QUIET)
-        if(TARGET ftxui::screen AND TARGET ftxui::dom AND TARGET ftxui::component)
+        if(TARGET ftxui::screen AND TARGET ftxui::dom AND TARGET ftxui::component
+           AND TARGET nlohmann_json::nlohmann_json)
             message(STATUS "d2rsave: ftxui available; enabling 'dashboard' subcommand.")
             target_sources(d2rsave PRIVATE
                 src/dashboard_model.cpp
                 src/dashboard_ftxui.cpp
-                src/dashboard_config.cpp
             )
             target_link_libraries(d2rsave PRIVATE
-                ftxui::screen ftxui::dom ftxui::component)
-            if(TARGET nlohmann_json::nlohmann_json)
-                target_link_libraries(d2rsave PRIVATE nlohmann_json::nlohmann_json)
-            else()
-                message(WARNING "d2rsave: nlohmann_json missing; dashboard config persistence disabled.")
-            endif()
+                ftxui::screen ftxui::dom ftxui::component
+                nlohmann_json::nlohmann_json)
             target_compile_definitions(d2rsave PRIVATE D2R_HAVE_DASHBOARD=1)
         else()
             message(STATUS "d2rsave: ftxui missing; 'dashboard' subcommand disabled.")

@@ -71,13 +71,17 @@ PaneNode makeDefaultLayout() {
 
 std::string_view toString(PaneType t) {
     switch (t) {
-        case PaneType::Blank:     return "blank";
-        case PaneType::Chronicle: return "chronicle";
-        case PaneType::Inventory: return "inventory";
-        case PaneType::Reconcile: return "reconcile";
-        case PaneType::Backups:   return "backups";
-        case PaneType::BackupLog: return "backup_log";
-        case PaneType::Session:   return "session";
+        case PaneType::Blank:       return "blank";
+        case PaneType::Chronicle:   return "chronicle";
+        case PaneType::Inventory:   return "inventory";
+        case PaneType::Reconcile:   return "reconcile";
+        case PaneType::Backups:     return "backups";
+        case PaneType::BackupLog:   return "backup_log";
+        case PaneType::Session:     return "session";
+        case PaneType::Character:   return "character";
+        case PaneType::SessionLoot: return "session_loot";
+        case PaneType::Uber:        return "uber";
+        case PaneType::TerrorZone:  return "terror_zone";
     }
     return "blank";
 }
@@ -161,19 +165,31 @@ std::string paneTitle(const PaneConfig& c) {
                 return "Backups  " + c.selectedBackupFile;
             }
             return "Backups";
-        case PaneType::BackupLog: return "Backup Actions";
-        case PaneType::Session:   return "Session";
+        case PaneType::BackupLog:   return "Backup Actions";
+        case PaneType::Session:     return "Session";
+        case PaneType::Character: {
+            std::string t = "Character";
+            if (!c.characterSelection.empty()) t += "  " + c.characterSelection;
+            return t;
+        }
+        case PaneType::SessionLoot: return "Session Loot";
+        case PaneType::Uber:        return "Uber";
+        case PaneType::TerrorZone:  return "Terror Zone";
     }
     return "(unconfigured)";
 }
 
 PaneType paneTypeFromString(std::string_view s) {
-    if (s == "chronicle")   return PaneType::Chronicle;
-    if (s == "inventory")   return PaneType::Inventory;
-    if (s == "reconcile")   return PaneType::Reconcile;
-    if (s == "backups")     return PaneType::Backups;
-    if (s == "backup_log")  return PaneType::BackupLog;
-    if (s == "session")     return PaneType::Session;
+    if (s == "chronicle")    return PaneType::Chronicle;
+    if (s == "inventory")    return PaneType::Inventory;
+    if (s == "reconcile")    return PaneType::Reconcile;
+    if (s == "backups")      return PaneType::Backups;
+    if (s == "backup_log")   return PaneType::BackupLog;
+    if (s == "session")      return PaneType::Session;
+    if (s == "character")    return PaneType::Character;
+    if (s == "session_loot") return PaneType::SessionLoot;
+    if (s == "uber")         return PaneType::Uber;
+    if (s == "terror_zone")  return PaneType::TerrorZone;
     return PaneType::Blank;
 }
 
@@ -263,6 +279,9 @@ nlohmann::json toJson(const PaneNode& n) {
         j["sortKey"]      = std::string(toString(c.sortKey));
         j["sortAsc"]      = c.sortAsc;
         j["ownership"]    = std::string(toString(c.ownership));
+        // Only meaningful on Uniques categories; kept flat for shape
+        // stability. Default (true) is elided.
+        if (!c.uniquesShowMisc) j["uniquesShowMisc"] = false;
     }
     if (c.type == PaneType::Inventory) {
         j["inventoryQualityMask"] = c.inventoryQualityMask;
@@ -274,9 +293,22 @@ nlohmann::json toJson(const PaneNode& n) {
         j["backupViewMode"]     = std::string(toString(c.backupViewMode));
         j["selectedBackupFile"] = c.selectedBackupFile;
     }
-    if (c.type == PaneType::Session) {
+    if (c.type == PaneType::Session
+     || c.type == PaneType::Character
+     || c.type == PaneType::SessionLoot) {
         j["sessionAnchorPinned"]     = c.sessionAnchorPinned;
         j["sessionAnchorPinnedDate"] = c.sessionAnchorPinnedDate;
+    }
+    if (c.type == PaneType::Character
+     || c.type == PaneType::SessionLoot) {
+        j["characterSelection"] = c.characterSelection;
+    }
+    if (c.type == PaneType::Uber) {
+        j["uberShowUbers"]        = c.uberShowUbers;
+        j["uberShowTorchByClass"] = c.uberShowTorchByClass;
+    }
+    if (c.type == PaneType::SessionLoot) {
+        j["sessionLootShowRunes"] = c.sessionLootShowRunes;
     }
     if (c.type == PaneType::Chronicle
      || c.type == PaneType::Inventory
@@ -311,6 +343,7 @@ PaneNode fromJson(const nlohmann::json& j) {
             n.config.sortAsc   = j.value("sortAsc", true);
             n.config.ownership = ownershipFromString(
                 j.value("ownership", std::string("all")));
+            n.config.uniquesShowMisc = j.value("uniquesShowMisc", true);
         }
         if (n.config.type == PaneType::Inventory) {
             n.config.inventoryQualityMask = j.value(
@@ -326,11 +359,25 @@ PaneNode fromJson(const nlohmann::json& j) {
             n.config.selectedBackupFile = j.value(
                 "selectedBackupFile", std::string());
         }
-        if (n.config.type == PaneType::Session) {
+        if (n.config.type == PaneType::Session
+         || n.config.type == PaneType::Character
+         || n.config.type == PaneType::SessionLoot) {
             n.config.sessionAnchorPinned     = j.value(
                 "sessionAnchorPinned", false);
             n.config.sessionAnchorPinnedDate = j.value(
                 "sessionAnchorPinnedDate", std::int64_t{0});
+        }
+        if (n.config.type == PaneType::Character
+         || n.config.type == PaneType::SessionLoot) {
+            n.config.characterSelection = j.value(
+                "characterSelection", std::string());
+        }
+        if (n.config.type == PaneType::Uber) {
+            n.config.uberShowUbers        = j.value("uberShowUbers", false);
+            n.config.uberShowTorchByClass = j.value("uberShowTorchByClass", false);
+        }
+        if (n.config.type == PaneType::SessionLoot) {
+            n.config.sessionLootShowRunes = j.value("sessionLootShowRunes", true);
         }
         if (n.config.type == PaneType::Chronicle
          || n.config.type == PaneType::Inventory
@@ -384,6 +431,21 @@ void savePaneTree(sqlite3* db, const PaneNode& root) {
                       static_cast<int>(payload.size()), SQLITE_TRANSIENT);
     sqlite3_step(stmt);
     sqlite3_finalize(stmt);
+}
+
+std::string serializePaneTree(const PaneNode& root) {
+    return toJson(root).dump();
+}
+
+PaneNode deserializePaneTree(std::string_view json) {
+    try {
+        // nlohmann::json::parse takes a string-like input; construct
+        // explicitly since std::string_view isn't directly consumable
+        // by every overload.
+        return fromJson(nlohmann::json::parse(std::string(json)));
+    } catch (const std::exception&) {
+        return PaneNode{};
+    }
 }
 
 namespace {

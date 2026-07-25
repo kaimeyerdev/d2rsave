@@ -51,6 +51,13 @@ namespace {
 
 using namespace ftxui;
 
+// Shared highlight color used for section headers, session-gain
+// overlays, and any pane-level "attention" accents. Kept as a single
+// constant so the palette can be tweaked in one place. Cannot be
+// constexpr because ftxui::Color is not a literal type; inline const
+// gives us one shared instance across TUs without a definition file.
+inline const Color kHighlightColor = Color::Cyan;
+
 // --------------------------- small util helpers -----------------------------
 
 std::string classString(CharacterClass c) {
@@ -829,7 +836,7 @@ Element renderChronicleByTier(const PaneConfig& c, const DashboardSnapshot& s,
                                        + "/" + std::to_string(st.total)
                                        + "  (" + std::to_string(pct) + "%)";
             body.push_back(hbox({
-                text(" " + dr.header) | bold | color(Color::Cyan),
+                text(" " + dr.header) | bold | color(kHighlightColor),
                 text(countTxt) | dim,
             }));
             firstBanner = false;
@@ -2238,6 +2245,16 @@ Element renderPane(PaneNode& node, const UiState& ui,
                                         node.config.sessionAnchorPinned);
             break;
         case PaneType::Blank:
+            leafEl = renderBlankLeaf(focused);
+            break;
+        // TODO(dashboard-redesign phases 2-5): real renderers land in the
+        // following phases. Until then, these fall through to the same
+        // blank placeholder so the pane type is selectable via the
+        // config menu without crashing the layout.
+        case PaneType::Character:
+        case PaneType::SessionLoot:
+        case PaneType::Uber:
+        case PaneType::TerrorZone:
             leafEl = renderBlankLeaf(focused);
             break;
     }
