@@ -118,6 +118,15 @@ struct PaneConfig {
     bool              sessionAnchorPinned     = false;
     std::int64_t      sessionAnchorPinnedDate = 0;   // unix seconds
 
+    // Optional pinned end of the current session (unix seconds). Zero
+    // means "auto" -- the session end tracks the newest backup after
+    // the (pinned or auto) session start. A non-zero value clamps the
+    // pane's displayed session-end datetime + duration to the given
+    // instant. Item / rune diffs still compare against the start-side
+    // anchor snapshot; the end pin only bounds the pane's visible
+    // window (matches how the start pin already works).
+    std::int64_t      sessionAnchorPinnedEndDate = 0;   // unix seconds; 0 = auto
+
     // Character / SessionLoot / Backups (via the first Character pane).
     // Empty string means "auto" -- pick the character with the newest
     // save timestamp. A non-empty value is the .d2s file stem

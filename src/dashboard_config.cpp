@@ -204,7 +204,7 @@ std::string paneTitle(const PaneConfig& c) {
             if (!c.characterSelection.empty()) t += "  " + c.characterSelection;
             return t;
         }
-        case PaneType::SessionLoot: return "Session Loot";
+        case PaneType::SessionLoot: return "Session Info";
         case PaneType::Uber:        return "Uber";
         case PaneType::TerrorZone:  return "Terror Zone";
     }
@@ -328,8 +328,13 @@ nlohmann::json toJson(const PaneNode& n) {
     if (c.type == PaneType::Session
      || c.type == PaneType::Character
      || c.type == PaneType::SessionLoot) {
-        j["sessionAnchorPinned"]     = c.sessionAnchorPinned;
-        j["sessionAnchorPinnedDate"] = c.sessionAnchorPinnedDate;
+        j["sessionAnchorPinned"]         = c.sessionAnchorPinned;
+        j["sessionAnchorPinnedDate"]     = c.sessionAnchorPinnedDate;
+        // Only emit end pin when set; keeps stored JSON tidy for the
+        // common auto-end case.
+        if (c.sessionAnchorPinnedEndDate > 0) {
+            j["sessionAnchorPinnedEndDate"] = c.sessionAnchorPinnedEndDate;
+        }
     }
     if (c.type == PaneType::Character
      || c.type == PaneType::SessionLoot) {
@@ -398,6 +403,8 @@ PaneNode fromJson(const nlohmann::json& j) {
                 "sessionAnchorPinned", false);
             n.config.sessionAnchorPinnedDate = j.value(
                 "sessionAnchorPinnedDate", std::int64_t{0});
+            n.config.sessionAnchorPinnedEndDate = j.value(
+                "sessionAnchorPinnedEndDate", std::int64_t{0});
         }
         if (n.config.type == PaneType::Character
          || n.config.type == PaneType::SessionLoot) {

@@ -117,6 +117,28 @@ std::uint64_t cumulativeXp(std::uint32_t level, std::uint64_t inLevel) {
     return prev + inLevel;
 }
 
+// Forward-declared here so renderers in this first anonymous namespace
+// (Character, SessionLoot) can format timestamps; the definitions live
+// alongside the other backup-pane helpers further down.
+std::string formatWallDateTime(std::int64_t unix) {
+    if (unix <= 0) return "-";
+    const std::time_t t = static_cast<std::time_t>(unix);
+    std::tm tm{};
+    localtime_r(&t, &tm);
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm);
+    return buf;
+}
+std::string formatWallDate(std::int64_t unix) {
+    if (unix <= 0) return "-";
+    const std::time_t t = static_cast<std::time_t>(unix);
+    std::tm tm{};
+    localtime_r(&t, &tm);
+    char buf[16];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%d", &tm);
+    return buf;
+}
+
 // ---------------------- chronicle category dispatch -------------------------
 
 struct KindTier { ChronicleKind kind; std::uint32_t tierMask; };
@@ -165,10 +187,12 @@ struct UiState {
         std::int64_t characterDate = 0;
         std::int64_t stashDate     = 0;
         std::int64_t pinnedDate    = 0;
+        std::int64_t pinnedEndDate = 0;   // 0 when end is auto
         bool operator==(const SessionAnchorCacheKey& o) const noexcept {
             return characterDate == o.characterDate
                 && stashDate     == o.stashDate
-                && pinnedDate    == o.pinnedDate;
+                && pinnedDate    == o.pinnedDate
+                && pinnedEndDate == o.pinnedEndDate;
         }
     };
     SessionAnchorCacheKey                     sessionAnchorCacheKey{};
@@ -268,6 +292,11 @@ struct UiState {
         std::string                       filename;          // e.g. "Kai.d2s"
         std::vector<BackupDb::HistoryRow> rows;              // newest-first
         int                               cursor = 0;
+        // Distinguishes the two roles this modal serves:
+        //   false -> pick the session anchor (start-of-session boundary).
+        //   true  -> pick the session end (the last moment to include).
+        // Same UI shape; only the commit target + modal title differ.
+        bool                              isEnd  = false;
     } sessionPicker;
     bool                                      sessionPickerVisible = false;
 
@@ -627,7 +656,8 @@ Element renderCharacterPane(const PaneConfig&        cfg,
 }
 
 // -----------------------------------------------------------------------
-// Session Loot pane (configurable top-row): new uniques, sets, and
+// Session Info pane (configurable top-row, formerly "Session Loot"):
+// session boundaries (start / end / duration) + new uniques, sets, and
 // runes gained during the current play session. Diffs the snapshot's
 // inventory against the SessionAnchor's item keys (for uniques/sets)
 // and against the anchor's rune stack map (for runes).
@@ -643,11 +673,37 @@ bool isRuneCode(const std::string& code) {
         && code[2] >= '0' && code[2] <= '9';
 }
 
+// Format a positive elapsed span as "Xh MMm SSs". Zero renders as
+// "0h 00m 00s". Negative inputs clamp to zero.
+std::string formatElapsedHMS(std::int64_t seconds) {
+    if (seconds < 0) seconds = 0;
+    const std::int64_t h =  seconds / 3600;
+    const std::int64_t m = (seconds % 3600) / 60;
+    const std::int64_t s =  seconds % 60;
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%lldh %02lldm %02llds",
+                  static_cast<long long>(h),
+                  static_cast<long long>(m),
+                  static_cast<long long>(s));
+    return buf;
+}
+
 Element renderSessionLootPane(const PaneConfig&        cfg,
                               const DashboardSnapshot& s,
                               const SessionAnchor*     anchor,
                               bool                     focused) {
-    Element titleEl = text(" Session Loot ");
+    // Title reflects pin state:
+    //   " Session Info "                -- both start + end auto
+    //   " Session Info (pinned start) " -- start pinned only
+    //   " Session Info (pinned end) "   -- end pinned only
+    //   " Session Info (pinned) "       -- both start + end pinned
+    const bool startPinned = cfg.sessionAnchorPinned && cfg.sessionAnchorPinnedDate > 0;
+    const bool endPinned   = cfg.sessionAnchorPinnedEndDate > 0;
+    std::string titleStr = " Session Info ";
+    if (startPinned && endPinned)       titleStr = " Session Info (pinned) ";
+    else if (startPinned)               titleStr = " Session Info (pinned start) ";
+    else if (endPinned)                 titleStr = " Session Info (pinned end) ";
+    Element titleEl = text(titleStr);
     if (focused) titleEl = titleEl | inverted;
 
     if (!anchor) {
@@ -738,6 +794,34 @@ Element renderSessionLootPane(const PaneConfig&        cfg,
     };
 
     Elements body;
+
+    // ---- Session window: Start / End / Duration ----
+    // Values from the anchor are already correctly clamped by
+    // buildSessionAnchor (which honors the pane's pinned end).
+    // A trailing "(pin)" suffix flags each field that the user set
+    // explicitly, so the pane never lies about its provenance.
+    body.push_back(hbox({
+        text("Start ") | bold,
+        text(formatWallDateTime(anchor->sessionStartEpoch)),
+        text(startPinned ? "  (pin)" : "") | dim,
+    }));
+    body.push_back(hbox({
+        text("End   ") | bold,
+        text(formatWallDateTime(anchor->sessionEndEpoch)),
+        text(endPinned ? "  (pin)" : "") | dim,
+    }));
+    {
+        std::int64_t secs = 0;
+        if (anchor->sessionStartEpoch != 0 && anchor->sessionEndEpoch != 0) {
+            secs = anchor->sessionEndEpoch - anchor->sessionStartEpoch;
+        }
+        body.push_back(hbox({
+            text("Time  ") | bold,
+            text(formatElapsedHMS(secs)),
+        }));
+    }
+    body.push_back(separator());
+
     body.push_back(renderItemList("New Uniques", newUniques));
     body.push_back(text(""));
     body.push_back(renderItemList("New Sets", newSets));
@@ -1792,32 +1876,15 @@ std::string_view backupStateShortLabel(BackupDb::State s) {
 // the machine's local zone because the user is comparing against wall-
 // clock events they lived through, not against UTC events they never
 // see.
-std::string formatWallDateTime(std::int64_t unix) {
-    if (unix <= 0) return "-";
-    const std::time_t t = static_cast<std::time_t>(unix);
-    std::tm tm{};
-    localtime_r(&t, &tm);
-    char buf[32];
-    std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm);
-    return buf;
-}
+// -- formatWallDateTime / formatWallDate are now defined in the top
+// anonymous namespace above so top-row renderers (Character,
+// SessionLoot) can format timestamps too. Kept as a single definition
+// per TU; this stub block is intentionally empty.
 
 bool isSharedStashName(std::string_view name) {
     if (name.size() < 4) return false;
     const auto suffix = name.substr(name.size() - 4);
     return (suffix == ".d2i" || suffix == ".D2I");
-}
-
-// Compact date-only formatter (falls back for narrow panes). ISO-ish,
-// local zone, same as formatWallDateTime but only YYYY-MM-DD.
-std::string formatWallDate(std::int64_t unix) {
-    if (unix <= 0) return "-";
-    const std::time_t t = static_cast<std::time_t>(unix);
-    std::tm tm{};
-    localtime_r(&t, &tm);
-    char buf[16];
-    std::strftime(buf, sizeof(buf), "%Y-%m-%d", &tm);
-    return buf;
 }
 
 // User-facing label for a backup row:
@@ -2371,8 +2438,8 @@ Element renderSessionLeaf(const DashboardSnapshot& now,
     // New-item lists (uniques / sets / runes since the anchor) moved
     // to PaneType::SessionLoot as part of the configurable-top-row
     // work. This bottom-row pane now focuses purely on XP + duration;
-    // add a Session Loot pane to see the loot rundown.
-    body.push_back(text("Add a 'Session Loot' pane to see new items,")
+    // add a Session Info pane to see the loot rundown.
+    body.push_back(text("Add a 'Session Info' pane to see new items,")
                    | dim);
     body.push_back(text("uniques, and rune drops for this session.")
                    | dim);
@@ -2480,7 +2547,9 @@ Element renderRetentionModal(const UiState::RetentionModal& m,
 // Column layout matches the Backups Detail view so the two look and
 // feel identical when scrolling around.
 Element renderSessionPickerModal(const UiState::SessionPicker& p) {
-    Element titleEl = text(" Pick session anchor  " + p.filename + " ");
+    Element titleEl = text(
+        std::string(p.isEnd ? " Pick session end  " : " Pick session anchor  ")
+        + p.filename + " ");
 
     if (p.rows.empty()) {
         return window(titleEl, vbox({
@@ -2595,6 +2664,8 @@ struct ConfigMenuItem {
         ResetSession,
         PickSessionAnchor,
         UnpinSessionAnchor,
+        PickSessionEnd,
+        UnpinSessionEnd,
         PickCharacter,
         ResetCharacterToAuto,
         ToggleUberShowUbers,
@@ -2672,16 +2743,32 @@ std::vector<ConfigMenuItem> buildConfigMenu(const PaneConfig& c, bool canDelete)
     if (c.type == PaneType::BackupLog) {
         items.push_back({"clear backup-actions log", ConfigMenuItem::ClearBackupLog});
     }
-    if (c.type == PaneType::Session) {
+    // Session-anchor pin controls live on every pane that consumes the
+    // anchor (Session, SessionLoot, Character). Each pane can pin the
+    // session start (item-diff base) and/or the session end (display
+    // clamp); the anchor scan in runDashboard picks up the first pin
+    // it finds across those pane types.
+    if (c.type == PaneType::Session
+     || c.type == PaneType::SessionLoot) {
         if (c.sessionAnchorPinned && c.sessionAnchorPinnedDate > 0) {
             items.push_back({
-                "anchor: pinned @ " + formatWallDateTime(c.sessionAnchorPinnedDate),
+                "start:  pinned @ " + formatWallDateTime(c.sessionAnchorPinnedDate),
                 ConfigMenuItem::PickSessionAnchor});
-            items.push_back({"unpin anchor (auto-track current session)",
+            items.push_back({"unpin start (auto-track current session)",
                               ConfigMenuItem::UnpinSessionAnchor});
         } else {
-            items.push_back({"anchor: auto (last Save & Exit)  --  [pick backup...]",
+            items.push_back({"start:  auto (last Save & Exit)  --  [pick backup...]",
                               ConfigMenuItem::PickSessionAnchor});
+        }
+        if (c.sessionAnchorPinnedEndDate > 0) {
+            items.push_back({
+                "end:    pinned @ " + formatWallDateTime(c.sessionAnchorPinnedEndDate),
+                ConfigMenuItem::PickSessionEnd});
+            items.push_back({"unpin end (auto-track newest backup)",
+                              ConfigMenuItem::UnpinSessionEnd});
+        } else {
+            items.push_back({"end:    auto (newest backup)  --  [pick backup...]",
+                              ConfigMenuItem::PickSessionEnd});
         }
         items.push_back({"reset session anchor now",
                           ConfigMenuItem::ResetSession});
@@ -3185,7 +3272,8 @@ int runDashboard(const std::filesystem::path& savePath,
     // base to a specific historical moment instead of auto-tracking.
     auto buildSessionAnchor =
         [&](const std::shared_ptr<const DashboardSnapshot>& current,
-            std::optional<std::int64_t>                     pinnedDate = std::nullopt)
+            std::optional<std::int64_t>                     pinnedDate    = std::nullopt,
+            std::optional<std::int64_t>                     pinnedEndDate = std::nullopt)
         -> std::shared_ptr<const SessionAnchor> {
         // Fallback used when we can't build a proper anchor -- treats
         // the current snapshot's active player + inventory as the
@@ -3326,13 +3414,29 @@ int runDashboard(const std::filesystem::path& savePath,
         }
 
         // Step 3: cache check. During autosave bursts the (character
-        // date, stash date, pinned date) tuple usually stays stable
+        // date, stash date, pinned dates) tuple usually stays stable
         // across many rebuilds -- return the previously-built anchor
         // without touching the parser.
+        //
+        // End-pin clamp: if the user pinned an end date, clamp
+        // sessionEndEpoch to <= that value (never past it). If the
+        // pinned end is BEFORE the current start, both collapse to
+        // the pin so the pane reads "0h 00m 00s starting at <pin>".
+        if (pinnedEndDate) {
+            const auto pin = *pinnedEndDate;
+            if (sessionEndEpoch == 0 || sessionEndEpoch > pin) {
+                sessionEndEpoch = pin;
+            }
+            if (sessionStartEpoch > sessionEndEpoch) {
+                sessionStartEpoch = sessionEndEpoch;
+            }
+        }
+
         const UiState::SessionAnchorCacheKey key{
             anchorDate,
             stashDate,
             pinnedDate.value_or(0),
+            pinnedEndDate.value_or(0),
         };
         if (ui.sessionAnchor && ui.sessionAnchorCacheKey == key) {
             // Item-diff fields (playerName/level/itemKeys) are still
@@ -3382,22 +3486,38 @@ int runDashboard(const std::filesystem::path& savePath,
         return anchor;
 #else
         (void)pinnedDate;
+        (void)pinnedEndDate;
         return anchorFromCurrent();
 #endif
     };
 
-    // Locate the first Session pane in the current layout that has a
-    // user-pinned anchor date. Returns nullopt when none is pinned
-    // (auto mode: buildSessionAnchor picks the newest S&E). Multiple
-    // Session panes share one global anchor; if two panes disagree,
-    // the first-in-DFS pin wins -- documented in the pane's config
-    // menu so the user knows the tradeoff.
+    // Locate the first pinned session start in the current layout.
+    // Session, SessionLoot, and Character panes all consume the anchor;
+    // pin priority is DFS order + first-wins across those pane types.
+    // Returns nullopt when no pane is pinned (auto mode:
+    // buildSessionAnchor picks the newest S&E).
     auto sessionPinFromLayout = [&]() -> std::optional<std::int64_t> {
         for (const auto* leaf : flattenLeaves(ui.rootPane)) {
-            if (leaf->config.type == PaneType::Session &&
-                leaf->config.sessionAnchorPinned &&
+            const auto t = leaf->config.type;
+            if ((t != PaneType::Session
+              && t != PaneType::SessionLoot
+              && t != PaneType::Character)) continue;
+            if (leaf->config.sessionAnchorPinned &&
                 leaf->config.sessionAnchorPinnedDate > 0) {
                 return leaf->config.sessionAnchorPinnedDate;
+            }
+        }
+        return std::nullopt;
+    };
+    // Companion: first pinned session end across the same pane types.
+    auto sessionEndPinFromLayout = [&]() -> std::optional<std::int64_t> {
+        for (const auto* leaf : flattenLeaves(ui.rootPane)) {
+            const auto t = leaf->config.type;
+            if ((t != PaneType::Session
+              && t != PaneType::SessionLoot
+              && t != PaneType::Character)) continue;
+            if (leaf->config.sessionAnchorPinnedEndDate > 0) {
+                return leaf->config.sessionAnchorPinnedEndDate;
             }
         }
         return std::nullopt;
@@ -3415,7 +3535,9 @@ int runDashboard(const std::filesystem::path& savePath,
         // Anchor the session view on the start of the current-or-just-
         // ended play session (see buildSessionAnchor above); refreshed
         // by the user from the Session pane's config menu.
-        ui.sessionAnchor = buildSessionAnchor(ui.snapshot, sessionPinFromLayout());
+        ui.sessionAnchor = buildSessionAnchor(ui.snapshot,
+                                              sessionPinFromLayout(),
+                                              sessionEndPinFromLayout());
     }
 
     auto screen = ScreenInteractive::Fullscreen();
@@ -3478,7 +3600,9 @@ int runDashboard(const std::filesystem::path& savePath,
         // or-just-ended session (see buildSessionAnchor above). Without
         // this refresh the anchor would go permanently stale after the
         // first S&E of a long-running dashboard.
-        auto anchor = buildSessionAnchor(snap, sessionPinFromLayout());
+        auto anchor = buildSessionAnchor(snap,
+                                          sessionPinFromLayout(),
+                                          sessionEndPinFromLayout());
         std::lock_guard g(ui.snapshotMutex);
         ui.snapshot      = std::move(snap);
         ui.sessionAnchor = std::move(anchor);
@@ -3731,6 +3855,7 @@ int runDashboard(const std::filesystem::path& savePath,
                 ui.sessionPickerVisible = false;
                 p.target = nullptr;
                 p.rows.clear();
+                p.isEnd = false;
                 return true;
             }
             if (n == 0) return true;   // empty list; only Esc is meaningful
@@ -3754,12 +3879,17 @@ int runDashboard(const std::filesystem::path& savePath,
             if (e == Event::End)  { p.cursor = n - 1; return true; }
             if (e == Event::Return) {
                 if (p.target) {
-                    p.target->config.sessionAnchorPinned     = true;
-                    p.target->config.sessionAnchorPinnedDate = p.rows[p.cursor].date;
+                    if (p.isEnd) {
+                        p.target->config.sessionAnchorPinnedEndDate = p.rows[p.cursor].date;
+                    } else {
+                        p.target->config.sessionAnchorPinned     = true;
+                        p.target->config.sessionAnchorPinnedDate = p.rows[p.cursor].date;
+                    }
                 }
                 ui.sessionPickerVisible = false;
                 p.target = nullptr;
                 p.rows.clear();
+                p.isEnd = false;
                 persistLayout();
                 rebuild();   // re-run buildSessionAnchor with the new pin
                 return true;
@@ -3910,7 +4040,9 @@ int runDashboard(const std::filesystem::path& savePath,
                             std::lock_guard<std::mutex> g(ui.snapshotMutex);
                             snapNow = ui.snapshot;
                         }
-                        auto rebuilt = buildSessionAnchor(snapNow, sessionPinFromLayout());
+                        auto rebuilt = buildSessionAnchor(snapNow,
+                                                          sessionPinFromLayout(),
+                                                          sessionEndPinFromLayout());
                         {
                             std::lock_guard<std::mutex> g(ui.snapshotMutex);
                             ui.sessionAnchor = std::move(rebuilt);
@@ -3954,6 +4086,7 @@ int runDashboard(const std::filesystem::path& savePath,
                         ui.sessionPicker.filename = std::move(filename);
                         ui.sessionPicker.rows     = std::move(rows);
                         ui.sessionPicker.cursor   = cursor;
+                        ui.sessionPicker.isEnd    = false;
                         ui.sessionPickerVisible   = true;
                         ui.configMode             = false;
                         break;
@@ -3964,6 +4097,53 @@ int runDashboard(const std::filesystem::path& savePath,
                         ui.configMode = false;
                         persistLayout();
                         rebuild();   // return to auto = newest S&E
+                        break;
+                    }
+                    case ConfigMenuItem::PickSessionEnd: {
+                        // Same modal shape as PickSessionAnchor, but
+                        // the modal's isEnd flag tells its Enter handler
+                        // to write to sessionAnchorPinnedEndDate.
+                        std::shared_ptr<const DashboardSnapshot> snapNow;
+                        {
+                            std::lock_guard<std::mutex> g(ui.snapshotMutex);
+                            snapNow = ui.snapshot;
+                        }
+                        std::string filename;
+                        if (snapNow && snapNow->hasActivePlayer)
+                            filename = snapNow->activePlayer.file;
+#if D2R_HAVE_INOTIFY
+                        std::vector<BackupDb::HistoryRow> rows;
+                        if (ui.backupDb && !filename.empty()) {
+                            try { rows = ui.backupDb->historyFor(filename, 500); }
+                            catch (const std::exception&) {}
+                        }
+#else
+                        std::vector<BackupDb::HistoryRow> rows;
+#endif
+                        // Preselect the current end pin if it exists.
+                        int cursor = 0;
+                        if (leaf->config.sessionAnchorPinnedEndDate > 0) {
+                            for (int i = 0; i < (int)rows.size(); ++i) {
+                                if (rows[i].date == leaf->config.sessionAnchorPinnedEndDate) {
+                                    cursor = i;
+                                    break;
+                                }
+                            }
+                        }
+                        ui.sessionPicker.target   = leaf;
+                        ui.sessionPicker.filename = std::move(filename);
+                        ui.sessionPicker.rows     = std::move(rows);
+                        ui.sessionPicker.cursor   = cursor;
+                        ui.sessionPicker.isEnd    = true;
+                        ui.sessionPickerVisible   = true;
+                        ui.configMode             = false;
+                        break;
+                    }
+                    case ConfigMenuItem::UnpinSessionEnd: {
+                        leaf->config.sessionAnchorPinnedEndDate = 0;
+                        ui.configMode = false;
+                        persistLayout();
+                        rebuild();   // return to auto end = newest backup
                         break;
                     }
                     case ConfigMenuItem::PickCharacter: {
