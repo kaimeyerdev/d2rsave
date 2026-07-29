@@ -9,8 +9,11 @@
 #include <sqlite3.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <filesystem>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 
@@ -532,6 +535,150 @@ PaneNode deserializePaneTree(std::string_view json) {
     } catch (const std::exception&) {
         return PaneNode{};
     }
+}
+
+namespace {
+
+// Trim ASCII whitespace from both ends of a string_view. Case-folding
+// is left to the caller (only the "now" keyword needs it, and it's a
+// short string).
+std::string_view trim(std::string_view s) {
+    auto is_ws = [](char c) { return c == ' ' || c == '\t'
+                                     || c == '\r' || c == '\n'; };
+    while (!s.empty() && is_ws(s.front())) s.remove_prefix(1);
+    while (!s.empty() && is_ws(s.back()))  s.remove_suffix(1);
+    return s;
+}
+
+// Parse "Nh", "Nm", "Ns", or a combination like "1h30m45s" into a total
+// second count. The unit order isn't enforced (each unit may appear at
+// most once, but callers accept e.g. "30m1h" too -- this is a manual-
+// entry field, not a strict grammar).
+std::optional<std::int64_t> parseOffsetMagnitude(std::string_view s) {
+    if (s.empty()) return std::nullopt;
+    std::int64_t total = 0;
+    std::size_t i = 0;
+    while (i < s.size()) {
+        std::int64_t n = 0;
+        std::size_t start = i;
+        while (i < s.size() && s[i] >= '0' && s[i] <= '9') {
+            n = n * 10 + (s[i] - '0');
+            if (n > 24 * 3600 * 365) return std::nullopt;   // sanity
+            ++i;
+        }
+        if (i == start) return std::nullopt;   // no digits before unit
+        if (i >= s.size()) return std::nullopt;
+        std::int64_t mult = 0;
+        switch (s[i]) {
+            case 'h': case 'H': mult = 3600; break;
+            case 'm': case 'M': mult = 60;   break;
+            case 's': case 'S': mult = 1;    break;
+            default:            return std::nullopt;
+        }
+        total += n * mult;
+        ++i;
+    }
+    if (total == 0) return std::nullopt;
+    return total;
+}
+
+// Common validation for the six-field local wall-clock components.
+// Delegates to mktime for calendar / DST resolution.
+std::optional<std::int64_t>
+makeLocalEpoch(int year, int mon, int mday, int hour, int min, int sec) {
+    if (year < 1970 || year > 2100) return std::nullopt;
+    if (mon  < 1    || mon  > 12)   return std::nullopt;
+    if (mday < 1    || mday > 31)   return std::nullopt;
+    if (hour < 0    || hour > 23)   return std::nullopt;
+    if (min  < 0    || min  > 59)   return std::nullopt;
+    if (sec  < 0    || sec  > 60)   return std::nullopt;   // allow leap seconds
+    std::tm tm{};
+    tm.tm_year  = year - 1900;
+    tm.tm_mon   = mon  - 1;
+    tm.tm_mday  = mday;
+    tm.tm_hour  = hour;
+    tm.tm_min   = min;
+    tm.tm_sec   = sec;
+    tm.tm_isdst = -1;
+    const std::time_t t = std::mktime(&tm);
+    if (t == static_cast<std::time_t>(-1)) return std::nullopt;
+    return static_cast<std::int64_t>(t);
+}
+
+// Splice HH:MM:SS onto today's date (as of `now` in the local zone).
+std::optional<std::int64_t>
+makeTodayEpoch(std::int64_t now, int hour, int min, int sec) {
+    if (hour < 0 || hour > 23) return std::nullopt;
+    if (min  < 0 || min  > 59) return std::nullopt;
+    if (sec  < 0 || sec  > 60) return std::nullopt;
+    const std::time_t t = static_cast<std::time_t>(now);
+    std::tm tm{};
+    localtime_r(&t, &tm);
+    tm.tm_hour = hour;
+    tm.tm_min  = min;
+    tm.tm_sec  = sec;
+    tm.tm_isdst = -1;
+    const std::time_t out = std::mktime(&tm);
+    if (out == static_cast<std::time_t>(-1)) return std::nullopt;
+    return static_cast<std::int64_t>(out);
+}
+
+} // namespace
+
+std::optional<std::int64_t>
+parseUserDateTime(std::string_view input, std::int64_t now) {
+    const auto s = trim(input);
+
+    // Empty and "now" (any case) resolve to the reference epoch.
+    if (s.empty()) return now;
+    if (s.size() == 3) {
+        auto lc = [](char c) {
+            return (c >= 'A' && c <= 'Z') ? char(c - 'A' + 'a') : c;
+        };
+        if (lc(s[0]) == 'n' && lc(s[1]) == 'o' && lc(s[2]) == 'w') return now;
+    }
+
+    // Relative offset from now: "-1h", "-30m", "-1h30m", ...
+    if (s.front() == '-') {
+        const auto off = parseOffsetMagnitude(s.substr(1));
+        if (!off) return std::nullopt;
+        return now - *off;
+    }
+
+    // Absolute forms use sscanf + %n so trailing junk is rejected.
+    // Buffer must be null-terminated for sscanf.
+    const std::string buf(s);
+    int y = 0, mo = 0, d = 0, h = 0, mi = 0, se = 0;
+    int endPos = 0;
+
+    // YYYY-MM-DD HH:MM:SS
+    if (std::sscanf(buf.c_str(), "%d-%d-%d %d:%d:%d%n",
+                    &y, &mo, &d, &h, &mi, &se, &endPos) == 6
+        && endPos == static_cast<int>(buf.size())) {
+        return makeLocalEpoch(y, mo, d, h, mi, se);
+    }
+    // YYYY-MM-DD HH:MM
+    if (std::sscanf(buf.c_str(), "%d-%d-%d %d:%d%n",
+                    &y, &mo, &d, &h, &mi, &endPos) == 5
+        && endPos == static_cast<int>(buf.size())) {
+        return makeLocalEpoch(y, mo, d, h, mi, 0);
+    }
+    // YYYY-MM-DD
+    if (std::sscanf(buf.c_str(), "%d-%d-%d%n", &y, &mo, &d, &endPos) == 3
+        && endPos == static_cast<int>(buf.size())) {
+        return makeLocalEpoch(y, mo, d, 0, 0, 0);
+    }
+    // HH:MM:SS today
+    if (std::sscanf(buf.c_str(), "%d:%d:%d%n", &h, &mi, &se, &endPos) == 3
+        && endPos == static_cast<int>(buf.size())) {
+        return makeTodayEpoch(now, h, mi, se);
+    }
+    // HH:MM today
+    if (std::sscanf(buf.c_str(), "%d:%d%n", &h, &mi, &endPos) == 2
+        && endPos == static_cast<int>(buf.size())) {
+        return makeTodayEpoch(now, h, mi, 0);
+    }
+    return std::nullopt;
 }
 
 namespace {

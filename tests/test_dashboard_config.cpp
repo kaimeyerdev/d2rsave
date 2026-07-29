@@ -9,6 +9,8 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstdint>
+#include <ctime>
 #include <memory>
 #include <string>
 #include <utility>
@@ -225,4 +227,110 @@ TEST_CASE("Unknown pane-type strings fall back to Blank", "[dashboard_config]") 
     const auto back = d2r::deserializePaneTree(R"({"type":"unheard_of_pane"})");
     REQUIRE_FALSE(back.isSplit);
     REQUIRE(back.config.type == d2r::PaneType::Blank);
+}
+
+// ------------------------- parseUserDateTime -------------------------------
+//
+// Anchor the tests to a fixed reference "now" so today-relative and
+// offset-relative forms are deterministic. 2026-07-29 15:30:00 local
+// == unix 1785763800 in UTC, but we don't rely on that value; instead
+// we let mktime tell us what "today at HH:MM" resolves to under the
+// same tm structure the parser uses. This keeps the tests hermetic
+// against whichever timezone CI happens to be in.
+
+namespace {
+
+std::int64_t localEpoch(int y, int mo, int d, int h, int mi, int se) {
+    std::tm tm{};
+    tm.tm_year  = y - 1900;
+    tm.tm_mon   = mo - 1;
+    tm.tm_mday  = d;
+    tm.tm_hour  = h;
+    tm.tm_min   = mi;
+    tm.tm_sec   = se;
+    tm.tm_isdst = -1;
+    return static_cast<std::int64_t>(std::mktime(&tm));
+}
+
+// A reference "now" the parseUserDateTime tests use for offset + today
+// forms. Fixed date (2026-07-29 15:30:00 local); mktime resolves the
+// local epoch under the test host's timezone the same way the parser
+// will at runtime.
+const std::int64_t kNow = localEpoch(2026, 7, 29, 15, 30, 0);
+
+} // namespace
+
+TEST_CASE("parseUserDateTime: empty and 'now' resolve to reference epoch",
+          "[dashboard_config][datetime]") {
+    REQUIRE(d2r::parseUserDateTime("",     kNow) == kNow);
+    REQUIRE(d2r::parseUserDateTime("  ",   kNow) == kNow);
+    REQUIRE(d2r::parseUserDateTime("now",  kNow) == kNow);
+    REQUIRE(d2r::parseUserDateTime("Now",  kNow) == kNow);
+    REQUIRE(d2r::parseUserDateTime("NOW ", kNow) == kNow);
+}
+
+TEST_CASE("parseUserDateTime: relative offsets subtract from now",
+          "[dashboard_config][datetime]") {
+    REQUIRE(d2r::parseUserDateTime("-5m",     kNow) == kNow - 5 * 60);
+    REQUIRE(d2r::parseUserDateTime("-1h",     kNow) == kNow - 3600);
+    REQUIRE(d2r::parseUserDateTime("-30s",    kNow) == kNow - 30);
+    REQUIRE(d2r::parseUserDateTime("-1h30m",  kNow) == kNow - 3600 - 30 * 60);
+    REQUIRE(d2r::parseUserDateTime("-2H",     kNow) == kNow - 2 * 3600);
+    REQUIRE(d2r::parseUserDateTime("-1h2m3s", kNow) == kNow - 3600 - 2 * 60 - 3);
+}
+
+TEST_CASE("parseUserDateTime: rejects malformed relative offsets",
+          "[dashboard_config][datetime]") {
+    REQUIRE_FALSE(d2r::parseUserDateTime("-",     kNow).has_value());
+    REQUIRE_FALSE(d2r::parseUserDateTime("-abc",  kNow).has_value());
+    REQUIRE_FALSE(d2r::parseUserDateTime("-5",    kNow).has_value());
+    REQUIRE_FALSE(d2r::parseUserDateTime("-0",    kNow).has_value());
+    REQUIRE_FALSE(d2r::parseUserDateTime("-h",    kNow).has_value());
+    REQUIRE_FALSE(d2r::parseUserDateTime("-5x",   kNow).has_value());
+}
+
+TEST_CASE("parseUserDateTime: absolute ISO-ish datetimes",
+          "[dashboard_config][datetime]") {
+    REQUIRE(d2r::parseUserDateTime("2026-07-29 15:30:00", kNow)
+            == localEpoch(2026, 7, 29, 15, 30, 0));
+    REQUIRE(d2r::parseUserDateTime("2026-07-29 15:30",    kNow)
+            == localEpoch(2026, 7, 29, 15, 30, 0));
+    REQUIRE(d2r::parseUserDateTime("2026-07-29",          kNow)
+            == localEpoch(2026, 7, 29, 0, 0, 0));
+    // Trims outer whitespace but rejects trailing junk.
+    REQUIRE(d2r::parseUserDateTime("  2026-07-29 ",       kNow)
+            == localEpoch(2026, 7, 29, 0, 0, 0));
+    REQUIRE_FALSE(d2r::parseUserDateTime("2026-07-29 extra", kNow).has_value());
+}
+
+TEST_CASE("parseUserDateTime: today-relative HH:MM[:SS]",
+          "[dashboard_config][datetime]") {
+    REQUIRE(d2r::parseUserDateTime("14:15",     kNow)
+            == localEpoch(2026, 7, 29, 14, 15, 0));
+    REQUIRE(d2r::parseUserDateTime("14:15:30",  kNow)
+            == localEpoch(2026, 7, 29, 14, 15, 30));
+    REQUIRE(d2r::parseUserDateTime("00:00:00",  kNow)
+            == localEpoch(2026, 7, 29, 0, 0, 0));
+    REQUIRE(d2r::parseUserDateTime("23:59:59",  kNow)
+            == localEpoch(2026, 7, 29, 23, 59, 59));
+}
+
+TEST_CASE("parseUserDateTime: rejects out-of-range fields",
+          "[dashboard_config][datetime]") {
+    REQUIRE_FALSE(d2r::parseUserDateTime("2026-13-01",         kNow).has_value());
+    REQUIRE_FALSE(d2r::parseUserDateTime("2026-00-01",         kNow).has_value());
+    REQUIRE_FALSE(d2r::parseUserDateTime("2026-07-32",         kNow).has_value());
+    REQUIRE_FALSE(d2r::parseUserDateTime("2026-07-29 24:00",   kNow).has_value());
+    REQUIRE_FALSE(d2r::parseUserDateTime("2026-07-29 12:60",   kNow).has_value());
+    REQUIRE_FALSE(d2r::parseUserDateTime("1969-12-31",         kNow).has_value());
+    REQUIRE_FALSE(d2r::parseUserDateTime("2101-01-01",         kNow).has_value());
+    REQUIRE_FALSE(d2r::parseUserDateTime("25:00",              kNow).has_value());
+}
+
+TEST_CASE("parseUserDateTime: rejects nonsense strings",
+          "[dashboard_config][datetime]") {
+    REQUIRE_FALSE(d2r::parseUserDateTime("tomorrow", kNow).has_value());
+    REQUIRE_FALSE(d2r::parseUserDateTime("nowish",   kNow).has_value());
+    REQUIRE_FALSE(d2r::parseUserDateTime("29-07-26", kNow).has_value());
+    REQUIRE_FALSE(d2r::parseUserDateTime("2026/7/29",kNow).has_value());
 }

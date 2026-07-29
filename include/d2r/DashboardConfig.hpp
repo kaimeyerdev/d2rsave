@@ -11,6 +11,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -229,6 +230,32 @@ void     savePaneTree(sqlite3* db, const PaneNode& root);
 // substitutes a Blank leaf for any subtree that fails to parse.
 std::string serializePaneTree(const PaneNode& root);
 PaneNode    deserializePaneTree(std::string_view json);
+
+// Parse a user-supplied date/time string into a unix timestamp (seconds).
+// Powers the Session Info pane's "set start / end manually" action so
+// the user can pick any moment -- not just a moment that happens to
+// have a backup on record.
+//
+// `now` is the reference epoch used to resolve relative forms + "today"
+// forms; renderers pass std::time(nullptr) at input time. Local
+// timezone is honored for absolute forms.
+//
+// Accepted formats (whitespace-trimmed, case-insensitive on 'now'):
+//   empty or "now"           -> `now`
+//   "-Nh", "-Nm", "-Ns"       -> `now - offset` (any of h/m/s;
+//     "-1h30m", "-45s", etc.     units may be combined in that order)
+//   "YYYY-MM-DD HH:MM:SS"    -> local wall-clock instant
+//   "YYYY-MM-DD HH:MM"       -> local, seconds = 0
+//   "YYYY-MM-DD"             -> local midnight
+//   "HH:MM:SS"               -> today (from `now`) at that local time
+//   "HH:MM"                  -> today (from `now`) at that local time,
+//                               seconds = 0
+//
+// Returns std::nullopt when the input doesn't match any accepted form
+// or the resolved instant would overflow. `now` is expressed in unix
+// seconds; the return value is likewise in unix seconds.
+[[nodiscard]] std::optional<std::int64_t>
+parseUserDateTime(std::string_view input, std::int64_t now);
 
 // Persisted retention config for the backup subsystem. Loaded from
 // `dashboard.sqlite`; stored back on Save from the Backups pane

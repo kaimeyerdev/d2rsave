@@ -310,6 +310,19 @@ struct UiState {
         int                      cursor = 0;
     } characterPicker;
     bool                                      characterPickerVisible = false;
+
+    // Manual session-time input modal. Opened by the Session Info /
+    // Session panes' "start: manual..." / "end: manual..." menu
+    // actions. Text buffer is parsed by d2r::parseUserDateTime on
+    // Enter; on success the pane's pinned start / end date field is
+    // updated and the anchor is rebuilt.
+    struct SessionTimeInputModal {
+        PaneNode*   target = nullptr;
+        std::string buffer;               // user-typed input
+        std::string status;               // parse error / empty on ok
+        bool        isEnd  = false;
+    } sessionTimeInputModal;
+    bool                                      sessionTimeInputVisible = false;
 };
 
 // -----------------------------------------------------------------------
@@ -2650,6 +2663,42 @@ Element renderCharacterPickerModal(const UiState::CharacterPicker& p) {
     return window(titleEl, vbox(std::move(body)) | size(WIDTH, GREATER_THAN, 40));
 }
 
+// Free-form session-time input modal. Text field + accepted-format
+// hint + optional error line. Used by the "start: manual..." and
+// "end: manual..." menu actions so the user can pin any moment,
+// not just backup-anchored ones.
+Element renderSessionTimeInputModal(const UiState::SessionTimeInputModal& m) {
+    Element titleEl = text(
+        std::string(m.isEnd ? " Set session end (manual) "
+                            : " Set session start (manual) "));
+    // Text field: rendered as "[ buffer_ ]" with an inverse cursor
+    // caret so the empty case still shows an obvious input target.
+    Element inputEl = hbox({
+        text("[ "),
+        text(m.buffer),
+        text("_") | inverted,
+        text(" ]"),
+    });
+    Elements body = {
+        hbox({ text("Time  ") | bold, std::move(inputEl) }),
+        text(""),
+        text("Accepted formats:") | bold,
+        text("  now                (or empty)") | dim,
+        text("  -5m, -1h30m, -45s  (offset from now)") | dim,
+        text("  2026-07-29 15:30:00") | dim,
+        text("  2026-07-29 15:30") | dim,
+        text("  2026-07-29         (midnight)") | dim,
+        text("  15:30, 15:30:00    (today)") | dim,
+    };
+    if (!m.status.empty()) {
+        body.push_back(text(""));
+        body.push_back(text(m.status) | bold | color(Color::Yellow));
+    }
+    body.push_back(text(""));
+    body.push_back(text("[Enter] apply  [Esc] cancel") | dim);
+    return window(titleEl, vbox(std::move(body)) | size(WIDTH, GREATER_THAN, 50));
+}
+
 // ---- Config-mode menu -------------------------------------------------------
 
 struct ConfigMenuItem {
@@ -2666,6 +2715,8 @@ struct ConfigMenuItem {
         UnpinSessionAnchor,
         PickSessionEnd,
         UnpinSessionEnd,
+        PickSessionStartManual,
+        PickSessionEndManual,
         PickCharacter,
         ResetCharacterToAuto,
         ToggleUberShowUbers,
@@ -2760,6 +2811,8 @@ std::vector<ConfigMenuItem> buildConfigMenu(const PaneConfig& c, bool canDelete)
             items.push_back({"start:  auto (last Save & Exit)  --  [pick backup...]",
                               ConfigMenuItem::PickSessionAnchor});
         }
+        items.push_back({"start:  set manually  --  [type any time...]",
+                          ConfigMenuItem::PickSessionStartManual});
         if (c.sessionAnchorPinnedEndDate > 0) {
             items.push_back({
                 "end:    pinned @ " + formatWallDateTime(c.sessionAnchorPinnedEndDate),
@@ -2770,6 +2823,8 @@ std::vector<ConfigMenuItem> buildConfigMenu(const PaneConfig& c, bool canDelete)
             items.push_back({"end:    auto (newest backup)  --  [pick backup...]",
                               ConfigMenuItem::PickSessionEnd});
         }
+        items.push_back({"end:    set manually  --  [type any time...]",
+                          ConfigMenuItem::PickSessionEndManual});
         items.push_back({"reset session anchor now",
                           ConfigMenuItem::ResetSession});
     }
@@ -3669,6 +3724,11 @@ int runDashboard(const std::filesystem::path& savePath,
                 renderCharacterPickerModal(ui.characterPicker)
                     | clear_under | center });
         }
+        if (ui.sessionTimeInputVisible) {
+            root = dbox({ root,
+                renderSessionTimeInputModal(ui.sessionTimeInputModal)
+                    | clear_under | center });
+        }
         return root;
     });
 
@@ -3934,6 +3994,59 @@ int runDashboard(const std::filesystem::path& savePath,
             return true;
         }
 
+        // ---- SESSION TIME INPUT modal (free-form manual entry) ----
+        if (ui.sessionTimeInputVisible) {
+            auto& m = ui.sessionTimeInputModal;
+            if (e == Event::Escape) {
+                ui.sessionTimeInputVisible = false;
+                m.target = nullptr;
+                m.buffer.clear();
+                m.status.clear();
+                m.isEnd = false;
+                return true;
+            }
+            if (e == Event::Backspace) {
+                if (!m.buffer.empty()) m.buffer.pop_back();
+                m.status.clear();
+                return true;
+            }
+            if (e.is_character()) {
+                const auto& ch = e.character();
+                // Cap length so a runaway paste can't render past the
+                // modal; any accepted format easily fits in 40 chars.
+                if (!ch.empty() && m.buffer.size() < 40) {
+                    m.buffer += ch;
+                    m.status.clear();
+                }
+                return true;
+            }
+            if (e == Event::Return) {
+                const auto parsed = d2r::parseUserDateTime(
+                    m.buffer, static_cast<std::int64_t>(std::time(nullptr)));
+                if (!parsed) {
+                    m.status = "error: could not parse '" + m.buffer + "'";
+                    return true;
+                }
+                if (m.target) {
+                    if (m.isEnd) {
+                        m.target->config.sessionAnchorPinnedEndDate = *parsed;
+                    } else {
+                        m.target->config.sessionAnchorPinned     = true;
+                        m.target->config.sessionAnchorPinnedDate = *parsed;
+                    }
+                }
+                ui.sessionTimeInputVisible = false;
+                m.target = nullptr;
+                m.buffer.clear();
+                m.status.clear();
+                m.isEnd = false;
+                persistLayout();
+                rebuild();
+                return true;
+            }
+            return true;   // swallow everything else while modal is up
+        }
+
         // ---- CONFIG mode ----
         if (ui.configMode) {
             auto* leaf = focusedLeaf();
@@ -4144,6 +4257,34 @@ int runDashboard(const std::filesystem::path& savePath,
                         ui.configMode = false;
                         persistLayout();
                         rebuild();   // return to auto end = newest backup
+                        break;
+                    }
+                    case ConfigMenuItem::PickSessionStartManual:
+                    case ConfigMenuItem::PickSessionEndManual: {
+                        // Free-form text input alongside the backup-history
+                        // picker. Same target-write semantics as the picker
+                        // (start pin writes sessionAnchorPinnedDate + flips
+                        // sessionAnchorPinned = true; end pin writes
+                        // sessionAnchorPinnedEndDate) so the pane's title +
+                        // config menu update uniformly regardless of which
+                        // route the user took.
+                        const bool isEnd = (action == ConfigMenuItem::PickSessionEndManual);
+                        ui.sessionTimeInputModal.target = leaf;
+                        ui.sessionTimeInputModal.isEnd  = isEnd;
+                        ui.sessionTimeInputModal.status.clear();
+                        // Prefill the buffer with the current pin (if any)
+                        // so tweaking a small offset is a couple of keys.
+                        const std::int64_t seed = isEnd
+                            ? leaf->config.sessionAnchorPinnedEndDate
+                            : (leaf->config.sessionAnchorPinned
+                                ? leaf->config.sessionAnchorPinnedDate : 0);
+                        if (seed > 0) {
+                            ui.sessionTimeInputModal.buffer = formatWallDateTime(seed);
+                        } else {
+                            ui.sessionTimeInputModal.buffer.clear();
+                        }
+                        ui.sessionTimeInputVisible = true;
+                        ui.configMode              = false;
                         break;
                     }
                     case ConfigMenuItem::PickCharacter: {
