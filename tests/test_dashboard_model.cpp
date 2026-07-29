@@ -229,3 +229,59 @@ TEST_CASE("SessionAnchor diff: rune moved between locations is not 'new'",
     }
     REQUIRE(newRows == 0);
 }
+
+TEST_CASE("SessionAnchor diff: empty anchor -> everything current is 'new'",
+          "[dashboard_model][session_loot][pre_history_pin]") {
+    // Pins the invariant behind the "pin before any save existed"
+    // request: buildSessionAnchor's pinned branch fetches per-file
+    // bytes at pin. Files with no backup at/before pin get their
+    // items stripped from `temp`. When the pin predates every save,
+    // every file's contribution is stripped, so the anchor's
+    // inventory is empty. Once the anchor is empty, the diff must
+    // report every currently-owned item as "new" -- including any
+    // that were on some OTHER character at anchor time (they didn't
+    // exist yet at anchor time either). This test verifies the diff
+    // half of that path via makeSessionAnchorFromSnapshot on an
+    // empty snapshot.
+    const d2r::DashboardSnapshot emptyAnchor;
+    const auto anchor = d2r::makeSessionAnchorFromSnapshot(emptyAnchor, 0, 0, 0);
+    REQUIRE(anchor.itemKeys.empty());
+    REQUIRE(anchor.runeStacks.empty());
+
+    d2r::DashboardSnapshot nowSnap;
+    // A handful of runes across two characters + a unique.
+    nowSnap.inventory.push_back(makeRune("r06",  "Ith Rune", "Barbarian.d2s"));
+    nowSnap.inventory.push_back(makeRune("r30",  "Ber Rune", "Barbarian.d2s"));
+    nowSnap.inventory.push_back(makeRune("r31",  "Jah Rune", "Warlock.d2s"));
+    nowSnap.inventory.push_back(makeUnique(0xAAAA1111u, "Windforce"));
+
+    // Uniques diff: fingerprint set is empty in anchor -> the unique
+    // is "new".
+    int newUniques = 0;
+    for (const auto& it : nowSnap.inventory) {
+        if (!it.identified) continue;
+        if (it.fingerprint == 0) continue;
+        if (it.quality != d2r::ItemQuality::Unique
+         && it.quality != d2r::ItemQuality::Set) continue;
+        if (anchor.itemKeys.contains({it.fingerprint, it.quality})) continue;
+        ++newUniques;
+    }
+    REQUIRE(newUniques == 1);
+
+    // Runes diff: nowStacks vs empty anchor stacks -> every code is new.
+    std::unordered_map<std::string, std::uint32_t> nowStacks;
+    for (const auto& it : nowSnap.inventory) {
+        if (it.code.size() == 3 && it.code[0] == 'r'
+            && it.code[1] >= '0' && it.code[1] <= '9'
+            && it.code[2] >= '0' && it.code[2] <= '9') {
+            ++nowStacks[it.code];
+        }
+    }
+    int newRuneRows = 0;
+    for (const auto& [code, now] : nowStacks) {
+        const auto it = anchor.runeStacks.find(code);
+        const std::uint32_t before = it == anchor.runeStacks.end() ? 0u : it->second;
+        if (now > before) ++newRuneRows;
+    }
+    REQUIRE(newRuneRows == 3);
+}

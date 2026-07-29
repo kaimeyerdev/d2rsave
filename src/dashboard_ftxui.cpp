@@ -3320,11 +3320,16 @@ int runDashboard(const std::filesystem::path& savePath,
     // the small footprint makes caching cheap enough to serve rapid
     // autosave bursts without any byte parsing after the first miss.
     //
-    // When `pinnedDate` is set, the anchor uses whichever .d2s backup
-    // is newest with date <= pinnedDate (regardless of state), plus the
-    // matching stash backup at date <= pinnedDate. This is how the
-    // "pick backup as anchor" Session-pane menu action pins the diff
-    // base to a specific historical moment instead of auto-tracking.
+    // When `pinnedDate` is set, the pin represents a moment in time
+    // and the anchor becomes the account state at that moment: for
+    // every file (character saves + the shared stash) the anchor
+    // pulls the newest backup with date <= pin. Files with no backup
+    // at/before the pin didn't exist yet at anchor time and
+    // contribute nothing. This makes an early pin -- one that
+    // predates every save -- produce an empty anchor snapshot, so
+    // every currently-owned item counts as "new since the session
+    // started". Picking an exact backup date from the picker admits
+    // equality and lands on that specific row (behavior preserved).
     auto buildSessionAnchor =
         [&](const std::shared_ptr<const DashboardSnapshot>& current,
             std::optional<std::int64_t>                     pinnedDate    = std::nullopt,
@@ -3364,16 +3369,24 @@ int runDashboard(const std::filesystem::path& savePath,
         try { hist = backupDb->historyFor(filename, 200); }
         catch (const std::exception&) {}
         if (pinnedDate) {
+            // Pinned semantic: the pin is a moment in time. Every file
+            // (active player, other characters, shared stash) contributes
+            // whichever backup is newest at or before the pin. Files
+            // with no such backup didn't exist yet at anchor time and
+            // contribute nothing -- a pin before ANY save on record
+            // therefore produces an empty anchor and every currently-
+            // owned item counts as "new".
+            //
+            // Session window: pin -> newest backup on record. When no
+            // backup postdates the pin, End collapses to Start (=pin)
+            // so the pane reads "0h 00m 00s starting at <pin>" rather
+            // than a nonsensical negative duration.
+            anchorDate = *pinnedDate;
             try { row = backupDb->at(filename, *pinnedDate); }
             catch (const std::exception&) { row.reset(); }
-            if (row) anchorDate = *pinnedDate;
-            // Session window = newest backup with date > pin down to
-            // the oldest such. If none, both stay 0 -> renders as 0.
-            for (const auto& h : hist) {
-                if (h.date <= *pinnedDate) break;   // hist is date DESC
-                if (sessionEndEpoch == 0) sessionEndEpoch = h.date;
-                sessionStartEpoch = h.date;
-            }
+            sessionStartEpoch = *pinnedDate;
+            sessionEndEpoch   = (!hist.empty() && hist.front().date > *pinnedDate)
+                ? hist.front().date : *pinnedDate;
         } else {
             // Auto mode: the anchor is the LATEST SAVE of the PREVIOUS
             // session -- i.e., the S&E that ended it. Diff = latest save
@@ -3432,7 +3445,12 @@ int runDashboard(const std::filesystem::path& savePath,
             // the previous session's S&E itself, or a just-quit with
             // no PRIOR session). Leave both at 0 -> renders as 0.
         }
-        if (!row || row->data.empty()) return anchorFromCurrent();
+        // Auto mode requires a valid anchor row (byte-source for
+        // overrideActivePlayerFromBytes below). Pinned mode is
+        // permitted to reach step 4 with a null row: it means the
+        // active player didn't exist at or before the pin, so its
+        // items get stripped from `temp` there (empty contribution).
+        if (!pinnedDate && (!row || row->data.empty())) return anchorFromCurrent();
 
         // Step 2: resolve the STASH-side anchor date. Three-tier lookup
         // (see the older commit log for the rationale) but here we only
@@ -3447,7 +3465,14 @@ int runDashboard(const std::filesystem::path& savePath,
                 catch (const std::exception&) {}
                 if (stashRow && !stashRow->data.empty()) {
                     stashDate = anchorDate;   // approx; not needed for lookup
-                } else {
+                } else if (!pinnedDate) {
+                    // Auto-mode fallback: OLDEST non-empty stash row so
+                    // an S&E boundary that predates the stash's first
+                    // backup still gets a defensible anchor (rather
+                    // than an empty stash). Pinned mode is strict:
+                    // "no stash at pin" means the account had no
+                    // stash yet -> anchor stash is empty (step 4
+                    // clears it via clearSharedStashInSnapshot).
                     stashRow.reset();
                     // Fallback: OLDEST non-empty stash row.
                     std::vector<BackupDb::HistoryRow> hist;
@@ -3518,26 +3543,44 @@ int runDashboard(const std::filesystem::path& savePath,
         // diff, because they'd be present in `now.inventory` but
         // absent from an empty anchor.
         //
-        // Cross-character correction: for every character save whose
-        // save timestamp is newer than anchorDate, `temp` still holds
-        // that character's CURRENT items, not its items at anchor time.
-        // When an item moves between characters during the session
-        // (typically via a socket / shared-stash round-trip), the
-        // renderer's diff sees it on the destination but not on the
-        // source -- so the item flags as "new" even though the account
-        // owned it the whole time. Fix: replace each such character's
-        // inventory contribution with its bytes from the backup DB at
-        // anchorDate. Character files whose timestamp is <= anchorDate
+        // Step 4: miss path -- build a fresh anchor. Start from a
+        // shallow-ish copy of `current` so items owned by OTHER
+        // characters (SetHolderFour, UniqueArmors, etc. -- .d2s files
+        // that live in the same save dir) stay in the anchor's item
+        // pool. Otherwise every such item would flag as "new" in the
+        // diff, because they'd be present in `now.inventory` but
+        // absent from an empty anchor.
+        //
+        // Uniform per-file semantic: every file (active player, other
+        // characters, shared stash) contributes its state at
+        // `anchorDate`. A file with no backup at/before that date
+        // didn't exist yet at anchor time and contributes nothing to
+        // the anchor -- its current items get stripped from `temp` so
+        // they correctly count as "new" now. This is what makes a
+        // pinned start of, say, "2026-07-01 00:00:00" produce an
+        // empty anchor when the earliest recorded backup is later,
+        // matching the user intent "session started before I had any
+        // save games; everything I own is new since then".
+        //
+        // Optimization: files whose in-file timestamp is <= anchorDate
         // haven't been touched since the anchor, so their current
-        // entry already reflects the anchor state and skips the
-        // historical parse entirely -- typically the vast majority of
-        // characters in a save directory. The historical parse cost
-        // is only paid on cache misses (session-boundary crosses,
-        // pin changes), so a burst of autosaves still hits the fast
-        // path above.
+        // cache entry already reflects the anchor state -- skip the
+        // historical parse entirely. Typically the vast majority of
+        // character files. The parse cost is only paid on cache
+        // misses (session-boundary crosses, pin changes), so a burst
+        // of autosaves still hits the fast path above.
         DashboardSnapshot temp = *current;
         const auto anchorU32 = anchorDate > 0
             ? static_cast<std::uint32_t>(anchorDate) : 0u;
+        auto stripCharacterItems = [&](const std::string& prefix) {
+            temp.inventory.erase(
+                std::remove_if(temp.inventory.begin(), temp.inventory.end(),
+                    [&](const InventoryItem& inv) {
+                        return inv.location.size() >= prefix.size() &&
+                               inv.location.compare(0, prefix.size(), prefix) == 0;
+                    }),
+                temp.inventory.end());
+        };
         for (const auto& [otherName, otherEntry] : ui.fileCache.d2s) {
             if (otherName == filename) continue;   // active player handled below
             if (anchorU32 != 0 && otherEntry.character.timestamp <= anchorU32) {
@@ -3553,26 +3596,32 @@ int runDashboard(const std::filesystem::path& savePath,
                 // override below is the LAST one and gets the final say.
                 (void)overrideActivePlayerFromBytes(temp, db, otherRow->data, otherName);
             } else {
-                // No historical row on record. Treat this file as
-                // "didn't exist at anchor": strip its items so a
-                // character created mid-session doesn't donate its
-                // current inventory to the anchor.
-                const std::string& prefix = otherName;
-                temp.inventory.erase(
-                    std::remove_if(temp.inventory.begin(), temp.inventory.end(),
-                        [&](const InventoryItem& inv) {
-                            return inv.location.size() >= prefix.size() &&
-                                   inv.location.compare(0, prefix.size(), prefix) == 0;
-                        }),
-                    temp.inventory.end());
+                // No historical row on record: this file didn't exist
+                // at anchor time. Strip its current items so a fresh
+                // character (or a pre-history pin against any file)
+                // doesn't donate its inventory to the anchor.
+                stripCharacterItems(otherName);
             }
         }
 
-        // Then override the active player last so temp.activePlayer
-        // reflects its historical state (any earlier calls in the loop
-        // above may have set activePlayer to some OTHER character).
-        if (!overrideActivePlayerFromBytes(temp, db, row->data, filename)) {
-            return anchorFromCurrent();
+        // Then handle the active player. Two cases:
+        //   1. Historical bytes exist -> override normally. This also
+        //      rebuilds temp.activePlayer's stats (name/class/level/
+        //      exp), giving the Character pane an accurate anchor for
+        //      its XP delta.
+        //   2. No historical bytes (pin predates the active player's
+        //      first save) -> strip its items so nothing survives from
+        //      the *current copy. Leave temp.activePlayer as-is (from
+        //      the initial *current copy) so the Character pane still
+        //      renders valid stats; the XP delta will read as "the
+        //      whole current level gained" which is the honest
+        //      interpretation of pinning before the character existed.
+        if (row && !row->data.empty()) {
+            if (!overrideActivePlayerFromBytes(temp, db, row->data, filename)) {
+                return anchorFromCurrent();
+            }
+        } else {
+            stripCharacterItems(filename);
         }
         if (stashRow && !stashRow->data.empty()) {
             (void)overrideSharedStashFromBytes(temp, db, stashRow->data);
