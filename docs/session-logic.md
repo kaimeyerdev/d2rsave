@@ -244,25 +244,32 @@ come from `anchor->sessionStartEpoch`, `anchor->sessionEndEpoch`, and
 ### Timeline
 
 ```mermaid
-timeline
-    title Auto mode
-    Previous session : "Play"
-                     : "Save & Exit (boundary)"
-    Current session  : "First save (autosave / startup)"
-                     : "…"
-                     : "Newest save (sessionEnd)"
+flowchart LR
+    subgraph Prev ["Previous session"]
+        direction LR
+        A[Play] --> B[Save & Exit<br/>boundary = anchor]
+    end
+    subgraph Curr ["Current session"]
+        direction LR
+        C[First save after boundary<br/>= sessionStart] --> D[...] --> E[Newest save<br/>= sessionEnd]
+    end
+    B --> C
 ```
 
 In auto mode the anchor is the boundary S&E; the session window is
 "first save after boundary" → "newest save on record".
 
 ```mermaid
-timeline
-    title Pinned mode
-    Pin moment       : "sessionStart = pin"
-                     : "anchorDate = pin"
-                     : "For each file: at(name, pin)"
-    Current          : "sessionEnd = max(newest save, pin)"
+flowchart LR
+    subgraph PinM ["Pin moment"]
+        direction LR
+        A[sessionStart = pin] --> B[anchorDate = pin] --> C[For each file:<br/>backupDb at name, pin]
+    end
+    subgraph Now ["Now"]
+        direction LR
+        D[sessionEnd = max newest save, pin]
+    end
+    PinM --> Now
 ```
 
 In pinned mode the window's Start is the pin itself. End clamps to
