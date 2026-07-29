@@ -111,14 +111,14 @@ session; the current session is everything since that S&E.
 
 ```mermaid
 flowchart LR
-    A[hist DESC<br/>backupDb->historyFor filename] --> B{hist[0].state<br/>== S&E?}
+    A[hist DESC via<br/>backupDb historyFor filename] --> B{Newest hist row<br/>is Save & Exit?}
     B -->|yes<br/>just-quit| C[seThreshold = 2]
     B -->|no<br/>mid-session| D[seThreshold = 1]
     C --> E[Walk hist forward.<br/>Count S&E rows.<br/>Boundary = the seThreshold'th<br/>S&E encountered.]
     D --> E
     E --> F[anchorDate = boundary date]
     F --> G[sessionStart = hist row<br/>just newer than boundary]
-    F --> H[sessionEnd = hist[0].date]
+    F --> H[sessionEnd = newest hist date]
 ```
 
 **Fallback**: no qualifying S&E on record → anchor on the oldest
@@ -221,7 +221,7 @@ the diff works on per-code counts:
 flowchart TD
     A[Walk now.inventory] --> B[Aggregate<br/>nowStacks: code -&gt; count]
     B --> C[For each code, count in nowStacks]
-    C --> D[before = anchor.runeStacks[code] or 0]
+    C --> D[before = anchor.runeStacks lookup by code, else 0]
     D --> E{count &gt; before?}
     E -->|no| C
     E -->|yes| F[Emit rune row +count-before]
