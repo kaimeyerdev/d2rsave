@@ -175,3 +175,57 @@ TEST_CASE("SessionAnchor round-trip: session-loot diff finds only positive rune 
     REQUIRE(deltas[1].first  == "r22");
     REQUIRE(deltas[1].second == 2);
 }
+
+TEST_CASE("SessionAnchor diff: rune moved between locations is not 'new'",
+          "[dashboard_model][session_loot][cross_character]") {
+    // Regression for the "socketed runes appear as new when armor moves
+    // via shared stash" bug. The user reported: a body armor with Ith,
+    // Ber, Jah socketed was moved from one character to another via the
+    // shared stash during a session; the runes then surfaced in the
+    // Session Info pane as "new" even though the account owned them the
+    // whole time.
+    //
+    // The invariant this test pins: the diff sees an INSTANCE COUNT per
+    // code, not a per-character allotment. If the anchor snapshot (as
+    // reconstructed by buildSessionAnchor) accounts for the runes on
+    // whichever character owned them at anchor time, moving them
+    // elsewhere by "now" leaves the count unchanged -> zero new runes.
+    //
+    // Sanity: the fix in buildSessionAnchor is what makes the anchor
+    // snapshot include runes owned by NON-active-player characters at
+    // anchor time. This test only verifies makeSessionAnchor +
+    // diff-logic play their part correctly once the anchor snapshot is
+    // right.
+    d2r::DashboardSnapshot anchorSnap;
+    // Anchor state: Ith / Ber / Jah are socketed in an armor on
+    // 'UniqueSwordsEl.d2s' (any 'other' character will do; the location
+    // string just needs to differ from the active player's below).
+    anchorSnap.inventory.push_back(makeRune("r06", "Ith Rune",  "UniqueSwordsEl.d2s"));
+    anchorSnap.inventory.push_back(makeRune("r30", "Ber Rune",  "UniqueSwordsEl.d2s"));
+    anchorSnap.inventory.push_back(makeRune("r31", "Jah Rune",  "UniqueSwordsEl.d2s"));
+    const auto anchor = d2r::makeSessionAnchorFromSnapshot(anchorSnap, 0, 0, 0);
+
+    // Now state: same three runes, now on 'Barbarian.d2s' (armor moved
+    // via shared stash). Counts per code are unchanged.
+    d2r::DashboardSnapshot nowSnap;
+    nowSnap.inventory.push_back(makeRune("r06", "Ith Rune", "Barbarian.d2s"));
+    nowSnap.inventory.push_back(makeRune("r30", "Ber Rune", "Barbarian.d2s"));
+    nowSnap.inventory.push_back(makeRune("r31", "Jah Rune", "Barbarian.d2s"));
+
+    std::unordered_map<std::string, std::uint32_t> nowStacks;
+    for (const auto& it : nowSnap.inventory) {
+        if (it.code.size() == 3 && it.code[0] == 'r'
+            && it.code[1] >= '0' && it.code[1] <= '9'
+            && it.code[2] >= '0' && it.code[2] <= '9') {
+            ++nowStacks[it.code];
+        }
+    }
+    // Diff should produce zero rows: every code has the same count.
+    int newRows = 0;
+    for (const auto& [code, now] : nowStacks) {
+        const auto it = anchor.runeStacks.find(code);
+        const std::uint32_t before = it == anchor.runeStacks.end() ? 0u : it->second;
+        if (now > before) ++newRows;
+    }
+    REQUIRE(newRows == 0);
+}

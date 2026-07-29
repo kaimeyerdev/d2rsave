@@ -3516,11 +3516,61 @@ int runDashboard(const std::filesystem::path& savePath,
         // that live in the same save dir) stay in the anchor's item
         // pool. Otherwise every such item would flag as "new" in the
         // diff, because they'd be present in `now.inventory` but
-        // absent from an empty anchor. We can't easily strip out
-        // chronicle/reconcile without touching DashboardSnapshot, so
-        // eat the deep copy on the miss path -- the cache-hit fast
-        // path avoids it during bursts, which is what matters.
+        // absent from an empty anchor.
+        //
+        // Cross-character correction: for every character save whose
+        // save timestamp is newer than anchorDate, `temp` still holds
+        // that character's CURRENT items, not its items at anchor time.
+        // When an item moves between characters during the session
+        // (typically via a socket / shared-stash round-trip), the
+        // renderer's diff sees it on the destination but not on the
+        // source -- so the item flags as "new" even though the account
+        // owned it the whole time. Fix: replace each such character's
+        // inventory contribution with its bytes from the backup DB at
+        // anchorDate. Character files whose timestamp is <= anchorDate
+        // haven't been touched since the anchor, so their current
+        // entry already reflects the anchor state and skips the
+        // historical parse entirely -- typically the vast majority of
+        // characters in a save directory. The historical parse cost
+        // is only paid on cache misses (session-boundary crosses,
+        // pin changes), so a burst of autosaves still hits the fast
+        // path above.
         DashboardSnapshot temp = *current;
+        const auto anchorU32 = anchorDate > 0
+            ? static_cast<std::uint32_t>(anchorDate) : 0u;
+        for (const auto& [otherName, otherEntry] : ui.fileCache.d2s) {
+            if (otherName == filename) continue;   // active player handled below
+            if (anchorU32 != 0 && otherEntry.character.timestamp <= anchorU32) {
+                continue;   // unchanged since anchor; current entry is correct
+            }
+            std::optional<BackupDb::Row> otherRow;
+            try { otherRow = backupDb->at(otherName, anchorDate); }
+            catch (const std::exception&) {}
+            if (otherRow && !otherRow->data.empty()) {
+                // Historical bytes: substitute this character's items.
+                // NOTE: this call also touches snap.activePlayer as a
+                // side-effect; that's fine because the active-player
+                // override below is the LAST one and gets the final say.
+                (void)overrideActivePlayerFromBytes(temp, db, otherRow->data, otherName);
+            } else {
+                // No historical row on record. Treat this file as
+                // "didn't exist at anchor": strip its items so a
+                // character created mid-session doesn't donate its
+                // current inventory to the anchor.
+                const std::string& prefix = otherName;
+                temp.inventory.erase(
+                    std::remove_if(temp.inventory.begin(), temp.inventory.end(),
+                        [&](const InventoryItem& inv) {
+                            return inv.location.size() >= prefix.size() &&
+                                   inv.location.compare(0, prefix.size(), prefix) == 0;
+                        }),
+                    temp.inventory.end());
+            }
+        }
+
+        // Then override the active player last so temp.activePlayer
+        // reflects its historical state (any earlier calls in the loop
+        // above may have set activePlayer to some OTHER character).
         if (!overrideActivePlayerFromBytes(temp, db, row->data, filename)) {
             return anchorFromCurrent();
         }
