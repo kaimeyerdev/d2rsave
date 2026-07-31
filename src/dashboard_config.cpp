@@ -331,12 +331,15 @@ nlohmann::json toJson(const PaneNode& n) {
     if (c.type == PaneType::Session
      || c.type == PaneType::Character
      || c.type == PaneType::SessionLoot) {
-        j["sessionAnchorPinned"]         = c.sessionAnchorPinned;
-        j["sessionAnchorPinnedDate"]     = c.sessionAnchorPinnedDate;
-        // Only emit end pin when set; keeps stored JSON tidy for the
-        // common auto-end case.
-        if (c.sessionAnchorPinnedEndDate > 0) {
-            j["sessionAnchorPinnedEndDate"] = c.sessionAnchorPinnedEndDate;
+        // Session window overrides. Zero = auto. Only emit non-zero
+        // values to keep stored JSON tidy for the common auto/auto case.
+        // Invariant: custom end implies custom start (loader clears end
+        // when start is auto).
+        if (c.sessionCustomStartEpoch > 0) {
+            j["sessionCustomStartEpoch"] = c.sessionCustomStartEpoch;
+        }
+        if (c.sessionCustomEndEpoch > 0) {
+            j["sessionCustomEndEpoch"] = c.sessionCustomEndEpoch;
         }
     }
     if (c.type == PaneType::Character
@@ -402,12 +405,29 @@ PaneNode fromJson(const nlohmann::json& j) {
         if (n.config.type == PaneType::Session
          || n.config.type == PaneType::Character
          || n.config.type == PaneType::SessionLoot) {
-            n.config.sessionAnchorPinned     = j.value(
-                "sessionAnchorPinned", false);
-            n.config.sessionAnchorPinnedDate = j.value(
-                "sessionAnchorPinnedDate", std::int64_t{0});
-            n.config.sessionAnchorPinnedEndDate = j.value(
-                "sessionAnchorPinnedEndDate", std::int64_t{0});
+            // Preferred fields (post-simplification).
+            n.config.sessionCustomStartEpoch = j.value(
+                "sessionCustomStartEpoch", std::int64_t{0});
+            n.config.sessionCustomEndEpoch = j.value(
+                "sessionCustomEndEpoch", std::int64_t{0});
+            // Legacy fields (pre-simplification anchor-pin model). Only
+            // read when the preferred fields are absent, so that once a
+            // layout is re-saved the migration path drops away cleanly.
+            if (n.config.sessionCustomStartEpoch == 0
+             && j.value("sessionAnchorPinned", false)
+             && j.contains("sessionAnchorPinnedDate")) {
+                n.config.sessionCustomStartEpoch = j.value(
+                    "sessionAnchorPinnedDate", std::int64_t{0});
+            }
+            if (n.config.sessionCustomEndEpoch == 0
+             && j.contains("sessionAnchorPinnedEndDate")) {
+                n.config.sessionCustomEndEpoch = j.value(
+                    "sessionAnchorPinnedEndDate", std::int64_t{0});
+            }
+            // Enforce invariant: custom end only valid with custom start.
+            if (n.config.sessionCustomStartEpoch == 0) {
+                n.config.sessionCustomEndEpoch = 0;
+            }
         }
         if (n.config.type == PaneType::Character
          || n.config.type == PaneType::SessionLoot) {

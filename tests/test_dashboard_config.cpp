@@ -65,30 +65,28 @@ TEST_CASE("paneTitle produces non-empty labels for every PaneType", "[dashboard_
     }
 }
 
-TEST_CASE("Character pane round-trips characterSelection + anchor pin", "[dashboard_config]") {
+TEST_CASE("Character pane round-trips characterSelection + custom start", "[dashboard_config]") {
     auto n = leaf(d2r::PaneType::Character);
-    n.config.characterSelection      = "Kai";
-    n.config.sessionAnchorPinned     = true;
-    n.config.sessionAnchorPinnedDate = 1'700'000'000;
-    n.config.paneWeight              = 2;
+    n.config.characterSelection       = "Kai";
+    n.config.sessionCustomStartEpoch  = 1'700'000'000;
+    n.config.paneWeight               = 2;
 
     const auto back = roundTrip(n);
     REQUIRE_FALSE(back.isSplit);
-    REQUIRE(back.config.type                    == d2r::PaneType::Character);
-    REQUIRE(back.config.characterSelection      == "Kai");
-    REQUIRE(back.config.sessionAnchorPinned     == true);
-    REQUIRE(back.config.sessionAnchorPinnedDate == 1'700'000'000);
-    REQUIRE(back.config.paneWeight              == 2);
+    REQUIRE(back.config.type                     == d2r::PaneType::Character);
+    REQUIRE(back.config.characterSelection       == "Kai");
+    REQUIRE(back.config.sessionCustomStartEpoch  == 1'700'000'000);
+    REQUIRE(back.config.paneWeight               == 2);
 }
 
 TEST_CASE("Character pane defaults survive round-trip (empty = auto)", "[dashboard_config]") {
-    // Defaults: empty selection, auto anchor. Verify the empty string
+    // Defaults: empty selection, auto session. Verify the empty string
     // survives so it keeps meaning "auto" after reload.
     const auto back = roundTrip(leaf(d2r::PaneType::Character));
-    REQUIRE(back.config.type                    == d2r::PaneType::Character);
-    REQUIRE(back.config.characterSelection      == "");
-    REQUIRE(back.config.sessionAnchorPinned     == false);
-    REQUIRE(back.config.sessionAnchorPinnedDate == 0);
+    REQUIRE(back.config.type                     == d2r::PaneType::Character);
+    REQUIRE(back.config.characterSelection       == "");
+    REQUIRE(back.config.sessionCustomStartEpoch  == 0);
+    REQUIRE(back.config.sessionCustomEndEpoch    == 0);
 }
 
 TEST_CASE("SessionLoot pane round-trips runes toggle + character selection", "[dashboard_config]") {
@@ -104,38 +102,43 @@ TEST_CASE("SessionLoot pane round-trips runes toggle + character selection", "[d
 
 TEST_CASE("SessionLoot pane defaults: runes on, selection empty", "[dashboard_config]") {
     const auto back = roundTrip(leaf(d2r::PaneType::SessionLoot));
-    REQUIRE(back.config.sessionLootShowRunes       == true);
-    REQUIRE(back.config.characterSelection         == "");
-    REQUIRE(back.config.sessionAnchorPinned        == false);
-    REQUIRE(back.config.sessionAnchorPinnedDate    == 0);
-    REQUIRE(back.config.sessionAnchorPinnedEndDate == 0);
+    REQUIRE(back.config.sessionLootShowRunes      == true);
+    REQUIRE(back.config.characterSelection        == "");
+    REQUIRE(back.config.sessionCustomStartEpoch   == 0);
+    REQUIRE(back.config.sessionCustomEndEpoch     == 0);
 }
 
-TEST_CASE("Session-anchor end pin round-trips on Session / SessionLoot / Character",
+TEST_CASE("Session custom-end round-trips on Session / SessionLoot / Character",
           "[dashboard_config]") {
-    // Each pane type that consumes the anchor should independently
-    // persist a pinned end date. Non-zero values survive; zero (default)
-    // is elided by the encoder and reads back as zero.
+    // Each pane type that consumes the session should independently
+    // persist a custom end epoch. Non-zero values survive; zero
+    // (default) is elided by the encoder and reads back as zero. The
+    // encoder requires a custom start when a custom end is set (the
+    // config-time invariant is enforced at input; here we exercise
+    // the JSON path by setting both).
     for (auto t : {d2r::PaneType::Session,
                    d2r::PaneType::SessionLoot,
                    d2r::PaneType::Character}) {
         auto n = leaf(t);
-        n.config.sessionAnchorPinnedEndDate = 1'751'000'000;
+        n.config.sessionCustomStartEpoch = 1'750'000'000;
+        n.config.sessionCustomEndEpoch   = 1'751'000'000;
         const auto back = roundTrip(n);
         INFO("pane type index " << static_cast<int>(t));
-        REQUIRE(back.config.type                       == t);
-        REQUIRE(back.config.sessionAnchorPinnedEndDate == 1'751'000'000);
+        REQUIRE(back.config.type                     == t);
+        REQUIRE(back.config.sessionCustomStartEpoch  == 1'750'000'000);
+        REQUIRE(back.config.sessionCustomEndEpoch    == 1'751'000'000);
     }
 }
 
-TEST_CASE("Session-anchor end pin defaults to 0 across all three pane types",
+TEST_CASE("Session custom epochs default to 0 across all three pane types",
           "[dashboard_config]") {
     for (auto t : {d2r::PaneType::Session,
                    d2r::PaneType::SessionLoot,
                    d2r::PaneType::Character}) {
         const auto back = roundTrip(leaf(t));
         INFO("pane type index " << static_cast<int>(t));
-        REQUIRE(back.config.sessionAnchorPinnedEndDate == 0);
+        REQUIRE(back.config.sessionCustomStartEpoch == 0);
+        REQUIRE(back.config.sessionCustomEndEpoch   == 0);
     }
 }
 

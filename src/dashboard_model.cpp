@@ -1208,14 +1208,11 @@ void clearSharedStashInSnapshot(DashboardSnapshot& snap) {
 }
 
 // Reduce a fully-populated DashboardSnapshot to the small
-// SessionAnchor the pane actually reads. Kept as a pure function so
+// SessionState the pane actually reads. Kept as a pure function so
 // the ftxui layer can call it after applying the character + stash
 // byte overrides to a working snapshot.
-SessionAnchor makeSessionAnchorFromSnapshot(const DashboardSnapshot& snap,
-                                            std::int64_t             anchorEpoch,
-                                            std::int64_t             sessionStartEpoch,
-                                            std::int64_t             sessionEndEpoch) {
-    SessionAnchor out;
+SessionState makeSessionStateFromSnapshot(const DashboardSnapshot& snap) {
+    SessionState out;
     out.hasActivePlayer = snap.hasActivePlayer;
     if (snap.hasActivePlayer) {
         out.playerName   = snap.activePlayer.name;
@@ -1223,9 +1220,6 @@ SessionAnchor makeSessionAnchorFromSnapshot(const DashboardSnapshot& snap,
         out.level        = snap.activePlayer.level;
         out.expInLevel   = snap.activePlayer.expInLevel;
     }
-    out.anchorEpoch       = anchorEpoch;
-    out.sessionStartEpoch = sessionStartEpoch;
-    out.sessionEndEpoch   = sessionEndEpoch;
     // Pre-computed lookup set: identified Unique/Set items with a
     // non-zero fingerprint. Renderer's diff loop just probes contains().
     out.itemKeys.reserve(snap.inventory.size() / 8 + 16);
@@ -1237,8 +1231,8 @@ SessionAnchor makeSessionAnchorFromSnapshot(const DashboardSnapshot& snap,
         out.itemKeys.insert({it.fingerprint, it.quality});
     }
 
-    // Rune counts per base code -- one entry per rune instance in the
-    // anchor's inventory. Session Loot pane subtracts these from the
+    // Rune counts per base code -- one entry per rune instance in this
+    // moment's inventory. Session Loot pane subtracts these from the
     // current snapshot's per-code counts to surface positive deltas.
     // Filter: code begins with 'r' and is exactly 3 chars ("r01".."r33").
     for (const auto& it : snap.inventory) {

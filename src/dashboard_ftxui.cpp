@@ -174,28 +174,29 @@ struct UiState {
     std::shared_ptr<const DashboardSnapshot>  snapshot;
 
     // Lightweight point-in-time record the Session pane diffs against.
-    // Rebuilt by `buildSessionAnchor` on every rebuild, but cached by
-    // `sessionAnchorCacheKey` -- consecutive rebuilds during an
-    // autosave burst (e.g. gem-combine) share the same key and
-    // short-circuit without any byte parsing. Renderer just reads
-    // `sessionAnchor->itemKeys.contains(...)` per current item.
-    std::shared_ptr<const SessionAnchor>      sessionAnchor;
-    // Cache key: character-side anchor date, stash-side anchor date,
-    // pinned date (0 when auto mode). If the previously-built anchor
-    // was for the same key, we return it as-is.
-    struct SessionAnchorCacheKey {
-        std::int64_t characterDate = 0;
-        std::int64_t stashDate     = 0;
-        std::int64_t pinnedDate    = 0;
-        std::int64_t pinnedEndDate = 0;   // 0 when end is auto
-        bool operator==(const SessionAnchorCacheKey& o) const noexcept {
-            return characterDate == o.characterDate
-                && stashDate     == o.stashDate
-                && pinnedDate    == o.pinnedDate
-                && pinnedEndDate == o.pinnedEndDate;
+    // Rebuilt by `buildSession` on every rebuild, but cached by
+    // `sessionCacheKey` -- consecutive rebuilds during an autosave
+    // burst (e.g. gem-combine) share the same key and short-circuit
+    // without any byte parsing. Renderer just reads
+    // `session->startState.itemKeys.contains(...)` per current item.
+    std::shared_ptr<const Session>            session;
+    // Cache key: character-side start date, stash-side start date,
+    // custom start date (0 when auto), custom end date (0 when auto).
+    // If the previously-built session was for the same key, we return
+    // it as-is.
+    struct SessionCacheKey {
+        std::int64_t characterDate    = 0;
+        std::int64_t stashDate        = 0;
+        std::int64_t customStartEpoch = 0;
+        std::int64_t customEndEpoch   = 0;
+        bool operator==(const SessionCacheKey& o) const noexcept {
+            return characterDate    == o.characterDate
+                && stashDate        == o.stashDate
+                && customStartEpoch == o.customStartEpoch
+                && customEndEpoch   == o.customEndEpoch;
         }
     };
-    SessionAnchorCacheKey                     sessionAnchorCacheKey{};
+    SessionCacheKey                           sessionCacheKey{};
 
     // Ephemeral backup-action ring buffer for the BackupLog pane. Written
     // by the watcher/scheduler thread via setInsertCallback (and by the
@@ -282,24 +283,6 @@ struct UiState {
     } retentionModal;
     bool                                      retentionModalVisible = false;
 
-    // Session-anchor picker modal (opened by "pick backup as anchor..."
-    // from the Session pane's config menu). Populated with the active
-    // player's backup history at open time; scrolled with Up/Down;
-    // committed with Enter which writes the pin into the pane's
-    // PaneConfig and reruns the anchor build.
-    struct SessionPicker {
-        PaneNode*                         target = nullptr;  // owning pane
-        std::string                       filename;          // e.g. "Kai.d2s"
-        std::vector<BackupDb::HistoryRow> rows;              // newest-first
-        int                               cursor = 0;
-        // Distinguishes the two roles this modal serves:
-        //   false -> pick the session anchor (start-of-session boundary).
-        //   true  -> pick the session end (the last moment to include).
-        // Same UI shape; only the commit target + modal title differ.
-        bool                              isEnd  = false;
-    } sessionPicker;
-    bool                                      sessionPickerVisible = false;
-
     // Character picker modal, opened from a Character pane's config
     // menu via ConfigMenuItem::PickCharacter. `options[0] == ""` always
     // represents "auto (newest saved)"; the rest are basenames from
@@ -312,10 +295,10 @@ struct UiState {
     bool                                      characterPickerVisible = false;
 
     // Manual session-time input modal. Opened by the Session Info /
-    // Session panes' "start: manual..." / "end: manual..." menu
-    // actions. Text buffer is parsed by d2r::parseUserDateTime on
-    // Enter; on success the pane's pinned start / end date field is
-    // updated and the anchor is rebuilt.
+    // Session panes' "start: <auto | custom @ ...>" / "end: <...>"
+    // menu actions. Text buffer is parsed by d2r::parseUserDateTime on
+    // Enter; on success the pane's custom start / end date field is
+    // updated and the session is rebuilt.
     struct SessionTimeInputModal {
         PaneNode*   target = nullptr;
         std::string buffer;               // user-typed input
@@ -479,24 +462,23 @@ Element renderExpBar(double anchorFrac, double nowFrac, int barW = 40) {
 // Full renderer for PaneType::Character. Composes the ActivePlayer
 // summary (name, class, level+difficulty, seed, badges) with the
 // session block (duration, XP delta, two-color exp bar). The session
-// portion uses the *auto* SessionAnchor (`ui.sessionAnchor`); per-
-// character anchors are tracked in a follow-up commit. A mismatch
-// between the pane's target and the anchor's tracked player is called
-// out in a warning line so the delta still renders but is annotated
-// as "from the auto anchor".
+// portion uses the shared Session (`ui.session`); per-character
+// sessions are tracked in a follow-up commit. A mismatch between the
+// pane's target and the session's tracked player is called out in a
+// warning line so the delta still renders but is annotated.
 Element renderCharacterPane(const PaneConfig&        cfg,
                             const DashboardSnapshot& s,
-                            const SessionAnchor*     anchor,
+                            const Session*           session,
                             const DashboardFileCache& cache,
                             bool                     focused,
-                            bool                     anchorPinned) {
+                            bool                     startPinned) {
     // Title reflects mode: " Character " (auto) or
     // " Character  Kai " (pinned to Kai).
     std::string titleStr = " Character ";
     if (!cfg.characterSelection.empty()) {
         titleStr = " Character  " + cfg.characterSelection + " ";
-    } else if (anchorPinned) {
-        titleStr = " Character (pinned) ";
+    } else if (startPinned) {
+        titleStr = " Character (custom start) ";
     }
     Element titleEl = text(titleStr);
     if (focused) titleEl = titleEl | inverted;
@@ -527,27 +509,30 @@ Element renderCharacterPane(const PaneConfig&        cfg,
     const bool tableStale = in.expForLevel > 0 && in.expInLevel > in.expForLevel;
 
     // ---- Session XP delta ----
-    // Only meaningful when the anchor tracks a real player and the pane's
-    // target matches (otherwise the delta compares apples/oranges).
+    // Only meaningful when the session start-state tracks a real player
+    // and the pane's target matches (otherwise the delta compares
+    // apples/oranges).
+    const SessionState* startState =
+        session ? &session->startState : nullptr;
     std::int64_t xpDelta    = 0;
     std::int32_t levelDelta = 0;
     double       pctDelta   = 0.0;
     bool         deltaValid = false;
     bool         anchorMismatch = false;
-    if (anchor && anchor->hasActivePlayer) {
-        anchorMismatch = (anchor->playerName != in.name);
+    if (startState && startState->hasActivePlayer) {
+        anchorMismatch = (startState->playerName != in.name);
         if (!anchorMismatch) {
-            const std::uint64_t aCum = cumulativeXp(anchor->level, anchor->expInLevel);
+            const std::uint64_t aCum = cumulativeXp(startState->level, startState->expInLevel);
             const std::uint64_t nCum = cumulativeXp(in.level, in.expInLevel);
             xpDelta = static_cast<std::int64_t>(nCum) - static_cast<std::int64_t>(aCum);
             levelDelta = static_cast<std::int32_t>(in.level)
-                       - static_cast<std::int32_t>(anchor->level);
-            const std::uint64_t anchorFloor = experienceToReachLevel(anchor->level);
-            const std::uint64_t anchorCeil  = experienceToReachLevel(anchor->level + 1);
+                       - static_cast<std::int32_t>(startState->level);
+            const std::uint64_t anchorFloor = experienceToReachLevel(startState->level);
+            const std::uint64_t anchorCeil  = experienceToReachLevel(startState->level + 1);
             const std::uint64_t anchorSpan  = anchorCeil > anchorFloor
                                                 ? anchorCeil - anchorFloor : 0;
             const double anchorFrac = (anchorSpan > 0)
-                ? static_cast<double>(anchor->expInLevel)
+                ? static_cast<double>(startState->expInLevel)
                   / static_cast<double>(anchorSpan) : 0.0;
             const double nowFrac = (in.expForLevel > 0)
                 ? static_cast<double>(in.expInLevel)
@@ -559,7 +544,7 @@ Element renderCharacterPane(const PaneConfig&        cfg,
     }
 
     // ---- Exp bar ----
-    // Anchor fraction only makes sense when the anchor tracks this
+    // Anchor fraction only makes sense when the start-state tracks this
     // character AND we haven't leveled up since (levelDelta == 0).
     // Otherwise start the bar's "white" segment at zero and show all
     // current progress as the highlight-colored gain -- reads as
@@ -569,19 +554,19 @@ Element renderCharacterPane(const PaneConfig&        cfg,
                      / static_cast<double>(in.expForLevel), 0.0, 1.0)
         : 0.0;
     double anchorFrac = 0.0;
-    if (deltaValid && levelDelta == 0 && anchor->expInLevel > 0) {
-        const std::uint64_t aFloor = experienceToReachLevel(anchor->level);
-        const std::uint64_t aCeil  = experienceToReachLevel(anchor->level + 1);
+    if (deltaValid && levelDelta == 0 && startState->expInLevel > 0) {
+        const std::uint64_t aFloor = experienceToReachLevel(startState->level);
+        const std::uint64_t aCeil  = experienceToReachLevel(startState->level + 1);
         if (aCeil > aFloor) {
-            anchorFrac = std::clamp(static_cast<double>(anchor->expInLevel)
+            anchorFrac = std::clamp(static_cast<double>(startState->expInLevel)
                                     / static_cast<double>(aCeil - aFloor), 0.0, 1.0);
         }
     }
 
     // ---- Session duration ----
     std::string durStr = "";
-    if (anchor && anchor->sessionStartEpoch != 0 && anchor->sessionEndEpoch != 0) {
-        std::int64_t secs = anchor->sessionEndEpoch - anchor->sessionStartEpoch;
+    if (session && session->startEpoch != 0 && session->endEpoch != 0) {
+        std::int64_t secs = session->endEpoch - session->startEpoch;
         if (secs < 0) secs = 0;
         char buf[32];
         std::snprintf(buf, sizeof(buf), "%lldh %02lldm %02llds",
@@ -620,10 +605,10 @@ Element renderCharacterPane(const PaneConfig&        cfg,
         text("Seed " + std::to_string(in.mapSeed)) | dim,
     }));
     if (anchorMismatch) {
-        body.push_back(text("* anchor was " + anchor->playerName
+        body.push_back(text("* session start was " + startState->playerName
                             + "; delta not shown") | color(Color::Yellow));
-    } else if (!deltaValid && anchor && !anchor->hasActivePlayer) {
-        body.push_back(text("* session anchor not yet initialised") | dim);
+    } else if (!deltaValid && startState && !startState->hasActivePlayer) {
+        body.push_back(text("* session start not yet initialised") | dim);
     }
     body.push_back(separator());
     // Session summary line: duration + delta bundled together.
@@ -672,8 +657,8 @@ Element renderCharacterPane(const PaneConfig&        cfg,
 // Session Info pane (configurable top-row, formerly "Session Loot"):
 // session boundaries (start / end / duration) + new uniques, sets, and
 // runes gained during the current play session. Diffs the snapshot's
-// inventory against the SessionAnchor's item keys (for uniques/sets)
-// and against the anchor's rune stack map (for runes).
+// inventory against the session start-state's item keys (for uniques /
+// sets) and against the start-state's rune stack map (for runes).
 // -----------------------------------------------------------------------
 
 // True when `code` is a rune base code -- r00..r99 shape. Runes actually
@@ -703,35 +688,33 @@ std::string formatElapsedHMS(std::int64_t seconds) {
 
 Element renderSessionLootPane(const PaneConfig&        cfg,
                               const DashboardSnapshot& s,
-                              const SessionAnchor*     anchor,
+                              const Session*           session,
                               bool                     focused) {
-    // Title reflects pin state:
-    //   " Session Info "                -- both start + end auto
-    //   " Session Info (pinned start) " -- start pinned only
-    //   " Session Info (pinned end) "   -- end pinned only
-    //   " Session Info (pinned) "       -- both start + end pinned
-    const bool startPinned = cfg.sessionAnchorPinned && cfg.sessionAnchorPinnedDate > 0;
-    const bool endPinned   = cfg.sessionAnchorPinnedEndDate > 0;
+    // Title reflects custom-window state:
+    //   " Session Info "                       -- start + end both auto
+    //   " Session Info (custom start) "        -- user-fixed start
+    //   " Session Info (custom start + end) "  -- user-fixed start + end
+    // (end-alone is impossible by invariant; see PaneConfig comments.)
+    const bool startCustom = cfg.sessionCustomStartEpoch > 0;
+    const bool endCustom   = cfg.sessionCustomEndEpoch   > 0;
     std::string titleStr = " Session Info ";
-    if (startPinned && endPinned)       titleStr = " Session Info (pinned) ";
-    else if (startPinned)               titleStr = " Session Info (pinned start) ";
-    else if (endPinned)                 titleStr = " Session Info (pinned end) ";
+    if (startCustom && endCustom) titleStr = " Session Info (custom start + end) ";
+    else if (startCustom)         titleStr = " Session Info (custom start) ";
     Element titleEl = text(titleStr);
     if (focused) titleEl = titleEl | inverted;
 
-    if (!anchor) {
+    if (!session) {
         return window(titleEl, vbox({
             filler(),
             hbox({ filler(),
-                   text("Session anchor not yet initialised.") | dim,
+                   text("Session not yet initialised.") | dim,
                    filler() }),
             filler(),
         }));
     }
 
     // ---- Uniques / Sets diff ----
-    // Identified named items not present in the anchor's key set. Same
-    // logic that used to live inside renderSessionLeaf.
+    // Identified named items not present in the session start's key set.
     std::vector<const InventoryItem*> newUniques;
     std::vector<const InventoryItem*> newSets;
     for (const auto& it : s.inventory) {
@@ -739,14 +722,14 @@ Element renderSessionLootPane(const PaneConfig&        cfg,
         if (it.fingerprint == 0) continue;
         if (it.quality != ItemQuality::Unique && it.quality != ItemQuality::Set)
             continue;
-        if (anchor->itemKeys.contains({it.fingerprint, it.quality})) continue;
+        if (session->startState.itemKeys.contains({it.fingerprint, it.quality})) continue;
         (it.quality == ItemQuality::Unique ? newUniques : newSets).push_back(&it);
     }
 
     // ---- Runes diff ----
     // Build "now" per-code counts by scanning inventory; subtract the
-    // anchor's stacks; keep only positive deltas. Look up display
-    // names from the current inventory (one exemplar item per code).
+    // session start's stacks; keep only positive deltas. Look up
+    // display names from the current inventory (one exemplar per code).
     struct RuneDelta {
         std::string  code;
         std::string  name;
@@ -764,8 +747,9 @@ Element renderSessionLootPane(const PaneConfig&        cfg,
             nameByCode.try_emplace(it.code, it.name);
         }
         for (const auto& [code, now] : nowStacks) {
-            const auto it = anchor->runeStacks.find(code);
-            const std::uint32_t before = (it == anchor->runeStacks.end()) ? 0u : it->second;
+            const auto it = session->startState.runeStacks.find(code);
+            const std::uint32_t before =
+                (it == session->startState.runeStacks.end()) ? 0u : it->second;
             if (now > before) {
                 RuneDelta d;
                 d.code  = code;
@@ -809,24 +793,23 @@ Element renderSessionLootPane(const PaneConfig&        cfg,
     Elements body;
 
     // ---- Session window: Start / End / Duration ----
-    // Values from the anchor are already correctly clamped by
-    // buildSessionAnchor (which honors the pane's pinned end).
-    // A trailing "(pin)" suffix flags each field that the user set
-    // explicitly, so the pane never lies about its provenance.
+    // Values from the session are already correctly clamped by
+    // buildSession (which honors any custom end). A trailing
+    // "(custom)" suffix flags each field the user set explicitly.
     body.push_back(hbox({
         text("Start ") | bold,
-        text(formatWallDateTime(anchor->sessionStartEpoch)),
-        text(startPinned ? "  (pin)" : "") | dim,
+        text(formatWallDateTime(session->startEpoch)),
+        text(startCustom ? "  (custom)" : "") | dim,
     }));
     body.push_back(hbox({
         text("End   ") | bold,
-        text(formatWallDateTime(anchor->sessionEndEpoch)),
-        text(endPinned ? "  (pin)" : "") | dim,
+        text(formatWallDateTime(session->endEpoch)),
+        text(endCustom ? "  (custom)" : "") | dim,
     }));
     {
         std::int64_t secs = 0;
-        if (anchor->sessionStartEpoch != 0 && anchor->sessionEndEpoch != 0) {
-            secs = anchor->sessionEndEpoch - anchor->sessionStartEpoch;
+        if (session->startEpoch != 0 && session->endEpoch != 0) {
+            secs = session->endEpoch - session->startEpoch;
         }
         body.push_back(hbox({
             text("Time  ") | bold,
@@ -2326,40 +2309,39 @@ Element renderBackupLogLeaf(const UiState& ui, bool focused) {
     }));
 }
 
-// ---- Session pane (diff vs sessionAnchor) ----------------------------------
+// ---- Session pane (diff vs session start) ----------------------------------
 
 namespace {
 
 } // namespace
 
 Element renderSessionLeaf(const DashboardSnapshot& now,
-                          const SessionAnchor*     anchor,
+                          const Session*           session,
                           bool                     focused,
-                          bool                     anchorPinned) {
-    // Title reflects whether the anchor is user-pinned to a specific
-    // backup or tracking the current play session automatically (a
-    // session ends with an S&E; the anchor rides the first save after
-    // the S&E that opened the session).
+                          bool                     startPinned) {
+    // Title reflects whether the start is user-fixed or tracking the
+    // current play session automatically (auto = D2R launch heuristic
+    // on the backup DB).
     Element titleEl = text(
-        anchorPinned ? " Session (pinned) " : " Session ");
+        startPinned ? " Session (custom start) " : " Session ");
     if (focused) titleEl = titleEl | inverted;
 
-    if (!anchor) {
+    if (!session) {
         return window(titleEl, vbox({
             filler(),
             hbox({ filler(),
-                   text("Session anchor not yet initialised.") | dim,
+                   text("Session not yet initialised.") | dim,
                    filler() }),
             filler(),
         }));
     }
 
+    const SessionState& startState = session->startState;
     Elements body;
     // Header line: character + session duration. Duration is the span
-    // between the oldest and newest backup of the CURRENT play session
-    // (see buildSessionAnchor for the session boundary definition).
-    // Backup-quantised on purpose -- a single-backup session reads as
-    // 0h 00m 00s, and the timer only changes when a new save lands.
+    // between session start and end (see buildSession for how those
+    // are chosen). Auto-end sessions ride "now"; custom-end sessions
+    // clamp to the user-fixed instant.
     Elements header;
     if (now.hasActivePlayer) {
         header.push_back(text(now.activePlayer.name) | bold);
@@ -2370,8 +2352,8 @@ Element renderSessionLeaf(const DashboardSnapshot& now,
     }
     {
         std::int64_t secs = 0;
-        if (anchor->sessionStartEpoch != 0 && anchor->sessionEndEpoch != 0) {
-            secs = anchor->sessionEndEpoch - anchor->sessionStartEpoch;
+        if (session->startEpoch != 0 && session->endEpoch != 0) {
+            secs = session->endEpoch - session->startEpoch;
             if (secs < 0) secs = 0;
         }
         const std::int64_t h =  secs / 3600;
@@ -2387,14 +2369,14 @@ Element renderSessionLeaf(const DashboardSnapshot& now,
     }
     body.push_back(hbox(std::move(header)));
 
-    // Warn if the active-player identity changed since the anchor -- the
-    // XP delta only makes sense within a single character, so we still
-    // show the numbers but flag the mismatch so the user knows to reset
-    // the anchor from the pane config.
-    if (anchor->hasActivePlayer && now.hasActivePlayer &&
-        anchor->playerName != now.activePlayer.name) {
+    // Warn if the active-player identity changed since the session start
+    // -- the XP delta only makes sense within a single character, so we
+    // still show the numbers but flag the mismatch so the user knows
+    // to reset the session from the pane config.
+    if (startState.hasActivePlayer && now.hasActivePlayer &&
+        startState.playerName != now.activePlayer.name) {
         body.push_back(text(
-            "  * anchor was " + anchor->playerName +
+            "  * session start was " + startState.playerName +
             "; reset session for this character") | color(Color::Yellow));
     }
     body.push_back(separator());
@@ -2404,26 +2386,26 @@ Element renderSessionLeaf(const DashboardSnapshot& now,
     std::int64_t xpDelta = 0;
     std::int32_t levelDelta = 0;
     double       pctDelta = 0.0;
-    if (anchor->hasActivePlayer && now.hasActivePlayer) {
+    if (startState.hasActivePlayer && now.hasActivePlayer) {
         const auto& n = now.activePlayer;
-        const std::uint64_t aCum = cumulativeXp(anchor->level, anchor->expInLevel);
-        const std::uint64_t nCum = cumulativeXp(n.level,       n.expInLevel);
+        const std::uint64_t aCum = cumulativeXp(startState.level, startState.expInLevel);
+        const std::uint64_t nCum = cumulativeXp(n.level,          n.expInLevel);
         xpDelta = static_cast<std::int64_t>(nCum)
                 - static_cast<std::int64_t>(aCum);
         levelDelta = static_cast<std::int32_t>(n.level)
-                   - static_cast<std::int32_t>(anchor->level);
+                   - static_cast<std::int32_t>(startState.level);
         // Percentage is expressed as "fraction of the XP bar filled
         // during the session", matching the in-game XP bar. A level-up
-        // contributes 100% (the anchor's remaining bar + all subsequent
+        // contributes 100% (the start's remaining bar + all subsequent
         // full bars + progress into the current bar). Late-game sessions
         // therefore read as "3.0%" rather than a cumulative-XP fraction
         // that trends toward zero as total XP grows.
-        const std::uint64_t anchorFloor = experienceToReachLevel(anchor->level);
-        const std::uint64_t anchorCeil  = experienceToReachLevel(anchor->level + 1);
+        const std::uint64_t anchorFloor = experienceToReachLevel(startState.level);
+        const std::uint64_t anchorCeil  = experienceToReachLevel(startState.level + 1);
         const std::uint64_t anchorSpan  = anchorCeil > anchorFloor
                                             ? anchorCeil - anchorFloor : 0;
         const double anchorFrac = (anchorSpan > 0)
-            ? static_cast<double>(anchor->expInLevel)
+            ? static_cast<double>(startState.expInLevel)
               / static_cast<double>(anchorSpan)
             : 0.0;
         const double nowFrac = (n.expForLevel > 0)
@@ -2448,16 +2430,16 @@ Element renderSessionLeaf(const DashboardSnapshot& now,
     }));
     body.push_back(separator());
 
-    // New-item lists (uniques / sets / runes since the anchor) moved
-    // to PaneType::SessionLoot as part of the configurable-top-row
-    // work. This bottom-row pane now focuses purely on XP + duration;
+    // New-item lists (uniques / sets / runes since the session start)
+    // moved to PaneType::SessionLoot as part of the configurable-top-
+    // row work. This bottom-row pane now focuses purely on XP + duration;
     // add a Session Info pane to see the loot rundown.
     body.push_back(text("Add a 'Session Info' pane to see new items,")
                    | dim);
     body.push_back(text("uniques, and rune drops for this session.")
                    | dim);
 
-    Element footer = text(" reset anchor from [c] configure ") | dim;
+    Element footer = text(" reset session from [c] configure ") | dim;
     return window(titleEl, vbox({
         vbox(std::move(body)) | vscroll_indicator | frame | flex,
         separator(),
@@ -2552,81 +2534,8 @@ Element renderRetentionModal(const UiState::RetentionModal& m,
     return window(text(" Retention "), vbox(std::move(body)) | size(WIDTH, GREATER_THAN, 60));
 }
 
-// ---- Session-anchor picker modal -------------------------------------------
-
-// Modal that lists the active character's backup history newest-first
-// so the user can pick any specific row as the Session pane's anchor.
-// Rendered on top of the pane layout when `ui.sessionPickerVisible`.
-// Column layout matches the Backups Detail view so the two look and
-// feel identical when scrolling around.
-Element renderSessionPickerModal(const UiState::SessionPicker& p) {
-    Element titleEl = text(
-        std::string(p.isEnd ? " Pick session end  " : " Pick session anchor  ")
-        + p.filename + " ");
-
-    if (p.rows.empty()) {
-        return window(titleEl, vbox({
-            text("No backups on record for this character.") | dim,
-            text("Press [Esc] to close.") | dim,
-        }) | size(WIDTH, GREATER_THAN, 60));
-    }
-
-    constexpr int kDateW  = 20;
-    constexpr int kStateW = 10;
-    constexpr int kBytesW = 10;
-    constexpr int kSumW   = 12;
-    auto pad = [](std::string s, int w) {
-        if (static_cast<int>(s.size()) > w) return s.substr(0, w);
-        s.append(w - s.size(), ' ');
-        return s;
-    };
-
-    const int nRows   = static_cast<int>(p.rows.size());
-    const int cursor  = std::clamp(p.cursor, 0, nRows - 1);
-    // Show a window of rows around the cursor so long histories stay
-    // navigable inside a fixed-height modal.
-    constexpr int kVisibleRows = 20;
-    int start = std::max(0, cursor - kVisibleRows / 2);
-    if (start + kVisibleRows > nRows) start = std::max(0, nRows - kVisibleRows);
-    const int end = std::min(nRows, start + kVisibleRows);
-
-    Elements body;
-    body.push_back(hbox({
-        text(pad("when",     kDateW))  | bold,
-        text(pad("state",    kStateW)) | bold,
-        text(pad("bytes",    kBytesW)) | bold,
-        text(pad("checksum", kSumW))   | bold,
-    }));
-    body.push_back(separator());
-    for (int i = start; i < end; ++i) {
-        const auto& r = p.rows[i];
-        std::string sumStr = "-";
-        if (r.checksum) {
-            char b[16];
-            std::snprintf(b, sizeof(b), "%08x", *r.checksum);
-            sumStr = b;
-        }
-        Element rowEl = hbox({
-            text(pad(formatWallDateTime(r.date),                   kDateW)),
-            text(pad(std::string(backupStateShortLabel(r.state)),  kStateW)),
-            text(pad(std::to_string(r.sizeBytes),                  kBytesW)),
-            text(pad(sumStr,                                       kSumW)),
-        });
-        if (i == cursor) rowEl = rowEl | inverted;
-        body.push_back(rowEl);
-    }
-    body.push_back(separator());
-    body.push_back(hbox({
-        text(" row " + std::to_string(cursor + 1) + "/" + std::to_string(nRows)) | dim,
-        filler(),
-        text("[Up/Down] navigate  [Enter] pin  [Esc] cancel ") | dim,
-    }));
-    return window(titleEl, vbox(std::move(body)) | size(WIDTH, GREATER_THAN, 60));
-}
-
 // Rendered on top of the pane layout when `ui.characterPickerVisible`.
-// Reuses the same shape as the session picker for consistency: a
-// vertical list with the current cursor row inverted and a fixed
+// Vertical list with the current cursor row inverted and a fixed
 // hint footer. The first entry is always "(auto -- newest saved)".
 Element renderCharacterPickerModal(const UiState::CharacterPicker& p) {
     Element titleEl = text(" Pick character ");
@@ -2711,12 +2620,8 @@ struct ConfigMenuItem {
         ToggleQuality,
         ClearBackupLog,
         ResetSession,
-        PickSessionAnchor,
-        UnpinSessionAnchor,
-        PickSessionEnd,
-        UnpinSessionEnd,
-        PickSessionStartManual,
-        PickSessionEndManual,
+        SetSessionStart,
+        SetSessionEnd,
         PickCharacter,
         ResetCharacterToAuto,
         ToggleUberShowUbers,
@@ -2794,38 +2699,40 @@ std::vector<ConfigMenuItem> buildConfigMenu(const PaneConfig& c, bool canDelete)
     if (c.type == PaneType::BackupLog) {
         items.push_back({"clear backup-actions log", ConfigMenuItem::ClearBackupLog});
     }
-    // Session-anchor pin controls live on every pane that consumes the
-    // anchor (Session, SessionLoot, Character). Each pane can pin the
-    // session start (item-diff base) and/or the session end (display
-    // clamp); the anchor scan in runDashboard picks up the first pin
-    // it finds across those pane types.
+    // Session-window controls live on every pane that consumes the
+    // session (Session, SessionLoot, Character). Each pane can set a
+    // custom start (item-diff base + display) and, when the start is
+    // custom, a custom end (display clamp). The session scan in
+    // runDashboard picks up the first custom values it finds across
+    // those pane types.
     if (c.type == PaneType::Session
      || c.type == PaneType::SessionLoot) {
-        if (c.sessionAnchorPinned && c.sessionAnchorPinnedDate > 0) {
+        const bool startCustom = c.sessionCustomStartEpoch > 0;
+        if (startCustom) {
             items.push_back({
-                "start:  pinned @ " + formatWallDateTime(c.sessionAnchorPinnedDate),
-                ConfigMenuItem::PickSessionAnchor});
-            items.push_back({"unpin start (auto-track current session)",
-                              ConfigMenuItem::UnpinSessionAnchor});
+                "start: custom @ " + formatWallDateTime(c.sessionCustomStartEpoch)
+                    + "  --  [type any time...]",
+                ConfigMenuItem::SetSessionStart});
         } else {
-            items.push_back({"start:  auto (last Save & Exit)  --  [pick backup...]",
-                              ConfigMenuItem::PickSessionAnchor});
-        }
-        items.push_back({"start:  set manually  --  [type any time...]",
-                          ConfigMenuItem::PickSessionStartManual});
-        if (c.sessionAnchorPinnedEndDate > 0) {
             items.push_back({
-                "end:    pinned @ " + formatWallDateTime(c.sessionAnchorPinnedEndDate),
-                ConfigMenuItem::PickSessionEnd});
-            items.push_back({"unpin end (auto-track newest backup)",
-                              ConfigMenuItem::UnpinSessionEnd});
-        } else {
-            items.push_back({"end:    auto (newest backup)  --  [pick backup...]",
-                              ConfigMenuItem::PickSessionEnd});
+                "start: auto (D2R launch)  --  [type any time...]",
+                ConfigMenuItem::SetSessionStart});
         }
-        items.push_back({"end:    set manually  --  [type any time...]",
-                          ConfigMenuItem::PickSessionEndManual});
-        items.push_back({"reset session anchor now",
+        // End control only surfaces when start is custom (invariant:
+        // custom end requires custom start).
+        if (startCustom) {
+            if (c.sessionCustomEndEpoch > 0) {
+                items.push_back({
+                    "end:   custom @ " + formatWallDateTime(c.sessionCustomEndEpoch)
+                        + "  --  [type any time...]",
+                    ConfigMenuItem::SetSessionEnd});
+            } else {
+                items.push_back({
+                    "end:   auto (live)  --  [type any time...]",
+                    ConfigMenuItem::SetSessionEnd});
+            }
+        }
+        items.push_back({"reset session (clears custom start + end)",
                           ConfigMenuItem::ResetSession});
     }
     if (c.type == PaneType::Character) {
@@ -3000,21 +2907,21 @@ Element renderPane(PaneNode& node, const UiState& ui,
             leafEl = renderBackupLogLeaf(ui, focused);
             break;
         case PaneType::Session:
-            leafEl = renderSessionLeaf(s, ui.sessionAnchor.get(), focused,
-                                        node.config.sessionAnchorPinned);
+            leafEl = renderSessionLeaf(s, ui.session.get(), focused,
+                                        node.config.sessionCustomStartEpoch > 0);
             break;
         case PaneType::Blank:
             leafEl = renderBlankLeaf(focused);
             break;
         case PaneType::Character:
             leafEl = renderCharacterPane(node.config, s,
-                                          ui.sessionAnchor.get(),
+                                          ui.session.get(),
                                           ui.fileCache, focused,
-                                          node.config.sessionAnchorPinned);
+                                          node.config.sessionCustomStartEpoch > 0);
             break;
         case PaneType::SessionLoot:
             leafEl = renderSessionLootPane(node.config, s,
-                                            ui.sessionAnchor.get(), focused);
+                                            ui.session.get(), focused);
             break;
         case PaneType::Uber:
             leafEl = renderUberPane(node.config, s, ui.fileCache, focused);
@@ -3314,81 +3221,80 @@ int runDashboard(const std::filesystem::path& savePath,
     // the anchor rides that start-of-session point; the diff therefore
     // shows everything the player has done since they last logged in.
     //
-    // Returns a lightweight SessionAnchor (character stats + pre-
-    // computed identified-item fingerprint set) rather than a shadow
-    // DashboardSnapshot -- the renderer only needs those fields, and
-    // the small footprint makes caching cheap enough to serve rapid
-    // autosave bursts without any byte parsing after the first miss.
+    // Returns a lightweight Session (window epochs + pre-computed
+    // start-state item keys, rune stacks, and character stats) rather
+    // than a shadow DashboardSnapshot -- the renderer only needs those
+    // fields, and the small footprint makes caching cheap enough to
+    // serve rapid autosave bursts without any byte parsing after the
+    // first miss.
     //
-    // When `pinnedDate` is set, the pin represents a moment in time
-    // and the anchor becomes the account state at that moment: for
-    // every file (character saves + the shared stash) the anchor
-    // pulls the newest backup with date <= pin. Files with no backup
-    // at/before the pin didn't exist yet at anchor time and
-    // contribute nothing. This makes an early pin -- one that
-    // predates every save -- produce an empty anchor snapshot, so
-    // every currently-owned item counts as "new since the session
-    // started". Picking an exact backup date from the picker admits
-    // equality and lands on that specific row (behavior preserved).
-    auto buildSessionAnchor =
+    // When `customStartEpoch` is set, the start represents a user-
+    // fixed moment in time and the start-state becomes the account
+    // state at that moment: for every file (character saves + the
+    // shared stash) the start-state pulls the newest backup with
+    // date <= that moment. Files with no backup at/before it didn't
+    // exist yet at start time and contribute nothing. This makes an
+    // early custom start -- one that predates every save -- produce
+    // an empty start-state, so every currently-owned item counts as
+    // "new since the session started".
+    auto buildSession =
         [&](const std::shared_ptr<const DashboardSnapshot>& current,
-            std::optional<std::int64_t>                     pinnedDate    = std::nullopt,
-            std::optional<std::int64_t>                     pinnedEndDate = std::nullopt)
-        -> std::shared_ptr<const SessionAnchor> {
-        // Fallback used when we can't build a proper anchor -- treats
+            std::optional<std::int64_t>                     customStartEpoch = std::nullopt,
+            std::optional<std::int64_t>                     customEndEpoch   = std::nullopt)
+        -> std::shared_ptr<const Session> {
+        // Fallback used when we can't build a proper session -- treats
         // the current snapshot's active player + inventory as the
-        // anchor, which produces a trivial 0-delta diff (correct: we
-        // have no historical reference).
-        auto anchorFromCurrent = [&]() -> std::shared_ptr<const SessionAnchor> {
-            if (!current) return std::make_shared<SessionAnchor>();
-            return std::make_shared<SessionAnchor>(
-                makeSessionAnchorFromSnapshot(*current, 0));
+        // start-state, which produces a trivial 0-delta diff (correct:
+        // we have no historical reference).
+        auto sessionFromCurrent = [&]() -> std::shared_ptr<const Session> {
+            auto out = std::make_shared<Session>();
+            if (current) out->startState = makeSessionStateFromSnapshot(*current);
+            return out;
         };
-        if (!current || !current->hasActivePlayer) return anchorFromCurrent();
+        if (!current || !current->hasActivePlayer) return sessionFromCurrent();
 #if D2R_HAVE_INOTIFY
-        if (!backupDb) return anchorFromCurrent();
+        if (!backupDb) return sessionFromCurrent();
         const auto& filename = current->activePlayer.file;
-        if (filename.empty()) return anchorFromCurrent();
+        if (filename.empty()) return sessionFromCurrent();
 
-        // Step 1: resolve the CHARACTER-side anchor date (row lookup).
-        // Also compute the CURRENT session's oldest/newest backup dates
-        // -- consumed later by the pane's duration display. Definitions:
-        //   * "Current session" = all backups newer than the boundary
-        //     S&E (auto mode), or newer than the pinned date (pinned).
-        //     When hist[0] itself is an S&E (just-quit case), the
-        //     terminating S&E is part of that session too.
+        // Step 1: resolve the CHARACTER-side start date (row lookup).
+        // Also compute the session's start / end epochs -- consumed by
+        // the pane's duration display. Definitions:
+        //   * Auto mode: start = boundary S&E date, end = newest backup.
+        //     When hist[0] is an S&E (just-quit case) the terminating
+        //     S&E is part of the just-ended session.
         //   * "No S&E on record" fallback: treat the entire history
         //     as one session -- newest to oldest.
-        //   * Pinned + no newer backups: session window collapses to
-        //     the pin (rendered as 0h 00m 00s).
+        //   * Custom start + no newer backups: end collapses to start
+        //     (rendered as 0h 00m 00s).
         std::optional<BackupDb::Row>      row;
-        std::int64_t                      anchorDate        = 0;
+        std::int64_t                      lookupEpoch     = 0;
         std::int64_t                      sessionStartEpoch = 0;
         std::int64_t                      sessionEndEpoch   = 0;
         std::vector<BackupDb::HistoryRow> hist;
         try { hist = backupDb->historyFor(filename, 200); }
         catch (const std::exception&) {}
-        if (pinnedDate) {
-            // Pinned semantic: the pin is a moment in time. Every file
-            // (active player, other characters, shared stash) contributes
-            // whichever backup is newest at or before the pin. Files
-            // with no such backup didn't exist yet at anchor time and
-            // contribute nothing -- a pin before ANY save on record
-            // therefore produces an empty anchor and every currently-
-            // owned item counts as "new".
+        if (customStartEpoch) {
+            // Custom start: the epoch is a moment in time. Every file
+            // (active player, other characters, shared stash)
+            // contributes whichever backup is newest at or before it.
+            // Files with no such backup didn't exist yet at start time
+            // and contribute nothing -- a custom start before ANY save
+            // on record therefore produces an empty start-state and
+            // every currently-owned item counts as "new".
             //
-            // Session window: pin -> newest backup on record. When no
-            // backup postdates the pin, End collapses to Start (=pin)
-            // so the pane reads "0h 00m 00s starting at <pin>" rather
-            // than a nonsensical negative duration.
-            anchorDate = *pinnedDate;
-            try { row = backupDb->at(filename, *pinnedDate); }
+            // Session window: start -> newest backup on record. When
+            // no backup postdates the start, End collapses to Start
+            // so the pane reads "0h 00m 00s starting at <start>"
+            // rather than a nonsensical negative duration.
+            lookupEpoch = *customStartEpoch;
+            try { row = backupDb->at(filename, *customStartEpoch); }
             catch (const std::exception&) { row.reset(); }
-            sessionStartEpoch = *pinnedDate;
-            sessionEndEpoch   = (!hist.empty() && hist.front().date > *pinnedDate)
-                ? hist.front().date : *pinnedDate;
+            sessionStartEpoch = *customStartEpoch;
+            sessionEndEpoch   = (!hist.empty() && hist.front().date > *customStartEpoch)
+                ? hist.front().date : *customStartEpoch;
         } else {
-            // Auto mode: the anchor is the LATEST SAVE of the PREVIOUS
+            // Auto mode: the start is the LATEST SAVE of the PREVIOUS
             // session -- i.e., the S&E that ended it. Diff = latest save
             // of the current session vs latest save of the previous.
             // A session ends with an S&E, so the previous session's
@@ -3403,12 +3309,12 @@ int runDashboard(const std::filesystem::path& savePath,
             //   * Otherwise the user is mid-session -- the previous
             //     session's terminating S&E is the newest S&E on record,
             //     so seThreshold = 1.
-            //   * Anchor = that boundary S&E's row directly.
-            //   * Fallback: no qualifying S&E on record -> anchor on
+            //   * start-state = that boundary S&E's row directly.
+            //   * Fallback: no qualifying S&E on record -> start on
             //     the oldest known save so the diff still says something
             //     (represents "everything since the DB started tracking
             //     this character").
-            if (hist.empty()) return anchorFromCurrent();
+            if (hist.empty()) return sessionFromCurrent();
             const int seThreshold =
                 (hist.front().state == BackupDb::State::SaveAndExit) ? 2 : 1;
             int seSeen = 0;
@@ -3424,7 +3330,7 @@ int runDashboard(const std::filesystem::path& savePath,
             const auto& pick = hist[static_cast<std::size_t>(anchorIdx)];
             try { row = backupDb->at(filename, pick.date); }
             catch (const std::exception&) { row.reset(); }
-            if (row) anchorDate = pick.date;
+            if (row) lookupEpoch = pick.date;
 
             // Session window: current session's backup range.
             // Boundary present: hist[0..boundaryIdx-1] are strictly
@@ -3445,14 +3351,14 @@ int runDashboard(const std::filesystem::path& savePath,
             // the previous session's S&E itself, or a just-quit with
             // no PRIOR session). Leave both at 0 -> renders as 0.
         }
-        // Auto mode requires a valid anchor row (byte-source for
-        // overrideActivePlayerFromBytes below). Pinned mode is
+        // Auto mode requires a valid start row (byte-source for
+        // overrideActivePlayerFromBytes below). Custom-start mode is
         // permitted to reach step 4 with a null row: it means the
-        // active player didn't exist at or before the pin, so its
+        // active player didn't exist at or before the start, so its
         // items get stripped from `temp` there (empty contribution).
-        if (!pinnedDate && (!row || row->data.empty())) return anchorFromCurrent();
+        if (!customStartEpoch && (!row || row->data.empty())) return sessionFromCurrent();
 
-        // Step 2: resolve the STASH-side anchor date. Three-tier lookup
+        // Step 2: resolve the STASH-side start date. Three-tier lookup
         // (see the older commit log for the rationale) but here we only
         // record the DATE + row, delaying the parse to the miss path.
         std::optional<BackupDb::Row> stashRow;
@@ -3461,20 +3367,19 @@ int runDashboard(const std::filesystem::path& savePath,
         if (!stashPath.empty()) {
             stashFile = stashPath.filename().string();
             if (!stashFile.empty()) {
-                try { stashRow = backupDb->at(stashFile, anchorDate); }
+                try { stashRow = backupDb->at(stashFile, lookupEpoch); }
                 catch (const std::exception&) {}
                 if (stashRow && !stashRow->data.empty()) {
-                    stashDate = anchorDate;   // approx; not needed for lookup
-                } else if (!pinnedDate) {
+                    stashDate = lookupEpoch;   // approx; not needed for lookup
+                } else if (!customStartEpoch) {
                     // Auto-mode fallback: OLDEST non-empty stash row so
                     // an S&E boundary that predates the stash's first
-                    // backup still gets a defensible anchor (rather
-                    // than an empty stash). Pinned mode is strict:
-                    // "no stash at pin" means the account had no
-                    // stash yet -> anchor stash is empty (step 4
-                    // clears it via clearSharedStashInSnapshot).
+                    // backup still gets a defensible start-state
+                    // (rather than an empty stash). Custom-start mode
+                    // is strict: "no stash at start" means the account
+                    // had no stash yet -> start-state stash is empty
+                    // (step 4 clears it via clearSharedStashInSnapshot).
                     stashRow.reset();
-                    // Fallback: OLDEST non-empty stash row.
                     std::vector<BackupDb::HistoryRow> hist;
                     try { hist = backupDb->historyFor(stashFile, 1000); }
                     catch (const std::exception&) {}
@@ -3494,16 +3399,16 @@ int runDashboard(const std::filesystem::path& savePath,
         }
 
         // Step 3: cache check. During autosave bursts the (character
-        // date, stash date, pinned dates) tuple usually stays stable
-        // across many rebuilds -- return the previously-built anchor
-        // without touching the parser.
+        // date, stash date, custom start, custom end) tuple usually
+        // stays stable across many rebuilds -- return the previously-
+        // built session without touching the parser.
         //
-        // End-pin clamp: if the user pinned an end date, clamp
+        // Custom-end clamp: if the user set a custom end epoch, clamp
         // sessionEndEpoch to <= that value (never past it). If the
-        // pinned end is BEFORE the current start, both collapse to
-        // the pin so the pane reads "0h 00m 00s starting at <pin>".
-        if (pinnedEndDate) {
-            const auto pin = *pinnedEndDate;
+        // custom end is BEFORE the start, both collapse to the end
+        // so the pane reads "0h 00m 00s starting at <end>".
+        if (customEndEpoch) {
+            const auto pin = *customEndEpoch;
             if (sessionEndEpoch == 0 || sessionEndEpoch > pin) {
                 sessionEndEpoch = pin;
             }
@@ -3512,66 +3417,58 @@ int runDashboard(const std::filesystem::path& savePath,
             }
         }
 
-        const UiState::SessionAnchorCacheKey key{
-            anchorDate,
+        const UiState::SessionCacheKey key{
+            lookupEpoch,
             stashDate,
-            pinnedDate.value_or(0),
-            pinnedEndDate.value_or(0),
+            customStartEpoch.value_or(0),
+            customEndEpoch.value_or(0),
         };
-        if (ui.sessionAnchor && ui.sessionAnchorCacheKey == key) {
-            // Item-diff fields (playerName/level/itemKeys) are still
-            // valid, but the session window advances every time a new
-            // autosave lands. Clone-and-patch is cheap (itemKeys uses
-            // shallow copy of the same hash buckets) and lets the
-            // timer stay live during autosave bursts without paying
-            // for the deep byte-parse in the miss path below.
-            if (ui.sessionAnchor->sessionStartEpoch == sessionStartEpoch &&
-                ui.sessionAnchor->sessionEndEpoch   == sessionEndEpoch) {
-                return ui.sessionAnchor;
+        if (ui.session && ui.sessionCacheKey == key) {
+            // Item-diff fields (startState.playerName/level/itemKeys)
+            // are still valid, but the session window advances every
+            // time a new autosave lands. Clone-and-patch is cheap
+            // (itemKeys uses shallow copy of the same hash buckets)
+            // and lets the timer stay live during autosave bursts
+            // without paying for the deep byte-parse in the miss path.
+            if (ui.session->startEpoch == sessionStartEpoch &&
+                ui.session->endEpoch   == sessionEndEpoch) {
+                return ui.session;
             }
-            auto patched = std::make_shared<SessionAnchor>(*ui.sessionAnchor);
-            patched->sessionStartEpoch = sessionStartEpoch;
-            patched->sessionEndEpoch   = sessionEndEpoch;
+            auto patched = std::make_shared<Session>(*ui.session);
+            patched->startEpoch = sessionStartEpoch;
+            patched->endEpoch   = sessionEndEpoch;
             return patched;
         }
 
-        // Step 4: miss path -- build a fresh anchor. Start from a
+        // Step 4: miss path -- build a fresh start-state. Start from a
         // shallow-ish copy of `current` so items owned by OTHER
         // characters (SetHolderFour, UniqueArmors, etc. -- .d2s files
-        // that live in the same save dir) stay in the anchor's item
-        // pool. Otherwise every such item would flag as "new" in the
-        // diff, because they'd be present in `now.inventory` but
-        // absent from an empty anchor.
-        //
-        // Step 4: miss path -- build a fresh anchor. Start from a
-        // shallow-ish copy of `current` so items owned by OTHER
-        // characters (SetHolderFour, UniqueArmors, etc. -- .d2s files
-        // that live in the same save dir) stay in the anchor's item
-        // pool. Otherwise every such item would flag as "new" in the
-        // diff, because they'd be present in `now.inventory` but
-        // absent from an empty anchor.
+        // that live in the same save dir) stay in the start-state's
+        // item pool. Otherwise every such item would flag as "new" in
+        // the diff, because they'd be present in `now.inventory` but
+        // absent from an empty start-state.
         //
         // Uniform per-file semantic: every file (active player, other
         // characters, shared stash) contributes its state at
-        // `anchorDate`. A file with no backup at/before that date
-        // didn't exist yet at anchor time and contributes nothing to
-        // the anchor -- its current items get stripped from `temp` so
-        // they correctly count as "new" now. This is what makes a
-        // pinned start of, say, "2026-07-01 00:00:00" produce an
-        // empty anchor when the earliest recorded backup is later,
-        // matching the user intent "session started before I had any
-        // save games; everything I own is new since then".
+        // `lookupEpoch`. A file with no backup at/before that date
+        // didn't exist yet at start time and contributes nothing to
+        // the start-state -- its current items get stripped from
+        // `temp` so they correctly count as "new" now. This is what
+        // makes a custom start of, say, "2026-07-01 00:00:00" produce
+        // an empty start-state when the earliest recorded backup is
+        // later, matching the user intent "session started before I
+        // had any save games; everything I own is new since then".
         //
-        // Optimization: files whose in-file timestamp is <= anchorDate
-        // haven't been touched since the anchor, so their current
-        // cache entry already reflects the anchor state -- skip the
-        // historical parse entirely. Typically the vast majority of
-        // character files. The parse cost is only paid on cache
-        // misses (session-boundary crosses, pin changes), so a burst
-        // of autosaves still hits the fast path above.
+        // Optimization: files whose in-file timestamp is <= lookupEpoch
+        // haven't been touched since the start, so their current cache
+        // entry already reflects the start state -- skip the historical
+        // parse entirely. Typically the vast majority of character
+        // files. The parse cost is only paid on cache misses (session-
+        // boundary crosses, custom changes), so a burst of autosaves
+        // still hits the fast path above.
         DashboardSnapshot temp = *current;
-        const auto anchorU32 = anchorDate > 0
-            ? static_cast<std::uint32_t>(anchorDate) : 0u;
+        const auto lookupU32 = lookupEpoch > 0
+            ? static_cast<std::uint32_t>(lookupEpoch) : 0u;
         auto stripCharacterItems = [&](const std::string& prefix) {
             temp.inventory.erase(
                 std::remove_if(temp.inventory.begin(), temp.inventory.end(),
@@ -3583,11 +3480,11 @@ int runDashboard(const std::filesystem::path& savePath,
         };
         for (const auto& [otherName, otherEntry] : ui.fileCache.d2s) {
             if (otherName == filename) continue;   // active player handled below
-            if (anchorU32 != 0 && otherEntry.character.timestamp <= anchorU32) {
-                continue;   // unchanged since anchor; current entry is correct
+            if (lookupU32 != 0 && otherEntry.character.timestamp <= lookupU32) {
+                continue;   // unchanged since start; current entry is correct
             }
             std::optional<BackupDb::Row> otherRow;
-            try { otherRow = backupDb->at(otherName, anchorDate); }
+            try { otherRow = backupDb->at(otherName, lookupEpoch); }
             catch (const std::exception&) {}
             if (otherRow && !otherRow->data.empty()) {
                 // Historical bytes: substitute this character's items.
@@ -3597,9 +3494,9 @@ int runDashboard(const std::filesystem::path& savePath,
                 (void)overrideActivePlayerFromBytes(temp, db, otherRow->data, otherName);
             } else {
                 // No historical row on record: this file didn't exist
-                // at anchor time. Strip its current items so a fresh
-                // character (or a pre-history pin against any file)
-                // doesn't donate its inventory to the anchor.
+                // at start time. Strip its current items so a fresh
+                // character (or a pre-history custom start against any
+                // file) doesn't donate its inventory to the start.
                 stripCharacterItems(otherName);
             }
         }
@@ -3607,18 +3504,19 @@ int runDashboard(const std::filesystem::path& savePath,
         // Then handle the active player. Two cases:
         //   1. Historical bytes exist -> override normally. This also
         //      rebuilds temp.activePlayer's stats (name/class/level/
-        //      exp), giving the Character pane an accurate anchor for
+        //      exp), giving the Character pane an accurate start for
         //      its XP delta.
-        //   2. No historical bytes (pin predates the active player's
-        //      first save) -> strip its items so nothing survives from
-        //      the *current copy. Leave temp.activePlayer as-is (from
-        //      the initial *current copy) so the Character pane still
-        //      renders valid stats; the XP delta will read as "the
-        //      whole current level gained" which is the honest
-        //      interpretation of pinning before the character existed.
+        //   2. No historical bytes (custom start predates the active
+        //      player's first save) -> strip its items so nothing
+        //      survives from the *current copy. Leave temp.activePlayer
+        //      as-is (from the initial *current copy) so the Character
+        //      pane still renders valid stats; the XP delta will read
+        //      as "the whole current level gained" which is the honest
+        //      interpretation of setting a custom start before the
+        //      character existed.
         if (row && !row->data.empty()) {
             if (!overrideActivePlayerFromBytes(temp, db, row->data, filename)) {
-                return anchorFromCurrent();
+                return sessionFromCurrent();
             }
         } else {
             stripCharacterItems(filename);
@@ -3627,51 +3525,50 @@ int runDashboard(const std::filesystem::path& savePath,
             (void)overrideSharedStashFromBytes(temp, db, stashRow->data);
         } else if (!stashFile.empty()) {
             // No historical stash backup at all -- clear the current
-            // stash out of the anchor so current-stash items don't
+            // stash out of the start-state so current-stash items don't
             // silently zero the stash diff.
             clearSharedStashInSnapshot(temp);
         }
 
-        auto anchor = std::make_shared<SessionAnchor>(
-            makeSessionAnchorFromSnapshot(temp, anchorDate,
-                                          sessionStartEpoch,
-                                          sessionEndEpoch));
-        ui.sessionAnchorCacheKey = key;
-        return anchor;
+        auto out = std::make_shared<Session>();
+        out->startEpoch = sessionStartEpoch;
+        out->endEpoch   = sessionEndEpoch;
+        out->startState = makeSessionStateFromSnapshot(temp);
+        ui.sessionCacheKey = key;
+        return out;
 #else
-        (void)pinnedDate;
-        (void)pinnedEndDate;
-        return anchorFromCurrent();
+        (void)customStartEpoch;
+        (void)customEndEpoch;
+        return sessionFromCurrent();
 #endif
     };
 
-    // Locate the first pinned session start in the current layout.
-    // Session, SessionLoot, and Character panes all consume the anchor;
-    // pin priority is DFS order + first-wins across those pane types.
-    // Returns nullopt when no pane is pinned (auto mode:
-    // buildSessionAnchor picks the newest S&E).
-    auto sessionPinFromLayout = [&]() -> std::optional<std::int64_t> {
+    // Locate the first custom session start in the current layout.
+    // Session, SessionLoot, and Character panes all consume the session;
+    // priority is DFS order + first-wins across those pane types.
+    // Returns nullopt when no pane has a custom start (auto mode:
+    // buildSession picks the newest S&E).
+    auto sessionCustomStartFromLayout = [&]() -> std::optional<std::int64_t> {
         for (const auto* leaf : flattenLeaves(ui.rootPane)) {
             const auto t = leaf->config.type;
             if ((t != PaneType::Session
               && t != PaneType::SessionLoot
               && t != PaneType::Character)) continue;
-            if (leaf->config.sessionAnchorPinned &&
-                leaf->config.sessionAnchorPinnedDate > 0) {
-                return leaf->config.sessionAnchorPinnedDate;
+            if (leaf->config.sessionCustomStartEpoch > 0) {
+                return leaf->config.sessionCustomStartEpoch;
             }
         }
         return std::nullopt;
     };
-    // Companion: first pinned session end across the same pane types.
-    auto sessionEndPinFromLayout = [&]() -> std::optional<std::int64_t> {
+    // Companion: first custom session end across the same pane types.
+    auto sessionCustomEndFromLayout = [&]() -> std::optional<std::int64_t> {
         for (const auto* leaf : flattenLeaves(ui.rootPane)) {
             const auto t = leaf->config.type;
             if ((t != PaneType::Session
               && t != PaneType::SessionLoot
               && t != PaneType::Character)) continue;
-            if (leaf->config.sessionAnchorPinnedEndDate > 0) {
-                return leaf->config.sessionAnchorPinnedEndDate;
+            if (leaf->config.sessionCustomEndEpoch > 0) {
+                return leaf->config.sessionCustomEndEpoch;
             }
         }
         return std::nullopt;
@@ -3687,11 +3584,11 @@ int runDashboard(const std::filesystem::path& savePath,
         std::lock_guard g(ui.snapshotMutex);
         ui.snapshot = std::move(snap);
         // Anchor the session view on the start of the current-or-just-
-        // ended play session (see buildSessionAnchor above); refreshed
-        // by the user from the Session pane's config menu.
-        ui.sessionAnchor = buildSessionAnchor(ui.snapshot,
-                                              sessionPinFromLayout(),
-                                              sessionEndPinFromLayout());
+        // ended play session (see buildSession above); refreshed by
+        // the user from the Session pane's config menu.
+        ui.session = buildSession(ui.snapshot,
+                                   sessionCustomStartFromLayout(),
+                                   sessionCustomEndFromLayout());
     }
 
     auto screen = ScreenInteractive::Fullscreen();
@@ -3750,16 +3647,16 @@ int runDashboard(const std::filesystem::path& savePath,
             aggregateDashboardSnapshot(db, ui.fileCache));
         // Re-anchor the session view on every rebuild so it advances as
         // the player starts new play sessions. A session ENDS with an
-        // S&E; the anchor is the first save that opened the current-
-        // or-just-ended session (see buildSessionAnchor above). Without
-        // this refresh the anchor would go permanently stale after the
-        // first S&E of a long-running dashboard.
-        auto anchor = buildSessionAnchor(snap,
-                                          sessionPinFromLayout(),
-                                          sessionEndPinFromLayout());
+        // S&E; the start is the first save that opened the current-
+        // or-just-ended session (see buildSession above). Without
+        // this refresh the session would go permanently stale after
+        // the first S&E of a long-running dashboard.
+        auto session = buildSession(snap,
+                                     sessionCustomStartFromLayout(),
+                                     sessionCustomEndFromLayout());
         std::lock_guard g(ui.snapshotMutex);
-        ui.snapshot      = std::move(snap);
-        ui.sessionAnchor = std::move(anchor);
+        ui.snapshot = std::move(snap);
+        ui.session  = std::move(session);
     };
     auto persistLayout = [&]() {
         if (configDb) savePaneTree(configDb, ui.rootPane);
@@ -3811,11 +3708,6 @@ int runDashboard(const std::filesystem::path& savePath,
         if (ui.retentionModalVisible) {
             root = dbox({ root,
                 renderRetentionModal(ui.retentionModal, ui.backupDb)
-                    | clear_under | center });
-        }
-        if (ui.sessionPickerVisible) {
-            root = dbox({ root,
-                renderSessionPickerModal(ui.sessionPicker)
                     | clear_under | center });
         }
         if (ui.characterPickerVisible) {
@@ -4006,58 +3898,8 @@ int runDashboard(const std::filesystem::path& savePath,
             return true;
         }
 
-        // ---- SESSION-ANCHOR PICKER modal ----
-        if (ui.sessionPickerVisible) {
-            auto& p = ui.sessionPicker;
-            const int n = static_cast<int>(p.rows.size());
-            if (e == Event::Escape) {
-                ui.sessionPickerVisible = false;
-                p.target = nullptr;
-                p.rows.clear();
-                p.isEnd = false;
-                return true;
-            }
-            if (n == 0) return true;   // empty list; only Esc is meaningful
-            if (e == Event::ArrowUp) {
-                p.cursor = std::max(0, p.cursor - 1);
-                return true;
-            }
-            if (e == Event::ArrowDown) {
-                p.cursor = std::min(n - 1, p.cursor + 1);
-                return true;
-            }
-            if (e == Event::PageUp) {
-                p.cursor = std::max(0, p.cursor - 10);
-                return true;
-            }
-            if (e == Event::PageDown) {
-                p.cursor = std::min(n - 1, p.cursor + 10);
-                return true;
-            }
-            if (e == Event::Home) { p.cursor = 0;     return true; }
-            if (e == Event::End)  { p.cursor = n - 1; return true; }
-            if (e == Event::Return) {
-                if (p.target) {
-                    if (p.isEnd) {
-                        p.target->config.sessionAnchorPinnedEndDate = p.rows[p.cursor].date;
-                    } else {
-                        p.target->config.sessionAnchorPinned     = true;
-                        p.target->config.sessionAnchorPinnedDate = p.rows[p.cursor].date;
-                    }
-                }
-                ui.sessionPickerVisible = false;
-                p.target = nullptr;
-                p.rows.clear();
-                p.isEnd = false;
-                persistLayout();
-                rebuild();   // re-run buildSessionAnchor with the new pin
-                return true;
-            }
-            return true;   // swallow everything else while modal is up
-        }
-
         // ---- CHARACTER PICKER modal ----
-        // Same shape as the session-anchor picker, keyed off the
+        // Same shape as the character picker, keyed off the
         // pane's characterSelection field. options[0] is always the
         // empty string == "auto (newest saved)".
         if (ui.characterPickerVisible) {
@@ -4128,10 +3970,9 @@ int runDashboard(const std::filesystem::path& savePath,
                 }
                 if (m.target) {
                     if (m.isEnd) {
-                        m.target->config.sessionAnchorPinnedEndDate = *parsed;
+                        m.target->config.sessionCustomEndEpoch = *parsed;
                     } else {
-                        m.target->config.sessionAnchorPinned     = true;
-                        m.target->config.sessionAnchorPinnedDate = *parsed;
+                        m.target->config.sessionCustomStartEpoch = *parsed;
                     }
                 }
                 ui.sessionTimeInputVisible = false;
@@ -4244,139 +4085,47 @@ int runDashboard(const std::filesystem::path& savePath,
                         break;
                     }
                     case ConfigMenuItem::ResetSession: {
-                        // Re-run the same anchor logic used at startup:
-                        // auto-track the current-or-just-ended session,
-                        // or re-load the user's pinned anchor.
+                        // Clear the pane's custom start + end so both
+                        // sides revert to auto (D2R launch heuristic /
+                        // live end), then rebuild the shared session.
+                        leaf->config.sessionCustomStartEpoch = 0;
+                        leaf->config.sessionCustomEndEpoch   = 0;
                         std::shared_ptr<const DashboardSnapshot> snapNow;
                         {
                             std::lock_guard<std::mutex> g(ui.snapshotMutex);
                             snapNow = ui.snapshot;
                         }
-                        auto rebuilt = buildSessionAnchor(snapNow,
-                                                          sessionPinFromLayout(),
-                                                          sessionEndPinFromLayout());
+                        auto rebuilt = buildSession(snapNow,
+                                                     sessionCustomStartFromLayout(),
+                                                     sessionCustomEndFromLayout());
                         {
                             std::lock_guard<std::mutex> g(ui.snapshotMutex);
-                            ui.sessionAnchor = std::move(rebuilt);
+                            ui.session = std::move(rebuilt);
                         }
-                        ui.configMode = false;
-                        break;
-                    }
-                    case ConfigMenuItem::PickSessionAnchor: {
-                        // Open the backup-history modal seeded with the
-                        // active player's rows. The Enter handler in
-                        // the modal loop writes the pick back into this
-                        // pane's PaneConfig and reruns the anchor build.
-                        std::shared_ptr<const DashboardSnapshot> snapNow;
-                        {
-                            std::lock_guard<std::mutex> g(ui.snapshotMutex);
-                            snapNow = ui.snapshot;
-                        }
-                        std::string filename;
-                        if (snapNow && snapNow->hasActivePlayer)
-                            filename = snapNow->activePlayer.file;
-#if D2R_HAVE_INOTIFY
-                        std::vector<BackupDb::HistoryRow> rows;
-                        if (ui.backupDb && !filename.empty()) {
-                            try { rows = ui.backupDb->historyFor(filename, 500); }
-                            catch (const std::exception&) {}
-                        }
-#else
-                        std::vector<BackupDb::HistoryRow> rows;
-#endif
-                        // Preselect the current pin if it exists.
-                        int cursor = 0;
-                        if (leaf->config.sessionAnchorPinned) {
-                            for (int i = 0; i < (int)rows.size(); ++i) {
-                                if (rows[i].date == leaf->config.sessionAnchorPinnedDate) {
-                                    cursor = i;
-                                    break;
-                                }
-                            }
-                        }
-                        ui.sessionPicker.target   = leaf;
-                        ui.sessionPicker.filename = std::move(filename);
-                        ui.sessionPicker.rows     = std::move(rows);
-                        ui.sessionPicker.cursor   = cursor;
-                        ui.sessionPicker.isEnd    = false;
-                        ui.sessionPickerVisible   = true;
-                        ui.configMode             = false;
-                        break;
-                    }
-                    case ConfigMenuItem::UnpinSessionAnchor: {
-                        leaf->config.sessionAnchorPinned     = false;
-                        leaf->config.sessionAnchorPinnedDate = 0;
                         ui.configMode = false;
                         persistLayout();
-                        rebuild();   // return to auto = newest S&E
                         break;
                     }
-                    case ConfigMenuItem::PickSessionEnd: {
-                        // Same modal shape as PickSessionAnchor, but
-                        // the modal's isEnd flag tells its Enter handler
-                        // to write to sessionAnchorPinnedEndDate.
-                        std::shared_ptr<const DashboardSnapshot> snapNow;
-                        {
-                            std::lock_guard<std::mutex> g(ui.snapshotMutex);
-                            snapNow = ui.snapshot;
-                        }
-                        std::string filename;
-                        if (snapNow && snapNow->hasActivePlayer)
-                            filename = snapNow->activePlayer.file;
-#if D2R_HAVE_INOTIFY
-                        std::vector<BackupDb::HistoryRow> rows;
-                        if (ui.backupDb && !filename.empty()) {
-                            try { rows = ui.backupDb->historyFor(filename, 500); }
-                            catch (const std::exception&) {}
-                        }
-#else
-                        std::vector<BackupDb::HistoryRow> rows;
-#endif
-                        // Preselect the current end pin if it exists.
-                        int cursor = 0;
-                        if (leaf->config.sessionAnchorPinnedEndDate > 0) {
-                            for (int i = 0; i < (int)rows.size(); ++i) {
-                                if (rows[i].date == leaf->config.sessionAnchorPinnedEndDate) {
-                                    cursor = i;
-                                    break;
-                                }
-                            }
-                        }
-                        ui.sessionPicker.target   = leaf;
-                        ui.sessionPicker.filename = std::move(filename);
-                        ui.sessionPicker.rows     = std::move(rows);
-                        ui.sessionPicker.cursor   = cursor;
-                        ui.sessionPicker.isEnd    = true;
-                        ui.sessionPickerVisible   = true;
-                        ui.configMode             = false;
-                        break;
-                    }
-                    case ConfigMenuItem::UnpinSessionEnd: {
-                        leaf->config.sessionAnchorPinnedEndDate = 0;
-                        ui.configMode = false;
-                        persistLayout();
-                        rebuild();   // return to auto end = newest backup
-                        break;
-                    }
-                    case ConfigMenuItem::PickSessionStartManual:
-                    case ConfigMenuItem::PickSessionEndManual: {
-                        // Free-form text input alongside the backup-history
-                        // picker. Same target-write semantics as the picker
-                        // (start pin writes sessionAnchorPinnedDate + flips
-                        // sessionAnchorPinned = true; end pin writes
-                        // sessionAnchorPinnedEndDate) so the pane's title +
-                        // config menu update uniformly regardless of which
-                        // route the user took.
-                        const bool isEnd = (action == ConfigMenuItem::PickSessionEndManual);
+                    case ConfigMenuItem::SetSessionStart:
+                    case ConfigMenuItem::SetSessionEnd: {
+                        // Open the free-form time entry modal. Enter
+                        // handler parses via d2r::parseUserDateTime and
+                        // writes the resulting epoch into either
+                        // sessionCustomStartEpoch (start) or
+                        // sessionCustomEndEpoch (end); the invariant
+                        // "custom end implies custom start" is enforced
+                        // by only surfacing the End menu item when
+                        // start is already custom.
+                        const bool isEnd = (action == ConfigMenuItem::SetSessionEnd);
                         ui.sessionTimeInputModal.target = leaf;
                         ui.sessionTimeInputModal.isEnd  = isEnd;
                         ui.sessionTimeInputModal.status.clear();
-                        // Prefill the buffer with the current pin (if any)
-                        // so tweaking a small offset is a couple of keys.
+                        // Prefill the buffer with the current custom
+                        // value (if any) so tweaking a small offset is
+                        // a couple of keys.
                         const std::int64_t seed = isEnd
-                            ? leaf->config.sessionAnchorPinnedEndDate
-                            : (leaf->config.sessionAnchorPinned
-                                ? leaf->config.sessionAnchorPinnedDate : 0);
+                            ? leaf->config.sessionCustomEndEpoch
+                            : leaf->config.sessionCustomStartEpoch;
                         if (seed > 0) {
                             ui.sessionTimeInputModal.buffer = formatWallDateTime(seed);
                         } else {

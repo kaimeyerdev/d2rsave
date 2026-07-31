@@ -106,27 +106,23 @@ struct PaneConfig {
     // most recently-viewed file across dashboard restarts.
     std::string       selectedBackupFile;
 
-    // Session-only. When `sessionAnchorPinned` is true, the Session
-    // pane uses `sessionAnchorPinnedDate` as its diff base -- the
-    // newest .d2s row for the active player with date <= this value,
-    // plus the matching stash backup. When false, the anchor tracks
-    // whatever SaveAndExit the scheduler last captured (auto mode).
-    // Pins are per-pane and persisted across dashboard restarts.
+    // Session / Character / SessionLoot. A session is a
+    // `[startEpoch, endEpoch]` time window. Both endpoints default to
+    // "auto" and can be overridden by the user via the config menu's
+    // free-form time entry.
     //
-    // Also read by the Character and SessionLoot panes -- both build
-    // their anchor from the same fields, keyed on the resolved
-    // character (see `characterSelection`).
-    bool              sessionAnchorPinned     = false;
-    std::int64_t      sessionAnchorPinnedDate = 0;   // unix seconds
-
-    // Optional pinned end of the current session (unix seconds). Zero
-    // means "auto" -- the session end tracks the newest backup after
-    // the (pinned or auto) session start. A non-zero value clamps the
-    // pane's displayed session-end datetime + duration to the given
-    // instant. Item / rune diffs still compare against the start-side
-    // anchor snapshot; the end pin only bounds the pane's visible
-    // window (matches how the start pin already works).
-    std::int64_t      sessionAnchorPinnedEndDate = 0;   // unix seconds; 0 = auto
+    //   sessionCustomStartEpoch = 0  => start is auto ("D2R launch"
+    //                                     heuristic on the backup DB).
+    //   sessionCustomStartEpoch > 0  => user-fixed start (unix seconds).
+    //
+    //   sessionCustomEndEpoch = 0    => end is auto (live "now").
+    //   sessionCustomEndEpoch > 0    => user-fixed end (unix seconds).
+    //
+    // Invariant: `sessionCustomEndEpoch != 0` implies
+    // `sessionCustomStartEpoch != 0`. The UI enforces this on entry
+    // and the JSON loader clears the end when the start is auto.
+    std::int64_t      sessionCustomStartEpoch = 0;
+    std::int64_t      sessionCustomEndEpoch   = 0;
 
     // Character / SessionLoot / Backups (via the first Character pane).
     // Empty string means "auto" -- pick the character with the newest

@@ -1,6 +1,6 @@
 // Catch2 tests for DashboardModel helpers exposed to the FTXUI layer.
-// Focus areas: the SessionAnchor's per-rune stack snapshot (populated
-// by makeSessionAnchorFromSnapshot from a DashboardSnapshot's inventory)
+// Focus areas: the SessionState's per-rune stack snapshot (populated
+// by makeSessionStateFromSnapshot from a DashboardSnapshot's inventory)
 // and the item-key set that drives the "new uniques / sets" diff.
 //
 // These tests build synthetic DashboardSnapshots directly rather than
@@ -41,14 +41,14 @@ d2r::InventoryItem makeUnique(std::uint32_t fingerprint, std::string_view name,
 
 } // namespace
 
-TEST_CASE("SessionAnchor.runeStacks: empty inventory -> empty map",
+TEST_CASE("SessionState.runeStacks: empty inventory -> empty map",
           "[dashboard_model][runes]") {
     d2r::DashboardSnapshot snap;
-    const auto anchor = d2r::makeSessionAnchorFromSnapshot(snap, 0, 0, 0);
+    const auto anchor = d2r::makeSessionStateFromSnapshot(snap);
     REQUIRE(anchor.runeStacks.empty());
 }
 
-TEST_CASE("SessionAnchor.runeStacks: counts one entry per rune instance",
+TEST_CASE("SessionState.runeStacks: counts one entry per rune instance",
           "[dashboard_model][runes]") {
     d2r::DashboardSnapshot snap;
     // 3 x Hel, 1 x Ko, 2 x Um.
@@ -59,14 +59,14 @@ TEST_CASE("SessionAnchor.runeStacks: counts one entry per rune instance",
     snap.inventory.push_back(makeRune("r22", "Um Rune"));
     snap.inventory.push_back(makeRune("r22", "Um Rune"));
 
-    const auto anchor = d2r::makeSessionAnchorFromSnapshot(snap, 0, 0, 0);
+    const auto anchor = d2r::makeSessionStateFromSnapshot(snap);
     REQUIRE(anchor.runeStacks.size() == 3);
     REQUIRE(anchor.runeStacks.at("r15") == 3);
     REQUIRE(anchor.runeStacks.at("r18") == 1);
     REQUIRE(anchor.runeStacks.at("r22") == 2);
 }
 
-TEST_CASE("SessionAnchor.runeStacks: ignores non-rune codes",
+TEST_CASE("SessionState.runeStacks: ignores non-rune codes",
           "[dashboard_model][runes]") {
     d2r::DashboardSnapshot snap;
     // Rune codes are 3-char 'r' + 2 digits. Everything else must not
@@ -95,12 +95,12 @@ TEST_CASE("SessionAnchor.runeStacks: ignores non-rune codes",
     snap.inventory = {key, gem, fakeR, fakeR4,
                       makeRune("r08", "Ral Rune")};
 
-    const auto anchor = d2r::makeSessionAnchorFromSnapshot(snap, 0, 0, 0);
+    const auto anchor = d2r::makeSessionStateFromSnapshot(snap);
     REQUIRE(anchor.runeStacks.size() == 1);
     REQUIRE(anchor.runeStacks.at("r08") == 1);
 }
 
-TEST_CASE("SessionAnchor: unique/set fingerprints go into itemKeys",
+TEST_CASE("SessionState: unique/set fingerprints go into itemKeys",
           "[dashboard_model][session_loot]") {
     d2r::DashboardSnapshot snap;
     // Two identified uniques with distinct fingerprints, plus a
@@ -120,7 +120,7 @@ TEST_CASE("SessionAnchor: unique/set fingerprints go into itemKeys",
     d2r::InventoryItem noPrint = makeUnique(0u, "Unfingerprinted");
     snap.inventory.push_back(noPrint);
 
-    const auto anchor = d2r::makeSessionAnchorFromSnapshot(snap, 0, 0, 0);
+    const auto anchor = d2r::makeSessionStateFromSnapshot(snap);
     REQUIRE(anchor.itemKeys.size() == 3);
     REQUIRE(anchor.itemKeys.contains({0xAAAA1111u, d2r::ItemQuality::Unique}));
     REQUIRE(anchor.itemKeys.contains({0xBBBB2222u, d2r::ItemQuality::Unique}));
@@ -129,14 +129,14 @@ TEST_CASE("SessionAnchor: unique/set fingerprints go into itemKeys",
     REQUIRE_FALSE(anchor.itemKeys.contains({0u,         d2r::ItemQuality::Unique}));
 }
 
-TEST_CASE("SessionAnchor round-trip: session-loot diff finds only positive rune deltas",
+TEST_CASE("SessionState round-trip: session-loot diff finds only positive rune deltas",
           "[dashboard_model][session_loot]") {
     // Anchor snapshot: 2 Hel + 1 Ko.
     d2r::DashboardSnapshot anchorSnap;
     anchorSnap.inventory.push_back(makeRune("r15", "Hel Rune"));
     anchorSnap.inventory.push_back(makeRune("r15", "Hel Rune"));
     anchorSnap.inventory.push_back(makeRune("r18", "Ko Rune"));
-    const auto anchor = d2r::makeSessionAnchorFromSnapshot(anchorSnap, 0, 0, 0);
+    const auto anchor = d2r::makeSessionStateFromSnapshot(anchorSnap);
 
     // "Now" snapshot: 3 Hel (+1), 1 Ko (=), 2 Um (+2, new code),
     // 0 Fal  ("consumed" -- runes at anchor but not now).
@@ -176,7 +176,7 @@ TEST_CASE("SessionAnchor round-trip: session-loot diff finds only positive rune 
     REQUIRE(deltas[1].second == 2);
 }
 
-TEST_CASE("SessionAnchor diff: rune moved between locations is not 'new'",
+TEST_CASE("SessionState diff: rune moved between locations is not 'new'",
           "[dashboard_model][session_loot][cross_character]") {
     // Regression for the "socketed runes appear as new when armor moves
     // via shared stash" bug. The user reported: a body armor with Ith,
@@ -187,13 +187,13 @@ TEST_CASE("SessionAnchor diff: rune moved between locations is not 'new'",
     //
     // The invariant this test pins: the diff sees an INSTANCE COUNT per
     // code, not a per-character allotment. If the anchor snapshot (as
-    // reconstructed by buildSessionAnchor) accounts for the runes on
+    // reconstructed by buildSessionState) accounts for the runes on
     // whichever character owned them at anchor time, moving them
     // elsewhere by "now" leaves the count unchanged -> zero new runes.
     //
-    // Sanity: the fix in buildSessionAnchor is what makes the anchor
+    // Sanity: the fix in buildSessionState is what makes the anchor
     // snapshot include runes owned by NON-active-player characters at
-    // anchor time. This test only verifies makeSessionAnchor +
+    // anchor time. This test only verifies makeSessionState +
     // diff-logic play their part correctly once the anchor snapshot is
     // right.
     d2r::DashboardSnapshot anchorSnap;
@@ -203,7 +203,7 @@ TEST_CASE("SessionAnchor diff: rune moved between locations is not 'new'",
     anchorSnap.inventory.push_back(makeRune("r06", "Ith Rune",  "UniqueSwordsEl.d2s"));
     anchorSnap.inventory.push_back(makeRune("r30", "Ber Rune",  "UniqueSwordsEl.d2s"));
     anchorSnap.inventory.push_back(makeRune("r31", "Jah Rune",  "UniqueSwordsEl.d2s"));
-    const auto anchor = d2r::makeSessionAnchorFromSnapshot(anchorSnap, 0, 0, 0);
+    const auto anchor = d2r::makeSessionStateFromSnapshot(anchorSnap);
 
     // Now state: same three runes, now on 'Barbarian.d2s' (armor moved
     // via shared stash). Counts per code are unchanged.
@@ -230,10 +230,10 @@ TEST_CASE("SessionAnchor diff: rune moved between locations is not 'new'",
     REQUIRE(newRows == 0);
 }
 
-TEST_CASE("SessionAnchor diff: empty anchor -> everything current is 'new'",
+TEST_CASE("SessionState diff: empty anchor -> everything current is 'new'",
           "[dashboard_model][session_loot][pre_history_pin]") {
     // Pins the invariant behind the "pin before any save existed"
-    // request: buildSessionAnchor's pinned branch fetches per-file
+    // request: buildSessionState's pinned branch fetches per-file
     // bytes at pin. Files with no backup at/before pin get their
     // items stripped from `temp`. When the pin predates every save,
     // every file's contribution is stripped, so the anchor's
@@ -241,10 +241,10 @@ TEST_CASE("SessionAnchor diff: empty anchor -> everything current is 'new'",
     // report every currently-owned item as "new" -- including any
     // that were on some OTHER character at anchor time (they didn't
     // exist yet at anchor time either). This test verifies the diff
-    // half of that path via makeSessionAnchorFromSnapshot on an
+    // half of that path via makeSessionStateFromSnapshot on an
     // empty snapshot.
     const d2r::DashboardSnapshot emptyAnchor;
-    const auto anchor = d2r::makeSessionAnchorFromSnapshot(emptyAnchor, 0, 0, 0);
+    const auto anchor = d2r::makeSessionStateFromSnapshot(emptyAnchor);
     REQUIRE(anchor.itemKeys.empty());
     REQUIRE(anchor.runeStacks.empty());
 

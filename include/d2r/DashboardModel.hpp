@@ -345,83 +345,72 @@ void refreshDashboardCacheFromChanges(
 void clearSharedStashInSnapshot(DashboardSnapshot& snap);
 
 // ---------------------------------------------------------------------------
-// SessionAnchor: the lightweight point-in-time record the Session pane
-// diffs against.
+// Session: a play session is a `[startEpoch, endEpoch]` time window with
+// pre-computed diff-side state at the start (and optionally at the end
+// too, when the user has fixed the end to a specific past moment).
 //
-// Historically the anchor was stored as a full DashboardSnapshot (deep-
-// copied from the live snapshot then overlaid with backup bytes). That
-// deep copy carries chronicle + reconcile + quests + per-item name
+// Historically the "anchor" was stored as a full DashboardSnapshot
+// (deep-copied from the live snapshot then overlaid with backup bytes).
+// That deep copy carries chronicle + reconcile + quests + per-item name
 // strings the Session pane never reads, and forces the renderer to
 // rebuild an identified-uniques/sets hash set on every frame. Rapid
 // autosave bursts (e.g. combining gems fires ~10 .d2s writes in a few
 // seconds) made both costs painful.
 //
-// SessionAnchor keeps only what the renderer actually consumes AND
-// pre-computes the identified-item lookup set once, at anchor build
-// time. Consecutive rebuilds where the anchor inputs are unchanged
-// can reuse the same shared_ptr without any byte parsing.
+// SessionState keeps only what the renderer actually consumes AND
+// pre-computes the identified-item lookup set once, at build time.
+// Consecutive rebuilds where the window inputs are unchanged can reuse
+// the same shared_ptr without any byte parsing.
 // ---------------------------------------------------------------------------
-struct SessionAnchorItemKey {
+struct SessionItemKey {
     std::uint32_t fingerprint = 0;
     ItemQuality   quality     = ItemQuality::None;
-    bool operator==(const SessionAnchorItemKey& o) const noexcept {
+    bool operator==(const SessionItemKey& o) const noexcept {
         return fingerprint == o.fingerprint && quality == o.quality;
     }
 };
-struct SessionAnchorItemKeyHash {
-    std::size_t operator()(const SessionAnchorItemKey& k) const noexcept {
+struct SessionItemKeyHash {
+    std::size_t operator()(const SessionItemKey& k) const noexcept {
         return std::hash<std::uint64_t>{}(
             (static_cast<std::uint64_t>(k.fingerprint) << 8) |
              static_cast<std::uint64_t>(k.quality));
     }
 };
 
-struct SessionAnchor {
+// SessionState = the diff-relevant slice of a DashboardSnapshot at one
+// moment in time (start-of-session, or a user-fixed end-of-session).
+struct SessionState {
     bool           hasActivePlayer = false;
     std::string    playerName;
     CharacterClass playerClass     = CharacterClass::Unknown;
     std::uint32_t  level           = 0;
     std::uint64_t  expInLevel      = 0;
-    // When the anchor was taken (unix seconds; 0 when unavailable).
-    // This is the boundary S&E that separates the previous session from
-    // the current one; the item-diff loop uses it as the reference
-    // point, but the pane's duration display uses the two epochs below.
-    std::int64_t   anchorEpoch     = 0;
-    // Oldest and newest backup dates observed within the CURRENT play
-    // session (the range of saves newer than `anchorEpoch`, or the
-    // whole history in the fallback "no S&E on record" case). Both 0
-    // when the current session has no backups yet. The Session pane
-    // renders `sessionEndEpoch - sessionStartEpoch` as elapsed play
-    // time; a single-backup session therefore reads as 0.
-    std::int64_t   sessionStartEpoch = 0;
-    std::int64_t   sessionEndEpoch   = 0;
-    // Pre-computed set of (fingerprint, quality) for every identified
-    // Unique / Set item that existed in the anchor's character-side
-    // AND shared-stash inventory. The renderer's diff loop only needs
-    // to query `itemKeys.contains(...)` per current item -- no
-    // per-render hash-set rebuild.
-    std::unordered_set<SessionAnchorItemKey, SessionAnchorItemKeyHash> itemKeys;
-
-    // Rune counts at anchor time, keyed on base code (r01..r33). The
-    // Session Loot pane diffs these against the current snapshot's
-    // per-code counts to surface newly-picked-up runes. Runes are
-    // stackable-by-code (each rune is its own InventoryItem instance),
-    // so this is a straight count-of-instances map rather than a
-    // stack-size sum.
+    // Identified Unique / Set items observed in the account at this
+    // moment. The renderer's diff loop probes contains() per item.
+    std::unordered_set<SessionItemKey, SessionItemKeyHash> itemKeys;
+    // Rune counts per base code (r01..r33). One entry per rune
+    // instance; the Session Loot pane subtracts these from the end
+    // side to surface newly-picked-up runes.
     std::unordered_map<std::string, std::uint32_t> runeStacks;
 };
 
-// Extract a SessionAnchor from a fully-populated DashboardSnapshot.
-// Used by the ftxui layer after overlaying the anchor bytes onto a
-// working DashboardSnapshot. `anchorEpoch` should be the unix time of
-// the underlying backup row (character-side); `sessionStartEpoch` and
-// `sessionEndEpoch` bound the current play session's backup range and
-// drive the pane's duration display.
-[[nodiscard]] SessionAnchor makeSessionAnchorFromSnapshot(
-    const DashboardSnapshot& snap,
-    std::int64_t             anchorEpoch,
-    std::int64_t             sessionStartEpoch = 0,
-    std::int64_t             sessionEndEpoch   = 0);
+// Session = the [start, end] window + pre-computed diff-side state at
+// the start. The end side of the diff is always the live snapshot;
+// `endEpoch` only bounds what the pane DISPLAYS (start/end timestamps,
+// elapsed duration). Auto-end sessions set `endEpoch` to "now"; user-
+// fixed end sessions clamp `endEpoch` to a past instant.
+struct Session {
+    std::int64_t startEpoch = 0;
+    std::int64_t endEpoch   = 0;
+    SessionState startState;
+};
+
+// Extract a SessionState from a fully-populated DashboardSnapshot.
+// Used by the ftxui layer after overlaying historical bytes onto a
+// working DashboardSnapshot (for the start side and, when the user
+// fixed the end, for the end side too).
+[[nodiscard]] SessionState makeSessionStateFromSnapshot(
+    const DashboardSnapshot& snap);
 
 // Experience needed to reach `level` from a fresh character. Levels
 // outside [1..99] clamp to the boundary. Values are the standard D2/D2R
