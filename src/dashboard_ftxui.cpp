@@ -1858,9 +1858,12 @@ Element renderBlankLeaf(bool focused) {
 namespace {
 
 std::string_view backupStateShortLabel(BackupDb::State s) {
+    // User-facing labels. `BackupDb::State::SaveAndExit` names the
+    // in-game action; the community-aligned display term for the
+    // resulting backup is "run end" (see docs/session-logic.md).
     switch (s) {
         case BackupDb::State::Deleted:     return "deleted";
-        case BackupDb::State::SaveAndExit: return "S&E";
+        case BackupDb::State::SaveAndExit: return "run end";
         case BackupDb::State::Autosave:    return "auto";
         case BackupDb::State::Startup:     return "startup";
         case BackupDb::State::Other:       return "other";
@@ -2019,7 +2022,7 @@ Element renderBackupsSummary(const PaneConfig& config, BackupDb* db,
     body.push_back(filler());
     const std::string retLine =
         "retention: " + std::to_string(daysRetention) + " days OR last "
-        + std::to_string(sessionsRetention) + " sessions/char";
+        + std::to_string(sessionsRetention) + " runs/char";
     body.push_back(hbox({
         text(retLine) | dim,
         filler(),
@@ -2512,10 +2515,10 @@ Element renderRetentionModal(const UiState::RetentionModal& m,
 
     std::vector<Element> body = {
         text("Backup retention policy") | bold,
-        text("Keep everything within N days OR the last M sessions per character.") | dim,
+        text("Keep everything within N days OR the last M runs per character.") | dim,
         text(""),
-        fieldBox("days:     ", m.daysBuf,     m.focused == 0),
-        fieldBox("sessions: ", m.sessionsBuf, m.focused == 1),
+        fieldBox("days: ", m.daysBuf,     m.focused == 0),
+        fieldBox("runs: ", m.sessionsBuf, m.focused == 1),
         text(""),
         text("Current DB: " + std::to_string(rowCount) + " row(s) across "
              + std::to_string(fileCount) + " file(s)") | dim,

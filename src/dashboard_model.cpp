@@ -1245,4 +1245,96 @@ SessionState makeSessionStateFromSnapshot(const DashboardSnapshot& snap) {
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// Run grouping.
+// ---------------------------------------------------------------------------
+// `historyRows` comes from BackupDb::historyFor which returns rows
+// newest-first (date DESC). We walk oldest-first so a Run accumulates
+// its Autosave dates before landing its closing SaveAndExit -- the
+// same shape the renderer wants (autosaves appear before the run-end
+// row when the run is expanded).
+//
+// Rows with `date < sessionStart` are skipped: they belong to a
+// previous session and don't count. `sessionStart == 0` disables the
+// clip, giving the caller the file's full run history (used by the
+// Backups pane).
+//
+// A run's `startEpoch` is either the previous SaveAndExit row's date
+// or `sessionStart`, whichever is later. So a run that straddles the
+// session boundary has its left bound clipped -- matching the user's
+// definition "run start is either the previous run's end or the
+// session start" (per the runs-vs-sessions plan).
+//
+// Trailing Autosave / Other rows (newer than the newest SaveAndExit)
+// emit as one in-progress Run with `endEpoch = 0` and
+// `inProgress = true`. A file with no SaveAndExit at all in the
+// window emits one such in-progress Run holding every retained row.
+//
+// Deleted / Startup rows are non-run signals and are ignored by the
+// grouping. Callers that want to render tombstones or dashboard-
+// startup markers should handle those separately, above the Run
+// list.
+std::vector<Run> groupRunsForFile(
+    std::string_view                       characterFile,
+    std::span<const BackupDb::HistoryRow>  historyRows,
+    std::int64_t                           sessionStart) {
+    std::vector<Run> out;
+    if (historyRows.empty()) return out;
+
+    // Left bound for the next run being built. Starts at sessionStart
+    // and advances to the most recent SaveAndExit date as we walk.
+    std::int64_t nextStart = sessionStart;
+
+    // Accumulator for the currently-open run (autosaves + any Other
+    // rows between the last SaveAndExit and either the next
+    // SaveAndExit or end-of-history).
+    Run acc;
+    acc.characterFile = std::string(characterFile);
+    acc.startEpoch    = nextStart;
+    acc.inProgress    = true;   // stays true unless we hit a SaveAndExit
+
+    // Walk oldest-first: iterate historyRows in reverse.
+    for (auto it = historyRows.rbegin(); it != historyRows.rend(); ++it) {
+        const auto& r = *it;
+        if (r.date < sessionStart) continue;
+        switch (r.state) {
+            case BackupDb::State::Autosave:
+            case BackupDb::State::Other:
+                acc.autosaveDates.push_back(r.date);
+                ++acc.autosaveCount;
+                break;
+            case BackupDb::State::SaveAndExit:
+                // Close the current run.
+                acc.endEpoch   = r.date;
+                acc.inProgress = false;
+                out.push_back(std::move(acc));
+                // Open a new accumulator: left bound = this SaveAndExit's date.
+                nextStart = r.date;
+                acc = Run{};
+                acc.characterFile = std::string(characterFile);
+                acc.startEpoch    = nextStart;
+                acc.inProgress    = true;
+                break;
+            case BackupDb::State::Deleted:
+            case BackupDb::State::Startup:
+                // Non-run signals; ignore in the grouping. The Backups
+                // pane renders these above/below the Run list rather
+                // than inside a run.
+                break;
+        }
+    }
+
+    // Emit any trailing in-progress run. Skip if it has no autosaves
+    // AND the walk never opened it past the seed left bound (no rows
+    // survived the sessionStart clip). The `autosaveCount > 0` guard
+    // avoids emitting a phantom empty run for a file whose latest
+    // recorded event was a SaveAndExit (its accumulator has zero
+    // autosaves and no closing SaveAndExit -- the previous iteration
+    // already closed the last real run).
+    if (acc.autosaveCount > 0) {
+        out.push_back(std::move(acc));
+    }
+    return out;
+}
+
 } // namespace d2r

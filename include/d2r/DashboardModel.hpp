@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include "d2r/BackupDb.hpp"
 #include "d2r/Character.hpp"
 #include "d2r/Item.hpp"
 #include "d2r/SharedStash.hpp"
@@ -416,5 +417,54 @@ struct Session {
 // outside [1..99] clamp to the boundary. Values are the standard D2/D2R
 // experience table (public knowledge, matches game/D2R experience.txt).
 [[nodiscard]] std::uint64_t experienceToReachLevel(std::uint32_t level) noexcept;
+
+// ---------------------------------------------------------------------------
+// Run: the interval between two adjacent SaveAndExit backups for one
+// character's `.d2s`. The community-aligned term for what the game
+// calls "Save & Exit" is "run end", so a Run's `endEpoch` is the date
+// of its closing SaveAndExit backup and its `startEpoch` is the date
+// of the previous SaveAndExit (or the caller-supplied `sessionStart`
+// when the previous SaveAndExit lies outside the session window).
+// A Run with no closing SaveAndExit on record is `inProgress = true`
+// -- the user is either mid-play or the dashboard's DB was rotated
+// before the run ended.
+//
+// Runs are strictly per-file. The Session concept
+// (`AppSession` in the ftxui layer) is character-agnostic and only
+// bounds `sessionStart`; a Session collects whichever Runs from
+// whichever files happen to close inside its window.
+// ---------------------------------------------------------------------------
+struct Run {
+    std::string   characterFile;    // e.g. "Kai.d2s"
+    // Left bound: previous SaveAndExit's date OR the session start
+    // (whichever is later). Never earlier than `sessionStart`.
+    std::int64_t  startEpoch  = 0;
+    // Right bound: this run's SaveAndExit date. 0 when `inProgress`.
+    std::int64_t  endEpoch    = 0;
+    bool          inProgress  = false;
+    std::int32_t  autosaveCount = 0;
+    // Dates of the Autosave / Other rows inside the run, chronological
+    // oldest-first. Phase C (Backups pane run-collapse) uses these to
+    // key an on-demand fetch of the full HistoryRow bytes for the
+    // expand-view; keeping only dates here keeps Run cheap.
+    std::vector<std::int64_t> autosaveDates;
+};
+
+// Group `historyRows` (as returned by BackupDb::historyFor, i.e. newest-
+// first) into Runs for a single file.
+//
+// Rows with `date < sessionStart` are skipped (session-clip). Passing
+// `sessionStart = 0` disables clipping (used by the Backups pane which
+// wants the file's full history).
+//
+// Algorithm: walk chronologically OLDEST-first (i.e. reverse of the
+// input) so a Run naturally accumulates its autosaves before its
+// closing SaveAndExit lands. Returned Runs are in chronological
+// order, oldest-first; the renderer reverses the vector for a
+// newest-first display.
+[[nodiscard]] std::vector<Run> groupRunsForFile(
+    std::string_view                            characterFile,
+    std::span<const BackupDb::HistoryRow>       historyRows,
+    std::int64_t                                sessionStart);
 
 } // namespace d2r

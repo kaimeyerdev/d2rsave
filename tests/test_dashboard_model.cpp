@@ -285,3 +285,154 @@ TEST_CASE("SessionState diff: empty anchor -> everything current is 'new'",
     }
     REQUIRE(newRuneRows == 3);
 }
+
+// ---------------------------------------------------------------------------
+// groupRunsForFile: chronological grouping of a file's HistoryRow list
+// into Runs bounded by SaveAndExit backups.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Fabricate a HistoryRow with only the fields the grouping cares about.
+// `historyFor` returns rows date-DESC, so callers should push newest
+// first when building fixtures.
+d2r::BackupDb::HistoryRow mkRow(std::int64_t date, d2r::BackupDb::State st) {
+    d2r::BackupDb::HistoryRow r;
+    r.date  = date;
+    r.state = st;
+    return r;
+}
+
+} // namespace
+
+TEST_CASE("groupRunsForFile: empty history -> no runs",
+          "[dashboard_model][runs]") {
+    std::vector<d2r::BackupDb::HistoryRow> hist;
+    const auto runs = d2r::groupRunsForFile("Kai.d2s", hist, /*sessionStart=*/0);
+    REQUIRE(runs.empty());
+}
+
+TEST_CASE("groupRunsForFile: two complete runs separated by a SaveAndExit",
+          "[dashboard_model][runs]") {
+    // Chronology (oldest -> newest):
+    //   100 Autosave     (Play click)
+    //   200 Autosave     (gem combine)
+    //   300 SaveAndExit  (end of run #1)
+    //   400 Autosave     (Play click, run #2 starts)
+    //   500 Autosave
+    //   600 Autosave
+    //   700 SaveAndExit  (end of run #2)
+    //
+    // historyFor returns date DESC, so we build the vector newest first.
+    std::vector<d2r::BackupDb::HistoryRow> hist{
+        mkRow(700, d2r::BackupDb::State::SaveAndExit),
+        mkRow(600, d2r::BackupDb::State::Autosave),
+        mkRow(500, d2r::BackupDb::State::Autosave),
+        mkRow(400, d2r::BackupDb::State::Autosave),
+        mkRow(300, d2r::BackupDb::State::SaveAndExit),
+        mkRow(200, d2r::BackupDb::State::Autosave),
+        mkRow(100, d2r::BackupDb::State::Autosave),
+    };
+    const auto runs = d2r::groupRunsForFile("Kai.d2s", hist, /*sessionStart=*/0);
+    REQUIRE(runs.size() == 2);
+
+    // Runs are emitted oldest-first.
+    REQUIRE(runs[0].characterFile == "Kai.d2s");
+    REQUIRE(runs[0].startEpoch    == 0);      // session start (no clip)
+    REQUIRE(runs[0].endEpoch      == 300);
+    REQUIRE_FALSE(runs[0].inProgress);
+    REQUIRE(runs[0].autosaveCount == 2);
+    REQUIRE(runs[0].autosaveDates == std::vector<std::int64_t>{100, 200});
+
+    REQUIRE(runs[1].startEpoch    == 300);    // previous SaveAndExit
+    REQUIRE(runs[1].endEpoch      == 700);
+    REQUIRE_FALSE(runs[1].inProgress);
+    REQUIRE(runs[1].autosaveCount == 3);
+    REQUIRE(runs[1].autosaveDates == std::vector<std::int64_t>{400, 500, 600});
+}
+
+TEST_CASE("groupRunsForFile: trailing autosaves emit an in-progress run",
+          "[dashboard_model][runs]") {
+    // 100 Autosave
+    // 200 SaveAndExit   <- closes run #1
+    // 300 Autosave      <- run #2 starts (user is still playing)
+    // 400 Autosave
+    std::vector<d2r::BackupDb::HistoryRow> hist{
+        mkRow(400, d2r::BackupDb::State::Autosave),
+        mkRow(300, d2r::BackupDb::State::Autosave),
+        mkRow(200, d2r::BackupDb::State::SaveAndExit),
+        mkRow(100, d2r::BackupDb::State::Autosave),
+    };
+    const auto runs = d2r::groupRunsForFile("Barbarian.d2s", hist,
+                                             /*sessionStart=*/0);
+    REQUIRE(runs.size() == 2);
+
+    REQUIRE(runs[0].endEpoch      == 200);
+    REQUIRE_FALSE(runs[0].inProgress);
+
+    REQUIRE(runs[1].startEpoch    == 200);
+    REQUIRE(runs[1].endEpoch      == 0);
+    REQUIRE(runs[1].inProgress);
+    REQUIRE(runs[1].autosaveCount == 2);
+    REQUIRE(runs[1].autosaveDates == std::vector<std::int64_t>{300, 400});
+}
+
+TEST_CASE("groupRunsForFile: sessionStart clips earlier runs; straddling run "
+          "has its startEpoch clipped",
+          "[dashboard_model][runs]") {
+    // Session starts at 350.
+    // 100 Autosave      (skipped: before session)
+    // 200 SaveAndExit   (skipped: before session)
+    // 300 Autosave      (skipped: before session)
+    // 400 Autosave      (in session, run #1 body)
+    // 500 SaveAndExit   (in session, closes run #1)
+    // 600 Autosave      (in session, run #2 body -- in-progress)
+    std::vector<d2r::BackupDb::HistoryRow> hist{
+        mkRow(600, d2r::BackupDb::State::Autosave),
+        mkRow(500, d2r::BackupDb::State::SaveAndExit),
+        mkRow(400, d2r::BackupDb::State::Autosave),
+        mkRow(300, d2r::BackupDb::State::Autosave),
+        mkRow(200, d2r::BackupDb::State::SaveAndExit),
+        mkRow(100, d2r::BackupDb::State::Autosave),
+    };
+    const auto runs = d2r::groupRunsForFile("Kai.d2s", hist,
+                                             /*sessionStart=*/350);
+    REQUIRE(runs.size() == 2);
+
+    // Run that straddles the boundary has left bound clipped to sessionStart.
+    REQUIRE(runs[0].startEpoch    == 350);
+    REQUIRE(runs[0].endEpoch      == 500);
+    REQUIRE_FALSE(runs[0].inProgress);
+    REQUIRE(runs[0].autosaveCount == 1);
+    REQUIRE(runs[0].autosaveDates == std::vector<std::int64_t>{400});
+
+    // Next run's left bound is the previous SaveAndExit at 500, not
+    // the sessionStart.
+    REQUIRE(runs[1].startEpoch    == 500);
+    REQUIRE(runs[1].endEpoch      == 0);
+    REQUIRE(runs[1].inProgress);
+    REQUIRE(runs[1].autosaveCount == 1);
+    REQUIRE(runs[1].autosaveDates == std::vector<std::int64_t>{600});
+}
+
+TEST_CASE("groupRunsForFile: Deleted and Startup rows are non-run signals",
+          "[dashboard_model][runs]") {
+    // A Startup row (dashboard bootstrap) and a Deleted row (tombstone)
+    // land between two Autosaves; neither should count against the
+    // Run accumulator's autosaveCount or open/close any run.
+    std::vector<d2r::BackupDb::HistoryRow> hist{
+        mkRow(500, d2r::BackupDb::State::SaveAndExit),
+        mkRow(400, d2r::BackupDb::State::Autosave),
+        mkRow(350, d2r::BackupDb::State::Startup),   // ignored
+        mkRow(300, d2r::BackupDb::State::Autosave),
+        mkRow(250, d2r::BackupDb::State::Deleted),   // ignored
+        mkRow(200, d2r::BackupDb::State::Autosave),
+    };
+    const auto runs = d2r::groupRunsForFile("Kai.d2s", hist,
+                                             /*sessionStart=*/0);
+    REQUIRE(runs.size() == 1);
+    REQUIRE(runs[0].endEpoch      == 500);
+    REQUIRE(runs[0].autosaveCount == 3);
+    REQUIRE(runs[0].autosaveDates ==
+            std::vector<std::int64_t>{200, 300, 400});
+}

@@ -17,6 +17,15 @@ Implementation entry point: `buildSession` in
 - **Backup DB**: a per-file history of save-file bytes over time
   (`backups.sqlite`). Every save event lands a row keyed on
   `(filename, date, state)` with the raw bytes attached.
+- **Run**: the interval from entering the game (a `Play` click) to
+  the next `Save & Exit`. Contains zero or more Autosave backups
+  and is closed by exactly one SaveAndExit backup. Runs are
+  **per-character** — each `.d2s` has its own runs.
+- **Session**: an arbitrary `[startEpoch, endEpoch]` time window
+  during which we count runs. Sessions are
+  **character-agnostic** — a session collects whichever runs
+  happen to land inside its window, regardless of which character
+  played them.
 - **Session start**: the moment the session began. Either **auto**
   (derived from the backup history) or **custom** (user-fixed).
 - **Session end**: the moment the session ended. Either **auto**
@@ -25,6 +34,29 @@ Implementation entry point: `buildSession` in
   about at the start moment — active player stats + a set of
   identified-item fingerprints + a per-code rune count map. This is
   what the renderer diffs against.
+
+Backend / UI vocabulary split: the enum value is
+`BackupDb::State::SaveAndExit` (naming the in-game action); the
+user-facing display term for the resulting backup is **"run end"**
+(see `backupStateShortLabel` in
+[src/dashboard_ftxui.cpp](../src/dashboard_ftxui.cpp)).
+
+### Runs vs sessions
+
+- A **run start** is either the previous run's SaveAndExit backup
+  timestamp OR the session start, whichever is later. Runs that
+  straddle the session boundary have their left bound clipped to
+  the session start.
+- A **session** is not tied to a specific character. Two runs by
+  different characters that both close inside the same session
+  window both count toward that session.
+- Programmatic access: `groupRunsForFile(historyRows, sessionStart)`
+  in
+  [include/d2r/DashboardModel.hpp](../include/d2r/DashboardModel.hpp)
+  returns a `std::vector<Run>` for a single file's history. Pass
+  `sessionStart = 0` to disable clipping (used by the Backups
+  pane, which shows a file's full run history uncollapsed by
+  session).
 
 **Invariant.** A custom end requires a custom start. The config
 menu only surfaces the end control when start is already custom;
