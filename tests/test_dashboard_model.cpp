@@ -449,8 +449,13 @@ TEST_CASE("groupRunsForFile: Deleted and Startup rows are non-run signals",
 // runDurationSecs.
 // ---------------------------------------------------------------------------
 
-TEST_CASE("runDurationSecs: closed run uses first-autosave -> endEpoch",
+TEST_CASE("runDurationSecs: closed run uses startEpoch -> endEpoch",
           "[dashboard_model][runs]") {
+    // Run start is the previous SaveAndExit / session start (whichever
+    // is later), NOT the first autosave. Duration must cover the whole
+    // interval so that the sum across all runs in a session equals the
+    // session duration -- i.e. the menu/select time between runs is
+    // credited to the containing run.
     d2r::Run r;
     r.characterFile = "Kai.d2s";
     r.startEpoch    = 100;
@@ -458,11 +463,15 @@ TEST_CASE("runDurationSecs: closed run uses first-autosave -> endEpoch",
     r.inProgress    = false;
     r.autosaveCount = 3;
     r.autosaveDates = {200, 300, 400};
-    REQUIRE(d2r::runDurationSecs(r) == 300);   // 500 - 200
+    REQUIRE(d2r::runDurationSecs(r) == 400);   // 500 - 100
 }
 
-TEST_CASE("runDurationSecs: in-progress run uses first->last autosave",
+TEST_CASE("runDurationSecs: in-progress run with sessionEnd",
           "[dashboard_model][runs]") {
+    // In-progress runs credit the span from startEpoch to sessionEnd.
+    // This keeps the session-duration invariant satisfied even when a
+    // run is still open (the trailing run absorbs the tail from the
+    // previous SaveAndExit to the session's end).
     d2r::Run r;
     r.characterFile = "Kai.d2s";
     r.startEpoch    = 100;
@@ -470,11 +479,30 @@ TEST_CASE("runDurationSecs: in-progress run uses first->last autosave",
     r.inProgress    = true;
     r.autosaveCount = 3;
     r.autosaveDates = {200, 300, 400};
-    REQUIRE(d2r::runDurationSecs(r) == 200);   // 400 - 200
+    REQUIRE(d2r::runDurationSecs(r, /*sessionEnd=*/600) == 500);   // 600 - 100
 }
 
-TEST_CASE("runDurationSecs: bare SaveAndExit with no autosaves -> 0",
+TEST_CASE("runDurationSecs: in-progress run without sessionEnd falls back to "
+          "last autosave",
           "[dashboard_model][runs]") {
+    // Bare unit calls without a session-end context still return a
+    // meaningful (but under-counted) value.
+    d2r::Run r;
+    r.characterFile = "Kai.d2s";
+    r.startEpoch    = 100;
+    r.endEpoch      = 0;
+    r.inProgress    = true;
+    r.autosaveCount = 3;
+    r.autosaveDates = {200, 300, 400};
+    REQUIRE(d2r::runDurationSecs(r) == 300);   // 400 - 100
+}
+
+TEST_CASE("runDurationSecs: closed run with no autosaves still counts menu time",
+          "[dashboard_model][runs]") {
+    // A bare SaveAndExit with no autosaves represents "the user
+    // entered game and quit immediately" -- there was still menu/
+    // load time between the previous SaveAndExit and this one, and
+    // that time gets credited here.
     d2r::Run r;
     r.characterFile = "Kai.d2s";
     r.startEpoch    = 400;
@@ -482,7 +510,7 @@ TEST_CASE("runDurationSecs: bare SaveAndExit with no autosaves -> 0",
     r.inProgress    = false;
     r.autosaveCount = 0;
     r.autosaveDates = {};
-    REQUIRE(d2r::runDurationSecs(r) == 0);
+    REQUIRE(d2r::runDurationSecs(r) == 100);   // 500 - 400
 }
 
 // ---------------------------------------------------------------------------
@@ -550,8 +578,8 @@ TEST_CASE("computeSessionRunStats: aggregates runs across two characters",
     d2r::BackupDb db(sc.path / "backups.sqlite");
 
     // Kai: two closed runs.
-    //  Run 1: autosaves at 100, 200, SaveAndExit at 300 -> duration 200.
-    //  Run 2: autosaves at 400, 500, SaveAndExit at 600 -> duration 200.
+    //  Run 1: startEpoch=0 (sessionStart), SaveAndExit at 300 -> 300.
+    //  Run 2: startEpoch=300 (prev SaveAndExit), SaveAndExit at 600 -> 300.
     insertRow(db, "Kai.d2s", 100, d2r::BackupDb::State::Autosave);
     insertRow(db, "Kai.d2s", 200, d2r::BackupDb::State::Autosave);
     insertRow(db, "Kai.d2s", 300, d2r::BackupDb::State::SaveAndExit);
@@ -559,8 +587,9 @@ TEST_CASE("computeSessionRunStats: aggregates runs across two characters",
     insertRow(db, "Kai.d2s", 500, d2r::BackupDb::State::Autosave);
     insertRow(db, "Kai.d2s", 600, d2r::BackupDb::State::SaveAndExit);
     // Barbarian: one closed run + trailing in-progress.
-    //  Run 1: autosaves at 150, 250, SaveAndExit at 350 -> duration 200.
-    //  Run 2 in progress: autosaves at 450, 550 -> duration 100.
+    //  Run 1: startEpoch=0, SaveAndExit at 350 -> 350.
+    //  Run 2 in progress: startEpoch=350, sessionEnd=0 in this test
+    //    (fallback to last autosave at 550) -> 200.
     insertRow(db, "Barbarian.d2s", 150, d2r::BackupDb::State::Autosave);
     insertRow(db, "Barbarian.d2s", 250, d2r::BackupDb::State::Autosave);
     insertRow(db, "Barbarian.d2s", 350, d2r::BackupDb::State::SaveAndExit);
@@ -577,18 +606,18 @@ TEST_CASE("computeSessionRunStats: aggregates runs across two characters",
     REQUIRE(stats.perCharacter.size() == 2);
     REQUIRE(stats.totalRuns == 3);      // 2 + 1 closed
     REQUIRE(stats.anyInProgress);
-    REQUIRE(stats.totalSecs == 700);    // 200+200 + 200 + 100
+    REQUIRE(stats.totalSecs == 1150);   // 300 + 300 + 350 + 200
 
-    // Order: descending by accumulatedSecs (Kai 400 > Karsh 300).
+    // Order: descending by accumulatedSecs (Kai 600 > Karsh 550).
     REQUIRE(stats.perCharacter[0].characterName    == "Kai");
     REQUIRE(stats.perCharacter[0].runCount         == 2);
     REQUIRE_FALSE(stats.perCharacter[0].hasInProgress);
-    REQUIRE(stats.perCharacter[0].accumulatedSecs  == 400);
+    REQUIRE(stats.perCharacter[0].accumulatedSecs  == 600);
 
     REQUIRE(stats.perCharacter[1].characterName    == "Karsh");
     REQUIRE(stats.perCharacter[1].runCount         == 1);
     REQUIRE(stats.perCharacter[1].hasInProgress);
-    REQUIRE(stats.perCharacter[1].accumulatedSecs  == 300);
+    REQUIRE(stats.perCharacter[1].accumulatedSecs  == 550);
 }
 
 TEST_CASE("computeSessionRunStats: sessionStart clips out earlier runs",
@@ -612,7 +641,9 @@ TEST_CASE("computeSessionRunStats: sessionStart clips out earlier runs",
                                                      /*sessionEnd=*/0);
     REQUIRE(stats.perCharacter.size() == 1);
     REQUIRE(stats.totalRuns == 1);
-    REQUIRE(stats.totalSecs == 200);   // 600 - 400
+    // Run 2's startEpoch is clipped to sessionStart (350) since the
+    // previous SaveAndExit (300) is before it. Duration = 600 - 350.
+    REQUIRE(stats.totalSecs == 250);
 }
 
 TEST_CASE("computeSessionRunStats: sessionEnd clips out later runs",
@@ -636,7 +667,40 @@ TEST_CASE("computeSessionRunStats: sessionEnd clips out later runs",
                                                      /*sessionStart=*/0,
                                                      /*sessionEnd=*/350);
     REQUIRE(stats.totalRuns == 1);
-    REQUIRE(stats.totalSecs == 200);   // 300 - 100
+    // Run 1: startEpoch=0 (sessionStart), endEpoch=300. Duration = 300.
+    REQUIRE(stats.totalSecs == 300);
+}
+
+TEST_CASE("computeSessionRunStats: sum-of-runs covers the entire session "
+          "window (contiguous accounting)",
+          "[dashboard_model][runs][stats]") {
+    // The user-visible invariant this refactor was written to satisfy:
+    // for a session with sessionStart <= earliest activity, the sum of
+    // per-character accumulatedSecs equals the span from sessionStart
+    // to the newest activity we count. No gaps between runs, no
+    // double-count.
+    RunStatsScratch sc;
+    d2r::BackupDb db(sc.path / "backups.sqlite");
+    // Kai: 3 closed runs; final SaveAndExit is at 900.
+    insertRow(db, "Kai.d2s", 150, d2r::BackupDb::State::Autosave);
+    insertRow(db, "Kai.d2s", 300, d2r::BackupDb::State::SaveAndExit);
+    insertRow(db, "Kai.d2s", 450, d2r::BackupDb::State::Autosave);
+    insertRow(db, "Kai.d2s", 600, d2r::BackupDb::State::SaveAndExit);
+    insertRow(db, "Kai.d2s", 750, d2r::BackupDb::State::Autosave);
+    insertRow(db, "Kai.d2s", 900, d2r::BackupDb::State::SaveAndExit);
+
+    d2r::DashboardFileCache cache;
+    addCacheEntry(cache, "Kai.d2s", "Kai");
+
+    const std::int64_t sessionStart = 100;   // before any activity
+    const std::int64_t sessionEnd   = 900;   // == last SaveAndExit
+    const auto stats = d2r::computeSessionRunStats(&db, cache,
+                                                     sessionStart,
+                                                     sessionEnd);
+    REQUIRE(stats.totalRuns == 3);
+    REQUIRE_FALSE(stats.anyInProgress);
+    // Session covers [100, 900] = 800 seconds. Sum of runs must equal.
+    REQUIRE(stats.totalSecs == sessionEnd - sessionStart);
 }
 
 TEST_CASE("computeSessionRunStats: character name falls back to filename stem",

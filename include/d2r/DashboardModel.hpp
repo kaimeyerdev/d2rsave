@@ -524,12 +524,23 @@ struct Run {
     std::span<const BackupDb::HistoryRow>       historyRows,
     std::int64_t                                sessionStart);
 
-// Wall-clock duration of `run` in seconds, using the same rule as the
-// Backups pane's collapsed-view VRow: the run spans its first-autosave
-// date through either its SaveAndExit (closed) or its last-autosave
-// date (in-progress). A run with zero autosaves returns 0 (a bare
-// SaveAndExit with no play activity captured).
-[[nodiscard]] std::int64_t runDurationSecs(const Run& run) noexcept;
+// Wall-clock duration of `run` in seconds.
+//
+// A run spans from its `startEpoch` (set by `groupRunsForFile` to
+// either the previous SaveAndExit's date or the session start,
+// whichever is later) to either its own SaveAndExit's date (closed
+// runs) or `sessionEnd` (in-progress runs). This makes the sum of
+// run durations across a session exactly cover the session window
+// -- there's no gap between the previous run's end and the next
+// run's first autosave.
+//
+// `sessionEnd` should be the session's effective end epoch (e.g.
+// `AppSession::endEpoch()`). If zero, in-progress runs fall back to
+// their last known autosave date, so bare unit-test calls without a
+// session-end context still return a meaningful (albeit under-
+// counted) value.
+[[nodiscard]] std::int64_t runDurationSecs(const Run& run,
+                                            std::int64_t sessionEnd = 0) noexcept;
 
 // Aggregated per-character run statistics for the current Session.
 // Populated by `computeSessionRunStats` and threaded onto the Session

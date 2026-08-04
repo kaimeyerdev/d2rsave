@@ -1341,17 +1341,31 @@ std::vector<Run> groupRunsForFile(
 // runDurationSecs / computeSessionRunStats.
 // ---------------------------------------------------------------------------
 
-std::int64_t runDurationSecs(const Run& run) noexcept {
-    if (run.autosaveDates.empty()) return 0;
-    // Closed run: end = SaveAndExit's date (captured in run.endEpoch).
-    // In-progress: end = last autosave date on record. Both give a
-    // wall-clock span from first autosave to end, which matches how the
-    // Backups pane run-collapse view formats duration.
-    const std::int64_t start = run.autosaveDates.front();
-    const std::int64_t end   = run.inProgress
-                                  ? run.autosaveDates.back()
-                                  : run.endEpoch;
-    return (end > start) ? (end - start) : 0;
+std::int64_t runDurationSecs(const Run& run, std::int64_t sessionEnd) noexcept {
+    // A run spans from `startEpoch` (previous SaveAndExit's date OR
+    // the session start, whichever is later -- set by
+    // `groupRunsForFile`) to either its closing SaveAndExit
+    // (`endEpoch`, closed runs) or the session end (in-progress
+    // runs).
+    //
+    // For in-progress runs, `sessionEnd` tracks the newest backup on
+    // record (via AppSession::autoEndEpoch). When the caller doesn't
+    // supply one (sessionEnd == 0, e.g. bare unit tests), we fall
+    // back to the run's last known autosave date so the return value
+    // stays meaningful. If neither is available, duration is 0.
+    std::int64_t end = 0;
+    if (run.inProgress) {
+        if (sessionEnd > run.startEpoch) {
+            end = sessionEnd;
+        } else if (!run.autosaveDates.empty()) {
+            end = run.autosaveDates.back();
+        } else {
+            return 0;
+        }
+    } else {
+        end = run.endEpoch;
+    }
+    return (end > run.startEpoch) ? (end - run.startEpoch) : 0;
 }
 
 // Strip a trailing ".d2s" / ".D2S" from `name` to produce a display
@@ -1401,7 +1415,7 @@ SessionRunStats computeSessionRunStats(
             } else {
                 ++pc.runCount;
             }
-            pc.accumulatedSecs += runDurationSecs(r);
+            pc.accumulatedSecs += runDurationSecs(r, sessionEnd);
         }
         if (pc.runCount == 0 && !pc.hasInProgress) continue;
 
