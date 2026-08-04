@@ -327,6 +327,8 @@ nlohmann::json toJson(const PaneNode& n) {
     if (c.type == PaneType::Backups) {
         j["backupViewMode"]     = std::string(toString(c.backupViewMode));
         j["selectedBackupFile"] = c.selectedBackupFile;
+        // Elide when default (true) so stored JSON stays tidy.
+        if (!c.backupsRunCollapse) j["backupsRunCollapse"] = false;
     }
     // NOTE: session-window overrides moved from PaneConfig to the
     // AppSession singleton (in-memory only). We no longer emit
@@ -391,6 +393,7 @@ PaneNode fromJson(const nlohmann::json& j) {
                 j.value("backupViewMode", std::string("summary")));
             n.config.selectedBackupFile = j.value(
                 "selectedBackupFile", std::string());
+            n.config.backupsRunCollapse = j.value("backupsRunCollapse", true);
         }
         // Session-window overrides no longer live on PaneConfig; any
         // pre-existing sessionCustomStartEpoch / sessionCustomEndEpoch

@@ -268,6 +268,12 @@ struct UiState {
     mutable std::string                                           backupsExpCacheFilename;
     mutable std::unordered_map<std::int64_t, std::optional<double>> backupsExpCache;
 
+    // Backups detail collapsed view: date of the currently-expanded
+    // Run (`runEndEpoch` from `groupRunsForFile`). Single-open policy
+    // -- opening a new run auto-collapses the previous. `nullopt` when
+    // no run is expanded. Ephemeral (not persisted).
+    std::optional<std::int64_t>               expandedRunEndEpoch;
+
     // Recovery modal state. Populated when the user presses [R] on the
     // Backups pane detail view; cleared on confirm or cancel.
     struct RecoveryModal {
@@ -2072,42 +2078,6 @@ Element renderBackupsDetail(const PaneConfig& config, BackupDb* db,
         }));
     }
 
-    // Cursor semantics: PaneConfig::cursor indexes into `hist` (0-based,
-    // reverse-chron). Sessions are demarcated by state=SaveAndExit rows:
-    // that row terminates the session it belongs to; a divider is drawn
-    // ABOVE the next row (which starts the next-older session).
-    const int nRows = static_cast<int>(hist.size());
-    const int cursor = std::clamp(config.cursor, 0, nRows - 1);
-
-    constexpr int kDateW  = 20;
-    constexpr int kStateW = 14;
-    constexpr int kExpW   = 8;      // "exp %" like " 87.3 % " -- 7 chars
-    constexpr int kSumW   = 12;
-    auto pad = [](std::string s, int w) {
-        if (static_cast<int>(s.size()) > w) return s.substr(0, w);
-        s.append(w - s.size(), ' ');
-        return s;
-    };
-
-    Element header = hbox({
-        text(pad("when",     kDateW))  | bold,
-        text(pad("state",    kStateW)) | bold,
-        text(pad("exp %",    kExpW))   | bold,
-        text(pad("checksum", kSumW))   | bold,
-    });
-
-    std::vector<Element> body;
-    body.push_back(header);
-    body.push_back(separator());
-
-    // Window rows around the cursor to fit the pane height. Reserve
-    // rows for the header + separator + footer.
-    const int reserved = 4;
-    const int visible = std::max(1, pageHeight - reserved);
-    int start = std::max(0, cursor - visible / 2);
-    if (start + visible > nRows) start = std::max(0, nRows - visible);
-    const int end = std::min(nRows, start + visible);
-
     // Reset the exp% cache when the detail view switches to a
     // different file. Only .d2s backups carry a character; other file
     // types show "-" in the exp column and are never parsed.
@@ -2122,17 +2092,18 @@ Element renderBackupsDetail(const PaneConfig& config, BackupDb* db,
          config.selectedBackupFile.compare(
              config.selectedBackupFile.size() - 4, 4, ".D2S") == 0);
 
-    auto expPercentFor = [&](const BackupDb::HistoryRow& r)
+    auto expPercentFor = [&](std::int64_t rowDate, std::int64_t sizeBytes,
+                              BackupDb::State st)
         -> std::optional<double> {
         if (!isCharacterFile) return std::nullopt;
-        if (r.state == BackupDb::State::Deleted) return std::nullopt;
-        if (r.sizeBytes <= 0) return std::nullopt;
-        auto it = ui.backupsExpCache.find(r.date);
+        if (st == BackupDb::State::Deleted) return std::nullopt;
+        if (sizeBytes <= 0) return std::nullopt;
+        auto it = ui.backupsExpCache.find(rowDate);
         if (it != ui.backupsExpCache.end()) return it->second;
 
         std::optional<double> pct;
         try {
-            auto row = db->at(config.selectedBackupFile, r.date);
+            auto row = db->at(config.selectedBackupFile, rowDate);
             if (row && !row->data.empty()) {
                 const auto ch = parseCharacter(row->data);
                 const std::uint32_t lvl = ch.attributes.level
@@ -2155,7 +2126,7 @@ Element renderBackupsDetail(const PaneConfig& config, BackupDb* db,
             // Parse failure -- cache the negative result so we don't
             // retry every render.
         }
-        ui.backupsExpCache.emplace(r.date, pct);
+        ui.backupsExpCache.emplace(rowDate, pct);
         return pct;
     };
 
@@ -2166,42 +2137,186 @@ Element renderBackupsDetail(const PaneConfig& config, BackupDb* db,
         return buf;
     };
 
-    // A play session is delimited by a state=SaveAndExit row: everything
-    // between the previous S&E and this one is that session. In this
-    // newest-first display we render each session as a contiguous block
-    // capped by its S&E at the TOP -- the divider goes ABOVE each S&E
-    // (except the very top row on screen, where there's nothing to
-    // separate from). That puts autosaves visually beneath the S&E they
-    // ended, matching the "S&E ends a session" model used everywhere
-    // else (retention, session-pane anchor, session count).
+    auto formatChecksum = [&](const std::optional<std::uint32_t>& c) -> std::string {
+        if (!c) return "-";
+        char b[16];
+        std::snprintf(b, sizeof(b), "%08x", *c);
+        return b;
+    };
+
+    auto formatDuration = [](std::int64_t secs) -> std::string {
+        if (secs < 0) secs = 0;
+        char b[32];
+        std::snprintf(b, sizeof(b), "%lldh %02lldm %02llds",
+                      static_cast<long long>(secs / 3600),
+                      static_cast<long long>((secs % 3600) / 60),
+                      static_cast<long long>(secs % 60));
+        return b;
+    };
+
+    // ---- Build visible-row list -------------------------------------
+    //
+    // Collapsed mode: group `hist` into Runs (via groupRunsForFile),
+    // reverse to newest-first, and emit one Run summary row per Run;
+    // if a Run is currently expanded (ui.expandedRunEndEpoch matches
+    // its endEpoch) the run's autosaves are unfolded beneath it,
+    // newest-first. Startup / Deleted / non-run-signal rows are
+    // omitted in this mode -- the user can toggle collapse off to see
+    // the full history.
+    //
+    // Raw mode: one row per hist entry, matching the pre-run-collapse
+    // behavior. A dim divider is drawn above each SaveAndExit row so
+    // runs are still visually demarcated.
+    struct VRow {
+        std::int64_t                  date        = 0;   // for cursor / exp cache
+        std::string                   whenStr;
+        std::string                   stateLabel;
+        std::optional<double>         exp;
+        std::optional<std::uint32_t>  checksum;
+        std::string                   extra;             // e.g. "▶  5 autosaves"
+        bool                          isDivider   = false;
+        bool                          isRunSummary= false;
+        std::int64_t                  runEndEpoch = 0;   // for expand toggling
+        bool                          dimAutosave = false;
+    };
+    std::vector<VRow> vrows;
+    if (config.backupsRunCollapse) {
+        auto runs = d2r::groupRunsForFile(config.selectedBackupFile, hist, 0);
+        // Runs come out chronological oldest-first; the detail view is
+        // newest-first.
+        std::reverse(runs.begin(), runs.end());
+        // Build a lookup of hist row -> checksum/sizeBytes so we can
+        // display fields on unfolded autosave rows too.
+        std::unordered_map<std::int64_t, const BackupDb::HistoryRow*> byDate;
+        for (const auto& r : hist) byDate[r.date] = &r;
+        for (const auto& r : runs) {
+            VRow v;
+            v.isRunSummary  = true;
+            v.runEndEpoch   = r.endEpoch;
+            v.date          = r.inProgress
+                                 ? (r.autosaveDates.empty() ? 0 : r.autosaveDates.back())
+                                 : r.endEpoch;
+            const bool expanded = ui.expandedRunEndEpoch
+                                    && *ui.expandedRunEndEpoch == r.endEpoch
+                                    && !r.inProgress;
+            if (r.inProgress) {
+                v.whenStr    = "(in progress)";
+                v.stateLabel = "-";
+                v.extra      = "~" + std::to_string(r.autosaveCount)
+                                 + " autosaves";
+            } else {
+                v.whenStr    = formatWallDateTime(r.endEpoch);
+                v.stateLabel = std::string(expanded ? "v " : "> ") + "run end";
+                const std::int64_t startForDur =
+                    r.autosaveDates.empty() ? r.endEpoch
+                                            : r.autosaveDates.front();
+                v.extra = formatDuration(r.endEpoch - startForDur)
+                            + "  " + std::to_string(r.autosaveCount)
+                            + " autosaves";
+                if (auto it = byDate.find(r.endEpoch); it != byDate.end()) {
+                    v.exp      = expPercentFor(r.endEpoch,
+                                                it->second->sizeBytes,
+                                                it->second->state);
+                    v.checksum = it->second->checksum;
+                }
+            }
+            vrows.push_back(std::move(v));
+            if (expanded) {
+                // Autosaves oldest-first inside the Run; unfold newest-
+                // first below the summary.
+                for (auto it = r.autosaveDates.rbegin();
+                     it != r.autosaveDates.rend(); ++it) {
+                    VRow a;
+                    a.date        = *it;
+                    a.dimAutosave = true;
+                    a.stateLabel  = "  auto";
+                    a.whenStr     = formatWallDateTime(*it);
+                    if (auto hi = byDate.find(*it); hi != byDate.end()) {
+                        a.exp      = expPercentFor(*it,
+                                                    hi->second->sizeBytes,
+                                                    hi->second->state);
+                        a.checksum = hi->second->checksum;
+                    }
+                    vrows.push_back(std::move(a));
+                }
+            }
+        }
+    } else {
+        // Raw mode: mirror the legacy per-hist-row rendering.
+        for (int i = 0; i < static_cast<int>(hist.size()); ++i) {
+            const auto& r = hist[i];
+            VRow v;
+            v.date       = r.date;
+            v.whenStr    = formatWallDateTime(r.date);
+            v.stateLabel = std::string(backupStateShortLabel(r.state));
+            v.exp        = expPercentFor(r.date, r.sizeBytes, r.state);
+            v.checksum   = r.checksum;
+            v.isDivider  = (r.state == BackupDb::State::SaveAndExit && i > 0);
+            vrows.push_back(std::move(v));
+        }
+    }
+
+    const int nRows = static_cast<int>(vrows.size());
+    const int cursor = nRows > 0
+        ? std::clamp(config.cursor, 0, nRows - 1)
+        : 0;
+
+    constexpr int kDateW  = 20;
+    constexpr int kStateW = 14;
+    constexpr int kExpW   = 8;
+    constexpr int kSumW   = 12;
+    auto pad = [](std::string s, int w) {
+        if (static_cast<int>(s.size()) > w) return s.substr(0, w);
+        s.append(w - s.size(), ' ');
+        return s;
+    };
+
+    Element header = hbox({
+        text(pad("when",     kDateW))  | bold,
+        text(pad("state",    kStateW)) | bold,
+        text(pad("exp %",    kExpW))   | bold,
+        text(pad("checksum", kSumW))   | bold,
+        text(" ")                       | bold,
+    });
+
+    std::vector<Element> body;
+    body.push_back(header);
+    body.push_back(separator());
+
+    // Window rows around the cursor to fit the pane height. Reserve
+    // rows for the header + separator + footer.
+    const int reserved = 4;
+    const int visible = std::max(1, pageHeight - reserved);
+    int start = std::max(0, cursor - visible / 2);
+    if (start + visible > nRows) start = std::max(0, nRows - visible);
+    const int end = std::min(nRows, start + visible);
+
     for (int i = start; i < end; ++i) {
-        const auto& r = hist[i];
-        if (r.state == BackupDb::State::SaveAndExit && i > start) {
+        const auto& v = vrows[i];
+        if (v.isDivider && i > start) {
             body.push_back(separator() | dim);
         }
         Element rowEl = hbox({
-            text(pad(formatWallDateTime(r.date), kDateW)),
-            text(pad(std::string(backupStateShortLabel(r.state)), kStateW)),
-            text(pad(formatExp(expPercentFor(r)), kExpW)),
-            text(pad(r.checksum
-                        ? [v = *r.checksum]{
-                              char b[16];
-                              std::snprintf(b, sizeof(b), "%08x", v);
-                              return std::string(b);
-                          }()
-                        : std::string("-"),
-                     kSumW)),
+            text(pad(v.whenStr,     kDateW)),
+            text(pad(v.stateLabel,  kStateW)),
+            text(pad(formatExp(v.exp), kExpW)),
+            text(pad(formatChecksum(v.checksum), kSumW)),
+            text(v.extra),
         });
-        if (i == cursor) rowEl = rowEl | inverted;
+        if (v.dimAutosave)   rowEl = rowEl | dim;
+        if (i == cursor)     rowEl = rowEl | inverted;
         body.push_back(rowEl);
     }
 
     // Footer.
     body.push_back(filler());
+    Element footer = config.backupsRunCollapse
+        ? text("[Enter] expand run  [Esc] back  [R] recover  ") | dim
+        : text("[Esc] back  [R] recover  ") | dim;
     body.push_back(hbox({
         text("  row " + std::to_string(cursor + 1) + "/" + std::to_string(nRows)) | dim,
         filler(),
-        text("[Esc] back  [R] recover  ") | dim,
+        footer,
     }));
 
     return window(titleEl, vbox(std::move(body)));
@@ -2638,6 +2753,7 @@ struct ConfigMenuItem {
         ToggleUberShowUbers,
         ToggleUberShowTorchByClass,
         ToggleSessionLootShowRunes,
+        ToggleBackupsRunCollapse,
         CyclePaneWeight,
         CycleInfoLevel,
         SplitVertical, SplitHorizontal, DeletePane, Close,
@@ -2715,6 +2831,13 @@ std::vector<ConfigMenuItem> buildConfigMenu(const PaneConfig& c, bool canDelete,
     }
     if (c.type == PaneType::BackupLog) {
         items.push_back({"clear backup-actions log", ConfigMenuItem::ClearBackupLog});
+    }
+    if (c.type == PaneType::Backups &&
+        c.backupViewMode == BackupViewMode::Detail) {
+        items.push_back({
+            std::string("collapse into runs:   ")
+              + (c.backupsRunCollapse ? "on" : "off"),
+            ConfigMenuItem::ToggleBackupsRunCollapse});
     }
     // Session-window controls live on every pane that consumes the
     // session (Session, SessionLoot, Character). They edit the shared
@@ -4075,6 +4198,15 @@ int runDashboard(const std::filesystem::path& savePath,
                         persistLayout();
                         break;
                     }
+                    case ConfigMenuItem::ToggleBackupsRunCollapse: {
+                        leaf->config.backupsRunCollapse = !leaf->config.backupsRunCollapse;
+                        // Reset cursor + expand state when the view
+                        // structure changes; row indices no longer map.
+                        leaf->config.cursor = 0;
+                        ui.expandedRunEndEpoch.reset();
+                        persistLayout();
+                        break;
+                    }
                     case ConfigMenuItem::SplitVertical:
                     case ConfigMenuItem::SplitHorizontal: {
                         // Commit the current pane's config before duplicating.
@@ -4159,6 +4291,44 @@ int runDashboard(const std::filesystem::path& savePath,
                 }
                 return true;
             }
+            // Enter in collapsed detail view toggles expand on the Run
+            // row under the cursor. Ignored on Autosave sub-rows and
+            // when the cursor sits on an in-progress run (no run-end
+            // epoch to key on).
+            if (e == Event::Return &&
+                leaf->config.backupViewMode == BackupViewMode::Detail &&
+                leaf->config.backupsRunCollapse && ui.backupDb) {
+                std::vector<BackupDb::HistoryRow> hist;
+                try {
+                    hist = ui.backupDb->historyFor(
+                        leaf->config.selectedBackupFile, 2048);
+                } catch (const std::exception&) {}
+                auto runs = d2r::groupRunsForFile(
+                    leaf->config.selectedBackupFile, hist, 0);
+                std::reverse(runs.begin(), runs.end());
+                int vi = 0;
+                std::optional<std::int64_t> toggleEpoch;
+                for (const auto& r : runs) {
+                    if (vi == leaf->config.cursor) {
+                        if (!r.inProgress) toggleEpoch = r.endEpoch;
+                        break;
+                    }
+                    ++vi;
+                    const bool expanded = ui.expandedRunEndEpoch
+                                            && *ui.expandedRunEndEpoch == r.endEpoch
+                                            && !r.inProgress;
+                    if (expanded) vi += static_cast<int>(r.autosaveDates.size());
+                }
+                if (toggleEpoch) {
+                    if (ui.expandedRunEndEpoch
+                     && *ui.expandedRunEndEpoch == *toggleEpoch) {
+                        ui.expandedRunEndEpoch.reset();
+                    } else {
+                        ui.expandedRunEndEpoch = *toggleEpoch;
+                    }
+                }
+                return true;
+            }
             if (e == Event::Escape &&
                 leaf->config.backupViewMode == BackupViewMode::Detail) {
                 leaf->config.backupViewMode = BackupViewMode::Summary;
@@ -4166,7 +4336,10 @@ int runDashboard(const std::filesystem::path& savePath,
                 return true;
             }
             // R opens the recovery modal for the row currently under the
-            // cursor in the detail view.
+            // cursor in the detail view. In collapsed mode, the cursor
+            // indexes visual rows (Run summaries + unfolded autosaves);
+            // we walk the same grouping the renderer uses to resolve
+            // the underlying backup date.
             if ((e == Event::Character('R') || e == Event::Character('r')) &&
                 leaf->config.backupViewMode == BackupViewMode::Detail &&
                 ui.backupDb) {
@@ -4174,12 +4347,49 @@ int runDashboard(const std::filesystem::path& savePath,
                     const auto hist = ui.backupDb->historyFor(
                         leaf->config.selectedBackupFile, 2048);
                     if (!hist.empty()) {
-                        const int idx = std::clamp(leaf->config.cursor,
-                                                    0, (int)hist.size() - 1);
-                        ui.recoveryModal = UiState::RecoveryModal{};
-                        ui.recoveryModal.filename = leaf->config.selectedBackupFile;
-                        ui.recoveryModal.atUnix   = hist[idx].date;
-                        ui.recoveryModalVisible   = true;
+                        std::int64_t rowDate = 0;
+                        if (leaf->config.backupsRunCollapse) {
+                            auto runs = d2r::groupRunsForFile(
+                                leaf->config.selectedBackupFile, hist, 0);
+                            std::reverse(runs.begin(), runs.end());
+                            int vi = 0;
+                            for (const auto& r : runs) {
+                                if (vi == leaf->config.cursor) {
+                                    rowDate = r.inProgress
+                                                ? (r.autosaveDates.empty()
+                                                    ? 0
+                                                    : r.autosaveDates.back())
+                                                : r.endEpoch;
+                                    break;
+                                }
+                                ++vi;
+                                const bool expanded = ui.expandedRunEndEpoch
+                                                        && *ui.expandedRunEndEpoch == r.endEpoch
+                                                        && !r.inProgress;
+                                if (expanded) {
+                                    // Autosaves unfold newest-first.
+                                    for (auto it = r.autosaveDates.rbegin();
+                                         it != r.autosaveDates.rend(); ++it) {
+                                        if (vi == leaf->config.cursor) {
+                                            rowDate = *it;
+                                            break;
+                                        }
+                                        ++vi;
+                                    }
+                                    if (rowDate) break;
+                                }
+                            }
+                        } else {
+                            const int idx = std::clamp(leaf->config.cursor,
+                                                        0, (int)hist.size() - 1);
+                            rowDate = hist[idx].date;
+                        }
+                        if (rowDate > 0) {
+                            ui.recoveryModal = UiState::RecoveryModal{};
+                            ui.recoveryModal.filename = leaf->config.selectedBackupFile;
+                            ui.recoveryModal.atUnix   = rowDate;
+                            ui.recoveryModalVisible   = true;
+                        }
                     }
                 } catch (const std::exception&) {
                     // Ignore -- next render shows an empty history view.
@@ -4232,8 +4442,27 @@ int runDashboard(const std::filesystem::path& savePath,
                 if (!ui.backupDb) return 0;
                 if (leaf->config.backupViewMode == BackupViewMode::Detail) {
                     try {
-                        return (int)ui.backupDb->historyFor(
-                            leaf->config.selectedBackupFile, 2048).size();
+                        auto hist = ui.backupDb->historyFor(
+                            leaf->config.selectedBackupFile, 2048);
+                        if (!leaf->config.backupsRunCollapse) {
+                            return static_cast<int>(hist.size());
+                        }
+                        // Collapsed mode: rows = runs + (if expanded)
+                        // unfolded autosaves for the current expand target.
+                        auto runs = d2r::groupRunsForFile(
+                            leaf->config.selectedBackupFile, hist, 0);
+                        int total = static_cast<int>(runs.size());
+                        if (ui.expandedRunEndEpoch) {
+                            for (const auto& r : runs) {
+                                if (!r.inProgress &&
+                                    r.endEpoch == *ui.expandedRunEndEpoch) {
+                                    total += static_cast<int>(
+                                        r.autosaveDates.size());
+                                    break;
+                                }
+                            }
+                        }
+                        return total;
                     } catch (const std::exception&) { return 0; }
                 }
                 return (int)backupsSummaryOrder(ui.backupDb, backupsCharFilter()).size();

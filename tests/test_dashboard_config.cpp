@@ -144,6 +144,22 @@ TEST_CASE("Uber pane defaults: both toggles off", "[dashboard_config]") {
     REQUIRE(back.config.uberShowTorchByClass == false);
 }
 
+TEST_CASE("Backups pane round-trips backupsRunCollapse", "[dashboard_config]") {
+    // Default is `true`; verify it survives a round-trip AND that the
+    // non-default (`false`) also survives so a user's opt-out sticks.
+    {
+        const auto back = roundTrip(leaf(d2r::PaneType::Backups));
+        REQUIRE(back.config.type               == d2r::PaneType::Backups);
+        REQUIRE(back.config.backupsRunCollapse == true);
+    }
+    {
+        auto n = leaf(d2r::PaneType::Backups);
+        n.config.backupsRunCollapse = false;
+        const auto back = roundTrip(n);
+        REQUIRE(back.config.backupsRunCollapse == false);
+    }
+}
+
 TEST_CASE("TerrorZone pane has no per-pane options to lose", "[dashboard_config]") {
     // TerrorZone carries no configurable state today; the round-trip
     // just needs to preserve the type. Pinning this keeps regressions

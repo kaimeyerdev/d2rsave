@@ -105,6 +105,12 @@ struct PaneConfig {
     // the user drilled into for Detail view. Also used to remember the
     // most recently-viewed file across dashboard restarts.
     std::string       selectedBackupFile;
+    // Detail view: when true (default) rows are grouped into Runs (each
+    // bounded by a SaveAndExit backup); one summary row per Run shows
+    // duration + autosave count and expands on Enter to reveal the
+    // underlying autosave rows. When false, every backup row is
+    // rendered individually (legacy view). See docs/session-logic.md.
+    bool              backupsRunCollapse = true;
 
     // NOTE: session-window fields (custom start/end) previously lived
     // here per-pane. They now live on the AppSession singleton in the
