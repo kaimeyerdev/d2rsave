@@ -107,12 +107,21 @@ namespace backup_scheduler_detail {
 // /memories/session/auto-modes-plan.md):
 //   * Zero writes across the burst (no IN_CLOSE_WRITE / IN_MODIFY /
 //     IN_MOVED_TO / IN_CREATE on any file).
-//   * At least one file read where the file's extension is NOT
-//     `.d2s` and NOT `.d2i`. Concretely: any `.ctl`, `.key`, `.ma*`,
-//     `.map`, or `Settings.json`.
-// The second clause is what discriminates D2R launch from the
-// dashboard's own `takeStartupSnapshot` (which only reads `.d2s` /
-// `.d2i` per `isPersistedFile`) -- see docs/session-logic.md.
+//   * AT LEAST THREE distinct non-`.d2s`/`.d2i` file reads in the same
+//     burst. Concretely: 3+ files ending in `.ctl`, `.key`, `.ma*`,
+//     `.map`, or named `Settings.json`. A real launch reads dozens of
+//     these files at once; single-file mid-gameplay reads (e.g. D2R
+//     touching Settings.json when the options menu opens) can't reach
+//     the threshold, so mid-session false positives that would
+//     retroactively shift AppSession.autoStartEpoch don't fire.
+//
+// The threshold is safe for accounts with >= 1 character (a real
+// launch reads Settings.json + at least 5 auxiliary files per
+// character). 0-character launches don't reach the threshold, but
+// they also have no runes / items to track.
+//
+// See docs/session-logic.md for the full derivation and the trace
+// analysis in memory for the empirical basis.
 [[nodiscard]] bool isLaunchBurst(
     std::span<const DirectoryWatcher::ChangedFile>);
 

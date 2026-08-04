@@ -145,21 +145,36 @@ std::uint32_t computeFileChecksum(std::string_view name,
 
 bool isLaunchBurst(
     std::span<const DirectoryWatcher::ChangedFile> files) {
-    // The launch signature is "reads-only burst with at least one read
-    // on a non-.d2s/.d2i file". See BackupScheduler.hpp + the analysis
-    // in memories for the derivation.
+    // The launch signature is "reads-only burst that reads a LOT of
+    // non-.d2s/.d2i files at once". A real D2R launch scans every save
+    // file in the directory (see the trace analysis in memory) --
+    // hundreds of files including every .ctl / .key / .ma* / .map plus
+    // Settings.json.
+    //
+    // The previous rule ("reads-only + >= 1 non-persisted read") was
+    // too loose: an in-game options-menu open or any other single
+    // non-persisted read event could trigger it, falsely resetting
+    // AppSession.autoStartEpoch mid-session and losing "new since
+    // session started" bookkeeping. Tighten to require >= 3 non-
+    // persisted files with distinct names in the same burst.
+    //
+    // For 1-character accounts, a launch reads Settings.json + 1 .ctl
+    // + 1 .key + 1 .ma0 + 1 .map = 5 non-persisted files, so the
+    // threshold has margin. 0-character accounts don't have runes /
+    // items to track anyway.
     constexpr std::uint32_t kWriteBits =
         IN_CLOSE_WRITE | IN_MODIFY | IN_MOVED_TO | IN_CREATE;
     constexpr std::uint32_t kReadBits =
         IN_ACCESS | IN_OPEN | IN_CLOSE_NOWRITE;
-    bool sawNonPersistedRead = false;
+    constexpr std::size_t   kMinNonPersistedReads = 3;
+    std::size_t             nonPersistedReads = 0;
     for (const auto& f : files) {
         if (f.name.empty()) continue;   // ISDIR-only rows carry an empty name
         if ((f.mask & kWriteBits) != 0) return false;
         if ((f.mask & kReadBits)  == 0) continue;
-        if (!isPersistedFile(f.name)) sawNonPersistedRead = true;
+        if (!isPersistedFile(f.name)) ++nonPersistedReads;
     }
-    return sawNonPersistedRead;
+    return nonPersistedReads >= kMinNonPersistedReads;
 }
 
 } // namespace backup_scheduler_detail

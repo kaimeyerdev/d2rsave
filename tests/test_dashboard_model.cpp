@@ -8,6 +8,8 @@
 
 #include "d2r/DashboardModel.hpp"
 #include "d2r/Item.hpp"
+#include "d2r/RefDb.hpp"
+#include "d2r/Save.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -236,6 +238,64 @@ TEST_CASE("SessionState diff: rune moved between locations is not 'new'",
         if (now > before) ++newRows;
     }
     REQUIRE(newRows == 0);
+}
+
+TEST_CASE("SessionState diff: rune picked up during session and stashed shows "
+          "as new",
+          "[dashboard_model][session_loot][stash]") {
+    // Direct reproduction of the user report: 'runes I store in the
+    // stash don't count towards session loot'.
+    //
+    // Session start: character 'Kai' owns no runes; stash is empty of
+    //                the code we'll test.
+    // During play:   Kai picks up 2x Vex Rune (r26), moves them to
+    //                shared stash tab 3, then Save & Exits.
+    // Session end:   snapshot has 2x r26 at "stash tab 3".
+    //
+    // The Session Info pane's rune diff must surface r26 = +2. This
+    // test exercises both makeSessionStateFromSnapshot (start-state
+    // build) and the pane's inline nowStacks - startState arithmetic.
+    d2r::DashboardSnapshot startSnap;
+    startSnap.inventory.push_back(
+        makeRune("r08", "Ral Rune", "stash tab 6"));   // pre-existing
+    const auto startState = d2r::makeSessionStateFromSnapshot(startSnap);
+    REQUIRE(startState.runeStacks.at("r08") == 1);
+    REQUIRE(startState.runeStacks.count("r26") == 0);
+
+    d2r::DashboardSnapshot nowSnap;
+    // Pre-existing rune still there.
+    nowSnap.inventory.push_back(
+        makeRune("r08", "Ral Rune", "stash tab 6"));
+    // Newly-stashed runes from this session.
+    nowSnap.inventory.push_back(
+        makeRune("r26", "Vex Rune", "stash tab 3"));
+    nowSnap.inventory.push_back(
+        makeRune("r26", "Vex Rune", "stash tab 3"));
+
+    std::unordered_map<std::string, std::uint32_t> nowStacks;
+    for (const auto& it : nowSnap.inventory) {
+        if (it.code.size() == 3 && it.code[0] == 'r'
+            && it.code[1] >= '0' && it.code[1] <= '9'
+            && it.code[2] >= '0' && it.code[2] <= '9') {
+            ++nowStacks[it.code];
+        }
+    }
+    REQUIRE(nowStacks.at("r08") == 1);
+    REQUIRE(nowStacks.at("r26") == 2);
+
+    // Diff -- r08 unchanged, r26 = +2.
+    std::unordered_map<std::string, std::int32_t> deltas;
+    for (const auto& [code, now] : nowStacks) {
+        const auto it = startState.runeStacks.find(code);
+        const std::uint32_t before =
+            (it == startState.runeStacks.end()) ? 0u : it->second;
+        if (now > before) {
+            deltas[code] = static_cast<std::int32_t>(now - before);
+        }
+    }
+    REQUIRE(deltas.size() == 1);
+    REQUIRE(deltas.count("r26") == 1);
+    REQUIRE(deltas.at("r26") == 2);
 }
 
 TEST_CASE("SessionState diff: empty anchor -> everything current is 'new'",
@@ -718,4 +778,159 @@ TEST_CASE("computeSessionRunStats: character name falls back to filename stem",
     const auto stats = d2r::computeSessionRunStats(&db, cache, 0, 0);
     REQUIRE(stats.perCharacter.size() == 1);
     REQUIRE(stats.perCharacter[0].characterName == "Warlock");
+}
+
+// ---------------------------------------------------------------------------
+// End-to-end: real shared-stash fixture -> aggregate -> makeSessionState.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::filesystem::path fixturePath(const char* name) {
+    if (const char* dir = std::getenv("D2R_FIXTURE_DIR")) {
+        return std::filesystem::path(dir) / name;
+    }
+#ifdef D2R_TEST_FIXTURE_DIR
+    return std::filesystem::path(D2R_TEST_FIXTURE_DIR) / name;
+#else
+    return std::filesystem::path("../../D2R_Saves") / name;
+#endif
+}
+
+std::filesystem::path refDbFixturePath() {
+    if (const char* env = std::getenv("D2R_REFERENCE_DB")) return env;
+#ifdef D2R_TEST_REFERENCE_DB
+    return D2R_TEST_REFERENCE_DB;
+#else
+    return "reference.sqlite";
+#endif
+}
+
+d2r::RefDb& sharedFixtureDb() {
+    static d2r::RefDb db(refDbFixturePath());
+    static bool loaded = false;
+    if (!loaded) { db.loadItemTables(); loaded = true; }
+    return db;
+}
+
+} // namespace
+
+TEST_CASE("Shared-stash fixture: stash runes flow into SessionState.runeStacks",
+          "[dashboard_model][runes][stash][fixtures]") {
+    // End-to-end reproduction of the user report 'runes I store in the
+    // stash don't count towards session loot'. Reads the checked-in
+    // fixture stash file, overlays it into a DashboardSnapshot, and
+    // asserts:
+    //   * runes at 'stash tab N' locations survive the overlay,
+    //   * makeSessionStateFromSnapshot counts them as ONE entry per
+    //     instance (a stash with 2 x Thul must show r10 = 2, not 1),
+    //   * a follow-up snapshot with an extra rune produces a positive
+    //     diff (nowStacks - startState.runeStacks) via the same
+    //     arithmetic renderSessionLootPane uses.
+    const auto stashBytes = d2r::readFile(
+        fixturePath("ModernSharedStashSoftCoreV2.d2i").string());
+
+    d2r::DashboardSnapshot snap;
+    REQUIRE(d2r::overrideSharedStashFromBytes(snap, sharedFixtureDb(),
+                                                stashBytes));
+
+    // Collect stash-located runes we saw.
+    std::unordered_map<std::string, std::uint32_t> stashRuneCounts;
+    for (const auto& it : snap.inventory) {
+        if (it.location.rfind("stash tab ", 0) != 0) continue;
+        if (it.code.size() == 3 && it.code[0] == 'r'
+            && it.code[1] >= '0' && it.code[1] <= '9'
+            && it.code[2] >= '0' && it.code[2] <= '9') {
+            ++stashRuneCounts[it.code];
+        }
+    }
+    // Confirm the parser is producing per-instance rune rows: the
+    // fixture is known to hold at least one code with multiple copies.
+    // (The user asked to 'double check that you can see more than one
+    // of each rune when you count from the stash'.)
+    bool anyStackedInStash = false;
+    for (const auto& [code, count] : stashRuneCounts) {
+        if (count > 1) { anyStackedInStash = true; break; }
+    }
+    REQUIRE(anyStackedInStash);
+
+    // makeSessionStateFromSnapshot must roll up ALL rune-code instances
+    // from snap.inventory (including stash-located ones).
+    const auto state = d2r::makeSessionStateFromSnapshot(snap);
+    for (const auto& [code, count] : stashRuneCounts) {
+        REQUIRE(state.runeStacks.count(code) == 1);
+        REQUIRE(state.runeStacks.at(code) >= count);   // includes any char-side too
+    }
+
+    // Simulate 'picked up 3 x r33 (Zod) mid-session, stashed them'.
+    // startState = snap (no r33 present in fixture stash count),
+    // nowSnap   = snap + 3 x r33 at 'stash tab 3'.
+    const auto beforeZod = state.runeStacks.count("r33")
+                              ? state.runeStacks.at("r33") : 0u;
+    d2r::DashboardSnapshot nowSnap = snap;
+    for (int i = 0; i < 3; ++i) {
+        nowSnap.inventory.push_back(
+            makeRune("r33", "Zod Rune", "stash tab 3"));
+    }
+    // Recompute nowStacks the way renderSessionLootPane does.
+    std::unordered_map<std::string, std::uint32_t> nowStacks;
+    for (const auto& it : nowSnap.inventory) {
+        if (it.code.size() == 3 && it.code[0] == 'r'
+            && it.code[1] >= '0' && it.code[1] <= '9'
+            && it.code[2] >= '0' && it.code[2] <= '9') {
+            ++nowStacks[it.code];
+        }
+    }
+    REQUIRE(nowStacks.at("r33") == beforeZod + 3);
+    // Diff must equal +3.
+    const std::uint32_t startZod = state.runeStacks.count("r33")
+                                       ? state.runeStacks.at("r33") : 0u;
+    REQUIRE((nowStacks.at("r33") - startZod) == 3u);
+}
+
+TEST_CASE("Full-account buildSnapshot fixture: stash + character runes appear "
+          "with per-instance counts",
+          "[dashboard_model][runes][stash][fixtures]") {
+    // Higher-level than the previous test: walks the ENTIRE account
+    // (all .d2s + the .d2i) via buildSnapshot, then asserts that
+    // stash-located runes actually land in snap.inventory. This is
+    // the path that runs at every dashboard rebuild -- if it drops
+    // stash items on the floor, no downstream fix can rescue it.
+    const auto fixtureDir  = fixturePath("").parent_path();
+    const auto stashPath   = fixturePath("ModernSharedStashSoftCoreV2.d2i");
+    const auto snap        = d2r::buildSnapshot(sharedFixtureDb(),
+                                                 fixtureDir, stashPath);
+
+    // Count rune instances at each location kind.
+    std::size_t stashRuneInstances = 0;
+    std::size_t charRuneInstances  = 0;
+    std::unordered_map<std::string, std::uint32_t> stashByCode;
+    for (const auto& it : snap.inventory) {
+        if (it.code.size() != 3 || it.code[0] != 'r') continue;
+        if (it.code[1] < '0' || it.code[1] > '9') continue;
+        if (it.code[2] < '0' || it.code[2] > '9') continue;
+        if (it.location.rfind("stash tab ", 0) == 0) {
+            ++stashRuneInstances;
+            ++stashByCode[it.code];
+        } else {
+            ++charRuneInstances;
+        }
+    }
+    // The fixture is known to hold plenty of runes in the stash --
+    // this is the concrete assertion the user asked for: "you can
+    // see more than one of each rune when you count from the stash."
+    REQUIRE(stashRuneInstances > 0);
+    bool sawMultiInstance = false;
+    for (const auto& [code, count] : stashByCode) {
+        if (count > 1) { sawMultiInstance = true; break; }
+    }
+    REQUIRE(sawMultiInstance);
+
+    // SessionState.runeStacks must include EVERY stash rune instance;
+    // a code with N copies in stash gets a count of at least N (may
+    // be higher when a character also holds the same code).
+    const auto state = d2r::makeSessionStateFromSnapshot(snap);
+    for (const auto& [code, count] : stashByCode) {
+        REQUIRE(state.runeStacks.at(code) >= count);
+    }
 }

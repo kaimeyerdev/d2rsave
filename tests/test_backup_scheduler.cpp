@@ -362,17 +362,19 @@ TEST_CASE("BackupDb.lastChecksumFor returns NULL for tombstones and legacy",
 // isLaunchBurst: D2R.exe startup detection.
 // ---------------------------------------------------------------------------
 
-TEST_CASE("isLaunchBurst: reads-only burst with non-persisted read -> launch",
+TEST_CASE("isLaunchBurst: reads-only burst with many non-persisted reads -> "
+          "launch",
           "[backup][scheduler][launch]") {
     // Trace-shaped: D2R.exe opens + reads + closes every file. Only
     // reads (IN_ACCESS + IN_OPEN + IN_CLOSE_NOWRITE); zero writes.
-    // The burst includes .ctl / Settings.json (non-persisted); that's
-    // what discriminates D2R launch from the dashboard's own startup
-    // scan.
+    // The burst includes MULTIPLE .ctl / .key / .ma* / Settings.json
+    // files (non-persisted). Threshold is >= 3 non-persisted reads to
+    // exclude single-file gameplay events from tripping the callback.
     const std::vector<DirectoryWatcher::ChangedFile> launch = {
         mkFile("Kai.d2s",       IN_ACCESS | IN_OPEN | IN_CLOSE_NOWRITE),
         mkFile("Kai.ctl",       IN_ACCESS | IN_OPEN | IN_CLOSE_NOWRITE),
         mkFile("Kai.key",       IN_ACCESS | IN_OPEN | IN_CLOSE_NOWRITE),
+        mkFile("Kai.ma0",       IN_ACCESS | IN_OPEN | IN_CLOSE_NOWRITE),
         mkFile("Shared.d2i",    IN_ACCESS | IN_OPEN | IN_CLOSE_NOWRITE),
         mkFile("Settings.json", IN_ACCESS | IN_OPEN | IN_CLOSE_NOWRITE),
     };
@@ -391,6 +393,33 @@ TEST_CASE("isLaunchBurst: reads on .d2s + .d2i alone -> NOT a launch",
     REQUIRE_FALSE(bs::isLaunchBurst(dashboardStartup));
 }
 
+TEST_CASE("isLaunchBurst: reads on a single non-persisted file -> NOT a launch",
+          "[backup][scheduler][launch]") {
+    // False-positive regression for the user report 'stash runes I
+    // pick up don't show as new session loot'. Root cause: any
+    // reads-only burst touching a single non-persisted file (e.g.
+    // D2R reading Settings.json when opening the in-game options
+    // menu) used to trip the callback, retroactively shifting
+    // AppSession.autoStartEpoch to 'now' and folding the just-picked-
+    // up rune into startState.
+    const std::vector<DirectoryWatcher::ChangedFile> optionsMenu = {
+        mkFile("Settings.json", IN_ACCESS | IN_OPEN | IN_CLOSE_NOWRITE),
+    };
+    REQUIRE_FALSE(bs::isLaunchBurst(optionsMenu));
+}
+
+TEST_CASE("isLaunchBurst: reads on two non-persisted files -> NOT a launch",
+          "[backup][scheduler][launch]") {
+    // Two non-persisted reads is below the launch threshold too --
+    // exercises the boundary. A real D2R launch reads 5+ auxiliary
+    // files even for a 1-character account.
+    const std::vector<DirectoryWatcher::ChangedFile> twoAuxReads = {
+        mkFile("Settings.json", IN_ACCESS | IN_OPEN | IN_CLOSE_NOWRITE),
+        mkFile("Kai.ctl",       IN_ACCESS | IN_OPEN | IN_CLOSE_NOWRITE),
+    };
+    REQUIRE_FALSE(bs::isLaunchBurst(twoAuxReads));
+}
+
 TEST_CASE("isLaunchBurst: any write in the burst -> NOT a launch",
           "[backup][scheduler][launch]") {
     // Even if reads on non-persisted files are present, ANY write in
@@ -399,6 +428,7 @@ TEST_CASE("isLaunchBurst: any write in the burst -> NOT a launch",
     // callback fires on reads-only bursts.
     const std::vector<DirectoryWatcher::ChangedFile> mixed = {
         mkFile("Kai.ctl",       IN_ACCESS | IN_OPEN | IN_CLOSE_NOWRITE),
+        mkFile("Kai.key",       IN_ACCESS | IN_OPEN | IN_CLOSE_NOWRITE),
         mkFile("Settings.json", IN_ACCESS | IN_OPEN | IN_CLOSE_NOWRITE),
         mkFile("Kai.d2s",       IN_MODIFY | IN_CLOSE_WRITE),
     };
