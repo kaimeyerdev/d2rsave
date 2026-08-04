@@ -170,8 +170,15 @@ KindTier categoryToKindTier(ChronicleCategory c) {
 // and when the user quits.
 struct UiState {
     // Data snapshot (owned; watcher thread replaces via mutex).
-    std::mutex                                snapshotMutex;
+    mutable std::mutex                        snapshotMutex;
     std::shared_ptr<const DashboardSnapshot>  snapshot;
+
+    // Application-wide Session singleton. Character-agnostic; not
+    // persisted across dashboard restarts. Read by buildSession and
+    // by the Session / SessionLoot / Character panes' config menus.
+    // Guarded by `snapshotMutex` (same mutex that guards `snapshot`
+    // and `session`; the fields co-vary during rebuild).
+    AppSession                                appSession;
 
     // Lightweight point-in-time record the Session pane diffs against.
     // Rebuilt by `buildSession` on every rebuild, but cached by
@@ -181,19 +188,19 @@ struct UiState {
     // `session->startState.itemKeys.contains(...)` per current item.
     std::shared_ptr<const Session>            session;
     // Cache key: character-side start date, stash-side start date,
-    // custom start date (0 when auto), custom end date (0 when auto).
-    // If the previously-built session was for the same key, we return
-    // it as-is.
+    // effective session start epoch. `endEpoch` is deliberately NOT
+    // part of the key -- endEpoch drifts every time a new save lands,
+    // and the item-pool of the start-state is invariant under end
+    // drift. On cache hit we clone-and-patch endEpoch (see the miss
+    // path below).
     struct SessionCacheKey {
-        std::int64_t characterDate    = 0;
-        std::int64_t stashDate        = 0;
-        std::int64_t customStartEpoch = 0;
-        std::int64_t customEndEpoch   = 0;
+        std::int64_t characterDate = 0;
+        std::int64_t stashDate     = 0;
+        std::int64_t startEpoch    = 0;
         bool operator==(const SessionCacheKey& o) const noexcept {
-            return characterDate    == o.characterDate
-                && stashDate        == o.stashDate
-                && customStartEpoch == o.customStartEpoch
-                && customEndEpoch   == o.customEndEpoch;
+            return characterDate == o.characterDate
+                && stashDate     == o.stashDate
+                && startEpoch    == o.startEpoch;
         }
     };
     SessionCacheKey                           sessionCacheKey{};
@@ -690,13 +697,14 @@ Element renderSessionLootPane(const PaneConfig&        cfg,
                               const DashboardSnapshot& s,
                               const Session*           session,
                               bool                     focused) {
-    // Title reflects custom-window state:
+    // Title reflects custom-window state (read from the AppSession
+    // singleton via the Session struct):
     //   " Session Info "                       -- start + end both auto
     //   " Session Info (custom start) "        -- user-fixed start
     //   " Session Info (custom start + end) "  -- user-fixed start + end
-    // (end-alone is impossible by invariant; see PaneConfig comments.)
-    const bool startCustom = cfg.sessionCustomStartEpoch > 0;
-    const bool endCustom   = cfg.sessionCustomEndEpoch   > 0;
+    // (end-alone is impossible by invariant; see AppSession comments.)
+    const bool startCustom = session && session->startIsCustom;
+    const bool endCustom   = session && session->endIsCustom;
     std::string titleStr = " Session Info ";
     if (startCustom && endCustom) titleStr = " Session Info (custom start + end) ";
     else if (startCustom)         titleStr = " Session Info (custom start) ";
@@ -2663,7 +2671,13 @@ std::string qualityLabel(ItemQuality q) {
 
 // Build the menu appropriate to the leaf's current type. Items that only
 // make sense for chronicle panes are hidden for other types.
-std::vector<ConfigMenuItem> buildConfigMenu(const PaneConfig& c, bool canDelete) {
+//
+// `appSession` is the current AppSession snapshot (start/end epochs +
+// custom-flags); Session/SessionLoot/Character panes read it to label
+// their start/end menu rows. Passed by value to avoid holding a lock
+// across menu-build allocations.
+std::vector<ConfigMenuItem> buildConfigMenu(const PaneConfig& c, bool canDelete,
+                                             const AppSession& appSession) {
     std::vector<ConfigMenuItem> items;
     items.push_back({"type:        " + std::string(toString(c.type)),
                       ConfigMenuItem::CycleType});
@@ -2703,35 +2717,35 @@ std::vector<ConfigMenuItem> buildConfigMenu(const PaneConfig& c, bool canDelete)
         items.push_back({"clear backup-actions log", ConfigMenuItem::ClearBackupLog});
     }
     // Session-window controls live on every pane that consumes the
-    // session (Session, SessionLoot, Character). Each pane can set a
-    // custom start (item-diff base + display) and, when the start is
-    // custom, a custom end (display clamp). The session scan in
-    // runDashboard picks up the first custom values it finds across
-    // those pane types.
+    // session (Session, SessionLoot, Character). They edit the shared
+    // AppSession singleton, not per-pane config. When start is auto
+    // the label shows which auto source is currently effective
+    // ("now" until a launch fires the callback; "D2R launch" after).
     if (c.type == PaneType::Session
      || c.type == PaneType::SessionLoot) {
-        const bool startCustom = c.sessionCustomStartEpoch > 0;
+        const bool startCustom = appSession.startIsCustom();
         if (startCustom) {
             items.push_back({
-                "start: custom @ " + formatWallDateTime(c.sessionCustomStartEpoch)
+                "start: custom @ " + formatWallDateTime(appSession.startEpoch())
                     + "  --  [type any time...]",
                 ConfigMenuItem::SetSessionStart});
         } else {
             items.push_back({
-                "start: auto (D2R launch)  --  [type any time...]",
+                "start: auto @ " + formatWallDateTime(appSession.startEpoch())
+                    + "  --  [type any time...]",
                 ConfigMenuItem::SetSessionStart});
         }
         // End control only surfaces when start is custom (invariant:
         // custom end requires custom start).
         if (startCustom) {
-            if (c.sessionCustomEndEpoch > 0) {
+            if (appSession.endIsCustom()) {
                 items.push_back({
-                    "end:   custom @ " + formatWallDateTime(c.sessionCustomEndEpoch)
+                    "end:   custom @ " + formatWallDateTime(appSession.endEpoch())
                         + "  --  [type any time...]",
                     ConfigMenuItem::SetSessionEnd});
             } else {
                 items.push_back({
-                    "end:   auto (live)  --  [type any time...]",
+                    "end:   auto (last save)  --  [type any time...]",
                     ConfigMenuItem::SetSessionEnd});
             }
         }
@@ -2785,7 +2799,15 @@ std::vector<ConfigMenuItem> buildConfigMenu(const PaneConfig& c, bool canDelete)
 }
 
 Element renderConfigMenu(const UiState& ui, const PaneConfig& c, bool canDelete) {
-    const auto items = buildConfigMenu(c, canDelete);
+    // Snapshot the AppSession under the mutex before building menu
+    // labels (the launch-burst callback can mutate it from the watcher
+    // thread; snapshotMutex is `mutable`).
+    AppSession appSessionCopy;
+    {
+        std::lock_guard g(ui.snapshotMutex);
+        appSessionCopy = ui.appSession;
+    }
+    const auto items = buildConfigMenu(c, canDelete, appSessionCopy);
     const int cursor = std::clamp(ui.configMenu, 0, (int)items.size() - 1);
 
     Elements rows;
@@ -2911,7 +2933,7 @@ Element renderPane(PaneNode& node, const UiState& ui,
             break;
         case PaneType::Session:
             leafEl = renderSessionLeaf(s, ui.session.get(), focused,
-                                        node.config.sessionCustomStartEpoch > 0);
+                                        ui.session && ui.session->startIsCustom);
             break;
         case PaneType::Blank:
             leafEl = renderBlankLeaf(focused);
@@ -2920,7 +2942,7 @@ Element renderPane(PaneNode& node, const UiState& ui,
             leafEl = renderCharacterPane(node.config, s,
                                           ui.session.get(),
                                           ui.fileCache, focused,
-                                          node.config.sessionCustomStartEpoch > 0);
+                                          ui.session && ui.session->startIsCustom);
             break;
         case PaneType::SessionLoot:
             leafEl = renderSessionLootPane(node.config, s,
@@ -3218,39 +3240,48 @@ int runDashboard(const std::filesystem::path& savePath,
     ui.backupScheduler = backupScheduler.get();
 #endif
 
-    // Build a session anchor for the current play session. A session
-    // ENDS with an S&E backup; its start is the first save (autosave or
-    // startup) captured after the previous session's S&E. In auto mode
-    // the anchor rides that start-of-session point; the diff therefore
-    // shows everything the player has done since they last logged in.
+    // Build a Session snapshot for the pane renderers. Reads the
+    // effective start/end epoch from `ui.appSession` (character-
+    // agnostic singleton). The start-state is the per-file overlay
+    // of the account at `startEpoch`; the end side is always the
+    // live snapshot (`endEpoch` only bounds the DISPLAYED window).
     //
-    // Returns a lightweight Session (window epochs + pre-computed
-    // start-state item keys, rune stacks, and character stats) rather
-    // than a shadow DashboardSnapshot -- the renderer only needs those
-    // fields, and the small footprint makes caching cheap enough to
-    // serve rapid autosave bursts without any byte parsing after the
-    // first miss.
-    //
-    // When `customStartEpoch` is set, the start represents a user-
-    // fixed moment in time and the start-state becomes the account
-    // state at that moment: for every file (character saves + the
-    // shared stash) the start-state pulls the newest backup with
-    // date <= that moment. Files with no backup at/before it didn't
-    // exist yet at start time and contribute nothing. This makes an
-    // early custom start -- one that predates every save -- produce
-    // an empty start-state, so every currently-owned item counts as
-    // "new since the session started".
+    // Uniform per-file semantic: every file (active player, other
+    // characters, shared stash) contributes its state at
+    // `startEpoch`. A file with no backup at/before that date
+    // didn't exist yet at session start and contributes nothing --
+    // its current items get stripped from `temp` so they correctly
+    // count as "new" now.
     auto buildSession =
-        [&](const std::shared_ptr<const DashboardSnapshot>& current,
-            std::optional<std::int64_t>                     customStartEpoch = std::nullopt,
-            std::optional<std::int64_t>                     customEndEpoch   = std::nullopt)
+        [&](const std::shared_ptr<const DashboardSnapshot>& current)
         -> std::shared_ptr<const Session> {
+        // Snapshot the session-window inputs under the mutex. `endEpoch`
+        // could momentarily be less than `startEpoch` when the user
+        // sets an inverted custom window; collapse to a zero-duration
+        // window in that case (renders as "0h 00m 00s").
+        std::int64_t startEpoch;
+        std::int64_t endEpoch;
+        bool         startIsCustom;
+        bool         endIsCustom;
+        {
+            std::lock_guard g(ui.snapshotMutex);
+            startEpoch    = ui.appSession.startEpoch();
+            endEpoch      = ui.appSession.endEpoch();
+            startIsCustom = ui.appSession.startIsCustom();
+            endIsCustom   = ui.appSession.endIsCustom();
+        }
+        if (endEpoch < startEpoch) endEpoch = startEpoch;
+
         // Fallback used when we can't build a proper session -- treats
         // the current snapshot's active player + inventory as the
-        // start-state, which produces a trivial 0-delta diff (correct:
-        // we have no historical reference).
+        // start-state (trivial 0-delta diff; correct since we have no
+        // historical reference).
         auto sessionFromCurrent = [&]() -> std::shared_ptr<const Session> {
             auto out = std::make_shared<Session>();
+            out->startEpoch    = startEpoch;
+            out->endEpoch      = endEpoch;
+            out->startIsCustom = startIsCustom;
+            out->endIsCustom   = endIsCustom;
             if (current) out->startState = makeSessionStateFromSnapshot(*current);
             return out;
         };
@@ -3260,133 +3291,42 @@ int runDashboard(const std::filesystem::path& savePath,
         const auto& filename = current->activePlayer.file;
         if (filename.empty()) return sessionFromCurrent();
 
-        // Step 1: resolve the CHARACTER-side start date (row lookup).
-        // Also compute the session's start / end epochs -- consumed by
-        // the pane's duration display. Definitions:
-        //   * Auto mode: start = boundary S&E date, end = newest backup.
-        //     When hist[0] is an S&E (just-quit case) the terminating
-        //     S&E is part of the just-ended session.
-        //   * "No S&E on record" fallback: treat the entire history
-        //     as one session -- newest to oldest.
-        //   * Custom start + no newer backups: end collapses to start
-        //     (rendered as 0h 00m 00s).
-        std::optional<BackupDb::Row>      row;
-        std::int64_t                      lookupEpoch     = 0;
-        std::int64_t                      sessionStartEpoch = 0;
-        std::int64_t                      sessionEndEpoch   = 0;
-        std::vector<BackupDb::HistoryRow> hist;
-        try { hist = backupDb->historyFor(filename, 200); }
-        catch (const std::exception&) {}
-        if (customStartEpoch) {
-            // Custom start: the epoch is a moment in time. Every file
-            // (active player, other characters, shared stash)
-            // contributes whichever backup is newest at or before it.
-            // Files with no such backup didn't exist yet at start time
-            // and contribute nothing -- a custom start before ANY save
-            // on record therefore produces an empty start-state and
-            // every currently-owned item counts as "new".
-            //
-            // Session window: start -> newest backup on record. When
-            // no backup postdates the start, End collapses to Start
-            // so the pane reads "0h 00m 00s starting at <start>"
-            // rather than a nonsensical negative duration.
-            lookupEpoch = *customStartEpoch;
-            try { row = backupDb->at(filename, *customStartEpoch); }
-            catch (const std::exception&) { row.reset(); }
-            sessionStartEpoch = *customStartEpoch;
-            sessionEndEpoch   = (!hist.empty() && hist.front().date > *customStartEpoch)
-                ? hist.front().date : *customStartEpoch;
-        } else {
-            // Auto mode: the start is the LATEST SAVE of the PREVIOUS
-            // session -- i.e., the S&E that ended it. Diff = latest save
-            // of the current session vs latest save of the previous.
-            // A session ends with an S&E, so the previous session's
-            // last save IS its terminating S&E (see BackupDb's session
-            // model documentation).
-            //
-            // Rules (hist is date DESC):
-            //   * If hist[0] is an S&E, the user just quit -- the
-            //     "current" session ended at hist[0]. Its previous
-            //     session's terminating S&E is the SECOND-newest S&E
-            //     on record, so seThreshold = 2.
-            //   * Otherwise the user is mid-session -- the previous
-            //     session's terminating S&E is the newest S&E on record,
-            //     so seThreshold = 1.
-            //   * start-state = that boundary S&E's row directly.
-            //   * Fallback: no qualifying S&E on record -> start on
-            //     the oldest known save so the diff still says something
-            //     (represents "everything since the DB started tracking
-            //     this character").
-            if (hist.empty()) return sessionFromCurrent();
-            const int seThreshold =
-                (hist.front().state == BackupDb::State::SaveAndExit) ? 2 : 1;
-            int seSeen = 0;
-            int boundaryIdx = -1;
-            for (int i = 0; i < static_cast<int>(hist.size()); ++i) {
-                if (hist[i].state == BackupDb::State::SaveAndExit) {
-                    if (++seSeen == seThreshold) { boundaryIdx = i; break; }
-                }
-            }
-            const int anchorIdx = (boundaryIdx >= 0)
-                ? boundaryIdx
-                : static_cast<int>(hist.size()) - 1;
-            const auto& pick = hist[static_cast<std::size_t>(anchorIdx)];
-            try { row = backupDb->at(filename, pick.date); }
-            catch (const std::exception&) { row.reset(); }
-            if (row) lookupEpoch = pick.date;
+        // Step 1: character-side row at the session start. Missing
+        // row (nullopt) means the active player didn't exist yet at
+        // start -- fine, step 4 strips its items from `temp`.
+        std::optional<BackupDb::Row> row;
+        try { row = backupDb->at(filename, startEpoch); }
+        catch (const std::exception&) { row.reset(); }
+        const std::int64_t characterDate =
+            (row && !row->data.empty()) ? row->date : 0;
 
-            // Session window: current session's backup range.
-            // Boundary present: hist[0..boundaryIdx-1] are strictly
-            // newer than the boundary S&E and belong to the current
-            // session. In the just-quit case (hist[0] is S&E)
-            // boundaryIdx points at the PREVIOUS session's S&E, so
-            // hist[0..boundaryIdx-1] still correctly captures the
-            // just-ended session INCLUDING its terminating S&E.
-            // No boundary: treat the entire history as the session.
-            if (boundaryIdx > 0) {
-                sessionEndEpoch   = hist.front().date;
-                sessionStartEpoch = hist[static_cast<std::size_t>(boundaryIdx - 1)].date;
-            } else if (boundaryIdx < 0 && !hist.empty()) {
-                sessionEndEpoch   = hist.front().date;
-                sessionStartEpoch = hist.back().date;
-            }
-            // boundaryIdx == 0: current session is empty (hist[0] is
-            // the previous session's S&E itself, or a just-quit with
-            // no PRIOR session). Leave both at 0 -> renders as 0.
-        }
-        // Auto mode requires a valid start row (byte-source for
-        // overrideActivePlayerFromBytes below). Custom-start mode is
-        // permitted to reach step 4 with a null row: it means the
-        // active player didn't exist at or before the start, so its
-        // items get stripped from `temp` there (empty contribution).
-        if (!customStartEpoch && (!row || row->data.empty())) return sessionFromCurrent();
-
-        // Step 2: resolve the STASH-side start date. Three-tier lookup
-        // (see the older commit log for the rationale) but here we only
-        // record the DATE + row, delaying the parse to the miss path.
+        // Step 2: stash-side row. Three-tier lookup preserved from the
+        // pre-singleton implementation:
+        //   1. Newest stash row at/before startEpoch (strict).
+        //   2. Auto-mode safety net: oldest non-empty stash on record
+        //      (so a session boundary that predates the stash's first
+        //      backup still yields a defensible start-state rather
+        //      than an empty stash).
+        //   3. Nothing -> stash cleared in step 4.
+        // Custom-start mode uses strict semantic only (tier 1 or
+        // nothing) since the user's intent is "session started at
+        // this exact instant; anything before doesn't count".
         std::optional<BackupDb::Row> stashRow;
         std::int64_t                 stashDate = 0;
         std::string                  stashFile;
         if (!stashPath.empty()) {
             stashFile = stashPath.filename().string();
             if (!stashFile.empty()) {
-                try { stashRow = backupDb->at(stashFile, lookupEpoch); }
+                try { stashRow = backupDb->at(stashFile, startEpoch); }
                 catch (const std::exception&) {}
                 if (stashRow && !stashRow->data.empty()) {
-                    stashDate = lookupEpoch;   // approx; not needed for lookup
-                } else if (!customStartEpoch) {
-                    // Auto-mode fallback: OLDEST non-empty stash row so
-                    // an S&E boundary that predates the stash's first
-                    // backup still gets a defensible start-state
-                    // (rather than an empty stash). Custom-start mode
-                    // is strict: "no stash at start" means the account
-                    // had no stash yet -> start-state stash is empty
-                    // (step 4 clears it via clearSharedStashInSnapshot).
+                    stashDate = stashRow->date;
+                } else if (!startIsCustom) {
                     stashRow.reset();
-                    std::vector<BackupDb::HistoryRow> hist;
-                    try { hist = backupDb->historyFor(stashFile, 1000); }
+                    std::vector<BackupDb::HistoryRow> stashHist;
+                    try { stashHist = backupDb->historyFor(stashFile, 1000); }
                     catch (const std::exception&) {}
-                    for (auto it = hist.rbegin(); it != hist.rend(); ++it) {
+                    for (auto it = stashHist.rbegin(); it != stashHist.rend(); ++it) {
                         if (it->state == BackupDb::State::Deleted) continue;
                         if (it->sizeBytes <= 0) continue;
                         try { stashRow = backupDb->at(stashFile, it->date); }
@@ -3401,45 +3341,27 @@ int runDashboard(const std::filesystem::path& savePath,
             }
         }
 
-        // Step 3: cache check. During autosave bursts the (character
-        // date, stash date, custom start, custom end) tuple usually
-        // stays stable across many rebuilds -- return the previously-
-        // built session without touching the parser.
-        //
-        // Custom-end clamp: if the user set a custom end epoch, clamp
-        // sessionEndEpoch to <= that value (never past it). If the
-        // custom end is BEFORE the start, both collapse to the end
-        // so the pane reads "0h 00m 00s starting at <end>".
-        if (customEndEpoch) {
-            const auto pin = *customEndEpoch;
-            if (sessionEndEpoch == 0 || sessionEndEpoch > pin) {
-                sessionEndEpoch = pin;
-            }
-            if (sessionStartEpoch > sessionEndEpoch) {
-                sessionStartEpoch = sessionEndEpoch;
-            }
-        }
-
+        // Step 3: cache check. The key excludes endEpoch because the
+        // start-state's item pool is invariant under end drift; a new
+        // save landing (which advances endEpoch) still hits the cache.
+        // We clone-and-patch endEpoch on such hits so the pane's
+        // duration display stays live during autosave bursts without
+        // paying for the deep byte-parse in the miss path.
         const UiState::SessionCacheKey key{
-            lookupEpoch,
+            characterDate,
             stashDate,
-            customStartEpoch.value_or(0),
-            customEndEpoch.value_or(0),
+            startEpoch,
         };
         if (ui.session && ui.sessionCacheKey == key) {
-            // Item-diff fields (startState.playerName/level/itemKeys)
-            // are still valid, but the session window advances every
-            // time a new autosave lands. Clone-and-patch is cheap
-            // (itemKeys uses shallow copy of the same hash buckets)
-            // and lets the timer stay live during autosave bursts
-            // without paying for the deep byte-parse in the miss path.
-            if (ui.session->startEpoch == sessionStartEpoch &&
-                ui.session->endEpoch   == sessionEndEpoch) {
+            if (ui.session->endEpoch     == endEpoch &&
+                ui.session->endIsCustom  == endIsCustom &&
+                ui.session->startIsCustom == startIsCustom) {
                 return ui.session;
             }
             auto patched = std::make_shared<Session>(*ui.session);
-            patched->startEpoch = sessionStartEpoch;
-            patched->endEpoch   = sessionEndEpoch;
+            patched->endEpoch      = endEpoch;
+            patched->startIsCustom = startIsCustom;
+            patched->endIsCustom   = endIsCustom;
             return patched;
         }
 
@@ -3451,27 +3373,14 @@ int runDashboard(const std::filesystem::path& savePath,
         // the diff, because they'd be present in `now.inventory` but
         // absent from an empty start-state.
         //
-        // Uniform per-file semantic: every file (active player, other
-        // characters, shared stash) contributes its state at
-        // `lookupEpoch`. A file with no backup at/before that date
-        // didn't exist yet at start time and contributes nothing to
-        // the start-state -- its current items get stripped from
-        // `temp` so they correctly count as "new" now. This is what
-        // makes a custom start of, say, "2026-07-01 00:00:00" produce
-        // an empty start-state when the earliest recorded backup is
-        // later, matching the user intent "session started before I
-        // had any save games; everything I own is new since then".
-        //
-        // Optimization: files whose in-file timestamp is <= lookupEpoch
+        // Optimization: files whose in-file timestamp is <= startEpoch
         // haven't been touched since the start, so their current cache
         // entry already reflects the start state -- skip the historical
         // parse entirely. Typically the vast majority of character
-        // files. The parse cost is only paid on cache misses (session-
-        // boundary crosses, custom changes), so a burst of autosaves
-        // still hits the fast path above.
+        // files.
         DashboardSnapshot temp = *current;
-        const auto lookupU32 = lookupEpoch > 0
-            ? static_cast<std::uint32_t>(lookupEpoch) : 0u;
+        const auto lookupU32 = startEpoch > 0
+            ? static_cast<std::uint32_t>(startEpoch) : 0u;
         auto stripCharacterItems = [&](const std::string& prefix) {
             temp.inventory.erase(
                 std::remove_if(temp.inventory.begin(), temp.inventory.end(),
@@ -3487,36 +3396,14 @@ int runDashboard(const std::filesystem::path& savePath,
                 continue;   // unchanged since start; current entry is correct
             }
             std::optional<BackupDb::Row> otherRow;
-            try { otherRow = backupDb->at(otherName, lookupEpoch); }
+            try { otherRow = backupDb->at(otherName, startEpoch); }
             catch (const std::exception&) {}
             if (otherRow && !otherRow->data.empty()) {
-                // Historical bytes: substitute this character's items.
-                // NOTE: this call also touches snap.activePlayer as a
-                // side-effect; that's fine because the active-player
-                // override below is the LAST one and gets the final say.
                 (void)overrideActivePlayerFromBytes(temp, db, otherRow->data, otherName);
             } else {
-                // No historical row on record: this file didn't exist
-                // at start time. Strip its current items so a fresh
-                // character (or a pre-history custom start against any
-                // file) doesn't donate its inventory to the start.
                 stripCharacterItems(otherName);
             }
         }
-
-        // Then handle the active player. Two cases:
-        //   1. Historical bytes exist -> override normally. This also
-        //      rebuilds temp.activePlayer's stats (name/class/level/
-        //      exp), giving the Character pane an accurate start for
-        //      its XP delta.
-        //   2. No historical bytes (custom start predates the active
-        //      player's first save) -> strip its items so nothing
-        //      survives from the *current copy. Leave temp.activePlayer
-        //      as-is (from the initial *current copy) so the Character
-        //      pane still renders valid stats; the XP delta will read
-        //      as "the whole current level gained" which is the honest
-        //      interpretation of setting a custom start before the
-        //      character existed.
         if (row && !row->data.empty()) {
             if (!overrideActivePlayerFromBytes(temp, db, row->data, filename)) {
                 return sessionFromCurrent();
@@ -3527,71 +3414,67 @@ int runDashboard(const std::filesystem::path& savePath,
         if (stashRow && !stashRow->data.empty()) {
             (void)overrideSharedStashFromBytes(temp, db, stashRow->data);
         } else if (!stashFile.empty()) {
-            // No historical stash backup at all -- clear the current
-            // stash out of the start-state so current-stash items don't
-            // silently zero the stash diff.
             clearSharedStashInSnapshot(temp);
         }
 
         auto out = std::make_shared<Session>();
-        out->startEpoch = sessionStartEpoch;
-        out->endEpoch   = sessionEndEpoch;
+        out->startEpoch    = startEpoch;
+        out->endEpoch      = endEpoch;
+        out->startIsCustom = startIsCustom;
+        out->endIsCustom   = endIsCustom;
         out->startState = makeSessionStateFromSnapshot(temp);
         ui.sessionCacheKey = key;
         return out;
 #else
-        (void)customStartEpoch;
-        (void)customEndEpoch;
         return sessionFromCurrent();
 #endif
     };
-
-    // Locate the first custom session start in the current layout.
-    // Session, SessionLoot, and Character panes all consume the session;
-    // priority is DFS order + first-wins across those pane types.
-    // Returns nullopt when no pane has a custom start (auto mode:
-    // buildSession picks the newest S&E).
-    auto sessionCustomStartFromLayout = [&]() -> std::optional<std::int64_t> {
-        for (const auto* leaf : flattenLeaves(ui.rootPane)) {
-            const auto t = leaf->config.type;
-            if ((t != PaneType::Session
-              && t != PaneType::SessionLoot
-              && t != PaneType::Character)) continue;
-            if (leaf->config.sessionCustomStartEpoch > 0) {
-                return leaf->config.sessionCustomStartEpoch;
+    // Refresh `autoEndEpoch` from the newest backup date on record
+    // across ALL files. Called at boot and after every rebuild(). Uses
+    // SELECT max(date) which is O(rows) linear across the file×date
+    // index -- cheap in practice. Falls back to the current wall clock
+    // when the DB is empty (fresh install) so the singleton always has
+    // a valid value.
+    auto refreshAutoEndEpoch = [&]() {
+        std::int64_t newest = 0;
+#if D2R_HAVE_INOTIFY
+        if (backupDb) {
+            sqlite3_stmt* stmt = nullptr;
+            const char* sql = "SELECT MAX(date) FROM backup";
+            if (sqlite3_prepare_v2(backupDb->raw(), sql, -1, &stmt, nullptr) == SQLITE_OK) {
+                if (sqlite3_step(stmt) == SQLITE_ROW &&
+                    sqlite3_column_type(stmt, 0) != SQLITE_NULL) {
+                    newest = sqlite3_column_int64(stmt, 0);
+                }
+                sqlite3_finalize(stmt);
             }
         }
-        return std::nullopt;
-    };
-    // Companion: first custom session end across the same pane types.
-    auto sessionCustomEndFromLayout = [&]() -> std::optional<std::int64_t> {
-        for (const auto* leaf : flattenLeaves(ui.rootPane)) {
-            const auto t = leaf->config.type;
-            if ((t != PaneType::Session
-              && t != PaneType::SessionLoot
-              && t != PaneType::Character)) continue;
-            if (leaf->config.sessionCustomEndEpoch > 0) {
-                return leaf->config.sessionCustomEndEpoch;
-            }
-        }
-        return std::nullopt;
+#endif
+        if (newest <= 0) newest = static_cast<std::int64_t>(std::time(nullptr));
+        std::lock_guard g(ui.snapshotMutex);
+        ui.appSession.autoEndEpoch = newest;
     };
 
     {
+        // Seed the session singleton. `autoStartEpoch` starts at
+        // dashboard boot -- the launch-burst callback replaces it if
+        // D2R starts while we're running. `autoEndEpoch` is refreshed
+        // from the DB immediately below.
+        {
+            std::lock_guard g(ui.snapshotMutex);
+            ui.appSession.autoStartEpoch = static_cast<std::int64_t>(std::time(nullptr));
+        }
         // Cold start: full scan populates the file cache. Every
         // subsequent rebuild uses the cache; only files inotify says
         // changed get re-parsed.
         refreshDashboardCacheFromDirectory(db, savePath, stashPath, ui.fileCache);
+        refreshAutoEndEpoch();
         auto snap = std::make_shared<DashboardSnapshot>(
             aggregateDashboardSnapshot(db, ui.fileCache));
+        auto session = buildSession(snap);
         std::lock_guard g(ui.snapshotMutex);
         ui.snapshot = std::move(snap);
-        // Anchor the session view on the start of the current-or-just-
-        // ended play session (see buildSession above); refreshed by
-        // the user from the Session pane's config menu.
-        ui.session = buildSession(ui.snapshot,
-                                   sessionCustomStartFromLayout(),
-                                   sessionCustomEndFromLayout());
+        ui.session  = std::move(session);
     }
 
     auto screen = ScreenInteractive::Fullscreen();
@@ -3610,6 +3493,18 @@ int runDashboard(const std::filesystem::path& savePath,
                     while (ui.backupLog.size() > kBackupLogCap) {
                         ui.backupLog.pop_front();
                     }
+                }
+                screen.PostEvent(Event::Custom);
+            });
+        // Launch-burst callback: shift the session's autoStartEpoch to
+        // the observed launch time. Custom overrides on the singleton
+        // are sticky (startEpoch() returns the custom value when set),
+        // so this is a no-op for users who've fixed a custom start.
+        backupScheduler->setLaunchCallback(
+            [&](std::int64_t whenUnix) {
+                {
+                    std::lock_guard<std::mutex> g(ui.snapshotMutex);
+                    ui.appSession.autoStartEpoch = whenUnix;
                 }
                 screen.PostEvent(Event::Custom);
             });
@@ -3648,15 +3543,10 @@ int runDashboard(const std::filesystem::path& savePath,
         }
         auto snap = std::make_shared<DashboardSnapshot>(
             aggregateDashboardSnapshot(db, ui.fileCache));
-        // Re-anchor the session view on every rebuild so it advances as
-        // the player starts new play sessions. A session ENDS with an
-        // S&E; the start is the first save that opened the current-
-        // or-just-ended session (see buildSession above). Without
-        // this refresh the session would go permanently stale after
-        // the first S&E of a long-running dashboard.
-        auto session = buildSession(snap,
-                                     sessionCustomStartFromLayout(),
-                                     sessionCustomEndFromLayout());
+        // Advance `autoEndEpoch` to the newest backup date on record
+        // (buildSession reads it via the singleton).
+        refreshAutoEndEpoch();
+        auto session = buildSession(snap);
         std::lock_guard g(ui.snapshotMutex);
         ui.snapshot = std::move(snap);
         ui.session  = std::move(session);
@@ -3971,19 +3861,18 @@ int runDashboard(const std::filesystem::path& savePath,
                     m.status = "error: could not parse '" + m.buffer + "'";
                     return true;
                 }
-                if (m.target) {
-                    if (m.isEnd) {
-                        m.target->config.sessionCustomEndEpoch = *parsed;
-                    } else {
-                        m.target->config.sessionCustomStartEpoch = *parsed;
-                    }
+                // Write to the AppSession singleton. `setCustomEnd`
+                // silently ignores end-without-start (invariant).
+                {
+                    std::lock_guard<std::mutex> g(ui.snapshotMutex);
+                    if (m.isEnd) ui.appSession.setCustomEnd(*parsed);
+                    else         ui.appSession.setCustomStart(*parsed);
                 }
                 ui.sessionTimeInputVisible = false;
                 m.target = nullptr;
                 m.buffer.clear();
                 m.status.clear();
                 m.isEnd = false;
-                persistLayout();
                 rebuild();
                 return true;
             }
@@ -3995,7 +3884,12 @@ int runDashboard(const std::filesystem::path& savePath,
             auto* leaf = focusedLeaf();
             if (!leaf) { ui.configMode = false; return true; }
             const bool canDelete = findParent(ui.rootPane, leaf) != nullptr;
-            const auto items = buildConfigMenu(leaf->config, canDelete);
+            AppSession appSessionCopy;
+            {
+                std::lock_guard<std::mutex> g(ui.snapshotMutex);
+                appSessionCopy = ui.appSession;
+            }
+            const auto items = buildConfigMenu(leaf->config, canDelete, appSessionCopy);
             const int n = (int)items.size();
             ui.configMenu = std::clamp(ui.configMenu, 0, std::max(0, n - 1));
 
@@ -4088,47 +3982,46 @@ int runDashboard(const std::filesystem::path& savePath,
                         break;
                     }
                     case ConfigMenuItem::ResetSession: {
-                        // Clear the pane's custom start + end so both
-                        // sides revert to auto (D2R launch heuristic /
-                        // live end), then rebuild the shared session.
-                        leaf->config.sessionCustomStartEpoch = 0;
-                        leaf->config.sessionCustomEndEpoch   = 0;
+                        // Clear the singleton's custom start + end so\n                        // both sides revert to auto. Rebuild the shared\n                        // Session on the current snapshot immediately\n                        // so panes reflect the change without waiting\n                        // for the next save event.
                         std::shared_ptr<const DashboardSnapshot> snapNow;
                         {
                             std::lock_guard<std::mutex> g(ui.snapshotMutex);
+                            ui.appSession.clearCustom();
                             snapNow = ui.snapshot;
                         }
-                        auto rebuilt = buildSession(snapNow,
-                                                     sessionCustomStartFromLayout(),
-                                                     sessionCustomEndFromLayout());
+                        auto rebuilt = buildSession(snapNow);
                         {
                             std::lock_guard<std::mutex> g(ui.snapshotMutex);
                             ui.session = std::move(rebuilt);
                         }
                         ui.configMode = false;
-                        persistLayout();
                         break;
                     }
                     case ConfigMenuItem::SetSessionStart:
                     case ConfigMenuItem::SetSessionEnd: {
                         // Open the free-form time entry modal. Enter
                         // handler parses via d2r::parseUserDateTime and
-                        // writes the resulting epoch into either
-                        // sessionCustomStartEpoch (start) or
-                        // sessionCustomEndEpoch (end); the invariant
-                        // "custom end implies custom start" is enforced
-                        // by only surfacing the End menu item when
-                        // start is already custom.
+                        // writes the resulting epoch into the
+                        // AppSession singleton (`customStartEpoch` or
+                        // `customEndEpoch`); the invariant "custom end
+                        // implies custom start" is enforced by
+                        // AppSession::setCustomEnd + only surfacing
+                        // the End menu item when start is already
+                        // custom.
                         const bool isEnd = (action == ConfigMenuItem::SetSessionEnd);
-                        ui.sessionTimeInputModal.target = leaf;
+                        ui.sessionTimeInputModal.target = nullptr;   // singleton target
                         ui.sessionTimeInputModal.isEnd  = isEnd;
                         ui.sessionTimeInputModal.status.clear();
                         // Prefill the buffer with the current custom
                         // value (if any) so tweaking a small offset is
                         // a couple of keys.
-                        const std::int64_t seed = isEnd
-                            ? leaf->config.sessionCustomEndEpoch
-                            : leaf->config.sessionCustomStartEpoch;
+                        std::int64_t seed = 0;
+                        {
+                            std::lock_guard<std::mutex> g(ui.snapshotMutex);
+                            const auto& s = ui.appSession;
+                            if (isEnd && s.customEndEpoch)      seed = *s.customEndEpoch;
+                            else if (!isEnd && s.customStartEpoch) seed = *s.customStartEpoch;
+                        }
                         if (seed > 0) {
                             ui.sessionTimeInputModal.buffer = formatWallDateTime(seed);
                         } else {

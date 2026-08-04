@@ -65,17 +65,15 @@ TEST_CASE("paneTitle produces non-empty labels for every PaneType", "[dashboard_
     }
 }
 
-TEST_CASE("Character pane round-trips characterSelection + custom start", "[dashboard_config]") {
+TEST_CASE("Character pane round-trips characterSelection", "[dashboard_config]") {
     auto n = leaf(d2r::PaneType::Character);
     n.config.characterSelection       = "Kai";
-    n.config.sessionCustomStartEpoch  = 1'700'000'000;
     n.config.paneWeight               = 2;
 
     const auto back = roundTrip(n);
     REQUIRE_FALSE(back.isSplit);
     REQUIRE(back.config.type                     == d2r::PaneType::Character);
     REQUIRE(back.config.characterSelection       == "Kai");
-    REQUIRE(back.config.sessionCustomStartEpoch  == 1'700'000'000);
     REQUIRE(back.config.paneWeight               == 2);
 }
 
@@ -85,8 +83,6 @@ TEST_CASE("Character pane defaults survive round-trip (empty = auto)", "[dashboa
     const auto back = roundTrip(leaf(d2r::PaneType::Character));
     REQUIRE(back.config.type                     == d2r::PaneType::Character);
     REQUIRE(back.config.characterSelection       == "");
-    REQUIRE(back.config.sessionCustomStartEpoch  == 0);
-    REQUIRE(back.config.sessionCustomEndEpoch    == 0);
 }
 
 TEST_CASE("SessionLoot pane round-trips runes toggle + character selection", "[dashboard_config]") {
@@ -104,42 +100,31 @@ TEST_CASE("SessionLoot pane defaults: runes on, selection empty", "[dashboard_co
     const auto back = roundTrip(leaf(d2r::PaneType::SessionLoot));
     REQUIRE(back.config.sessionLootShowRunes      == true);
     REQUIRE(back.config.characterSelection        == "");
-    REQUIRE(back.config.sessionCustomStartEpoch   == 0);
-    REQUIRE(back.config.sessionCustomEndEpoch     == 0);
 }
 
-TEST_CASE("Session custom-end round-trips on Session / SessionLoot / Character",
+TEST_CASE("Legacy session-window keys on PaneConfig JSON are silently ignored",
           "[dashboard_config]") {
-    // Each pane type that consumes the session should independently
-    // persist a custom end epoch. Non-zero values survive; zero
-    // (default) is elided by the encoder and reads back as zero. The
-    // encoder requires a custom start when a custom end is set (the
-    // config-time invariant is enforced at input; here we exercise
-    // the JSON path by setting both).
-    for (auto t : {d2r::PaneType::Session,
-                   d2r::PaneType::SessionLoot,
-                   d2r::PaneType::Character}) {
-        auto n = leaf(t);
-        n.config.sessionCustomStartEpoch = 1'750'000'000;
-        n.config.sessionCustomEndEpoch   = 1'751'000'000;
-        const auto back = roundTrip(n);
-        INFO("pane type index " << static_cast<int>(t));
-        REQUIRE(back.config.type                     == t);
-        REQUIRE(back.config.sessionCustomStartEpoch  == 1'750'000'000);
-        REQUIRE(back.config.sessionCustomEndEpoch    == 1'751'000'000);
-    }
-}
-
-TEST_CASE("Session custom epochs default to 0 across all three pane types",
-          "[dashboard_config]") {
-    for (auto t : {d2r::PaneType::Session,
-                   d2r::PaneType::SessionLoot,
-                   d2r::PaneType::Character}) {
-        const auto back = roundTrip(leaf(t));
-        INFO("pane type index " << static_cast<int>(t));
-        REQUIRE(back.config.sessionCustomStartEpoch == 0);
-        REQUIRE(back.config.sessionCustomEndEpoch   == 0);
-    }
+    // Session-window overrides used to live on PaneConfig. They now
+    // belong to the AppSession singleton (in-memory only). Loading a
+    // layout that still has the legacy keys must not crash or leak
+    // state onto PaneConfig -- the fields aren't there anymore, so
+    // the loader just drops them.
+    const std::string legacy = R"({
+        "type": "session",
+        "sessionCustomStartEpoch": 1750000000,
+        "sessionCustomEndEpoch":   1751000000,
+        "sessionAnchorPinned":     true,
+        "sessionAnchorPinnedDate": 1700000000,
+        "sessionAnchorPinnedEndDate": 1701000000
+    })";
+    const auto node = d2r::deserializePaneTree(legacy);
+    REQUIRE_FALSE(node.isSplit);
+    REQUIRE(node.config.type == d2r::PaneType::Session);
+    // Re-serialising must succeed and produce no session-window keys.
+    const auto rt = d2r::serializePaneTree(node);
+    REQUIRE(rt.find("sessionCustomStartEpoch") == std::string::npos);
+    REQUIRE(rt.find("sessionCustomEndEpoch")   == std::string::npos);
+    REQUIRE(rt.find("sessionAnchorPinned")     == std::string::npos);
 }
 
 TEST_CASE("Uber pane round-trips both option toggles", "[dashboard_config]") {

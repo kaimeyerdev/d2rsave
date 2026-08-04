@@ -84,6 +84,7 @@ public:
 
     // Fetch the latest row where date <= askUnix, or nullopt if none.
     struct Row {
+        std::int64_t                 date  = 0;   // unix seconds; the row's date column
         State                        state = State::Autosave;
         std::optional<std::uint32_t> checksum;   // NULL for tombstones / legacy
         std::vector<std::byte>       data;       // empty when state=Deleted

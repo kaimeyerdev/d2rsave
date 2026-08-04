@@ -30,9 +30,18 @@ namespace {
 // Wine) can keep the `.d2i` file open for the whole session and write to
 // it in-place, so IN_CLOSE_WRITE never fires. IN_MODIFY does. Bursty
 // writes are coalesced by the 250 ms debounce in waitForChange().
+//
+// IN_ACCESS is included so the scheduler can detect a D2R launch burst
+// (D2R.exe reads every save file at startup with OPEN + ACCESS +
+// CLOSE_NOWRITE). The isLaunchBurst() classifier looks for a burst that
+// has zero writes AND at least one read on a non-.d2s/.d2i file
+// (settings.json, .ctl, .key, .ma*, .map). Reads during gameplay are
+// extremely rare (D2R keeps state in memory) so the extra event volume
+// is negligible.
 constexpr std::uint32_t kSaveDirMask =
     IN_MODIFY | IN_CLOSE_WRITE | IN_MOVED_TO | IN_MOVED_FROM |
-    IN_CREATE | IN_DELETE | IN_DELETE_SELF | IN_MOVE_SELF;
+    IN_CREATE | IN_DELETE | IN_DELETE_SELF | IN_MOVE_SELF |
+    IN_ACCESS;
 
 // For the exe's parent we only care about creates/renames-in — that's how
 // ld / cmake atomically replaces a running binary.

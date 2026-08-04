@@ -232,19 +232,20 @@ void BackupDb::checkpointWal() noexcept {
 std::optional<BackupDb::Row>
 BackupDb::at(std::string_view filename, std::int64_t askUnix) const {
     Stmt s(db_,
-        "SELECT state, checksum, data FROM backup "
+        "SELECT date, state, checksum, data FROM backup "
         " WHERE filename = ? AND date <= ? "
         " ORDER BY date DESC LIMIT 1");
     s.bindText(1, filename);
     s.bindInt64(2, askUnix);
     if (!s.step()) return std::nullopt;
     Row row;
-    row.state = static_cast<State>(s.columnInt64(0));
-    if (!s.columnIsNull(1)) {
-        row.checksum = static_cast<std::uint32_t>(s.columnInt64(1));
-    }
+    row.date  = s.columnInt64(0);
+    row.state = static_cast<State>(s.columnInt64(1));
     if (!s.columnIsNull(2)) {
-        row.data = s.columnBlob(2);
+        row.checksum = static_cast<std::uint32_t>(s.columnInt64(2));
+    }
+    if (!s.columnIsNull(3)) {
+        row.data = s.columnBlob(3);
     }
     return row;
 }

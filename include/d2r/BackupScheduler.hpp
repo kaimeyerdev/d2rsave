@@ -64,6 +64,14 @@ public:
                                               BackupDb::State  state)>;
     void setInsertCallback(InsertCallback cb) { onInsert_ = std::move(cb); }
 
+    // Fires when a burst matches `isLaunchBurst` (D2R.exe launch
+    // pattern). The dashboard uses this to update the AppSession
+    // singleton's `autoStartEpoch` without recording anything to the
+    // BackupDb -- launches are observational, not persisted. Runs on
+    // the watcher thread; passing an empty function detaches.
+    using LaunchCallback = std::function<void(std::int64_t whenUnix)>;
+    void setLaunchCallback(LaunchCallback cb) { onLaunch_ = std::move(cb); }
+
 private:
     void writeFileAsState(const std::filesystem::path& path,
                           BackupDb::State              state,
@@ -74,6 +82,7 @@ private:
     std::filesystem::path  savesDir_;
     RetentionConfig        retention_;
     InsertCallback         onInsert_;
+    LaunchCallback         onLaunch_;
 };
 
 // Helpers exposed for testing.
@@ -90,6 +99,21 @@ namespace backup_scheduler_detail {
 // should be applied to every persisted file. Deletes are handled at a
 // higher level and don't feed this function.
 [[nodiscard]] BackupDb::State classifyBurst(
+    std::span<const DirectoryWatcher::ChangedFile>);
+
+// True iff `files` looks like a D2R.exe launch burst.
+//
+// Signature (see docs/session-logic.md + the analysis in
+// /memories/session/auto-modes-plan.md):
+//   * Zero writes across the burst (no IN_CLOSE_WRITE / IN_MODIFY /
+//     IN_MOVED_TO / IN_CREATE on any file).
+//   * At least one file read where the file's extension is NOT
+//     `.d2s` and NOT `.d2i`. Concretely: any `.ctl`, `.key`, `.ma*`,
+//     `.map`, or `Settings.json`.
+// The second clause is what discriminates D2R launch from the
+// dashboard's own `takeStartupSnapshot` (which only reads `.d2s` /
+// `.d2i` per `isPersistedFile`) -- see docs/session-logic.md.
+[[nodiscard]] bool isLaunchBurst(
     std::span<const DirectoryWatcher::ChangedFile>);
 
 // Extract Character.timestamp (unix seconds) from the .d2s header. Returns

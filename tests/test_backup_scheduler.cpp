@@ -357,3 +357,56 @@ TEST_CASE("BackupDb.lastChecksumFor returns NULL for tombstones and legacy",
     db.insertTombstone("Kai.d2s", 2000);
     REQUIRE_FALSE(db.lastChecksumFor("Kai.d2s").has_value());
 }
+
+// ---------------------------------------------------------------------------
+// isLaunchBurst: D2R.exe startup detection.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("isLaunchBurst: reads-only burst with non-persisted read -> launch",
+          "[backup][scheduler][launch]") {
+    // Trace-shaped: D2R.exe opens + reads + closes every file. Only
+    // reads (IN_ACCESS + IN_OPEN + IN_CLOSE_NOWRITE); zero writes.
+    // The burst includes .ctl / Settings.json (non-persisted); that's
+    // what discriminates D2R launch from the dashboard's own startup
+    // scan.
+    const std::vector<DirectoryWatcher::ChangedFile> launch = {
+        mkFile("Kai.d2s",       IN_ACCESS | IN_OPEN | IN_CLOSE_NOWRITE),
+        mkFile("Kai.ctl",       IN_ACCESS | IN_OPEN | IN_CLOSE_NOWRITE),
+        mkFile("Kai.key",       IN_ACCESS | IN_OPEN | IN_CLOSE_NOWRITE),
+        mkFile("Shared.d2i",    IN_ACCESS | IN_OPEN | IN_CLOSE_NOWRITE),
+        mkFile("Settings.json", IN_ACCESS | IN_OPEN | IN_CLOSE_NOWRITE),
+    };
+    REQUIRE(bs::isLaunchBurst(launch));
+}
+
+TEST_CASE("isLaunchBurst: reads on .d2s + .d2i alone -> NOT a launch",
+          "[backup][scheduler][launch]") {
+    // Dashboard-startup shape: takeStartupSnapshot reads every .d2s
+    // and .d2i but nothing else. Must not be classified as a launch.
+    const std::vector<DirectoryWatcher::ChangedFile> dashboardStartup = {
+        mkFile("Kai.d2s",       IN_ACCESS | IN_OPEN | IN_CLOSE_NOWRITE),
+        mkFile("Barbarian.d2s", IN_ACCESS | IN_OPEN | IN_CLOSE_NOWRITE),
+        mkFile("Shared.d2i",    IN_ACCESS | IN_OPEN | IN_CLOSE_NOWRITE),
+    };
+    REQUIRE_FALSE(bs::isLaunchBurst(dashboardStartup));
+}
+
+TEST_CASE("isLaunchBurst: any write in the burst -> NOT a launch",
+          "[backup][scheduler][launch]") {
+    // Even if reads on non-persisted files are present, ANY write in
+    // the burst disqualifies. Bursts that mix reads + a Save & Exit
+    // must still classify as SaveAndExit via classifyBurst; the launch
+    // callback fires on reads-only bursts.
+    const std::vector<DirectoryWatcher::ChangedFile> mixed = {
+        mkFile("Kai.ctl",       IN_ACCESS | IN_OPEN | IN_CLOSE_NOWRITE),
+        mkFile("Settings.json", IN_ACCESS | IN_OPEN | IN_CLOSE_NOWRITE),
+        mkFile("Kai.d2s",       IN_MODIFY | IN_CLOSE_WRITE),
+    };
+    REQUIRE_FALSE(bs::isLaunchBurst(mixed));
+}
+
+TEST_CASE("isLaunchBurst: empty burst -> false",
+          "[backup][scheduler][launch]") {
+    const std::vector<DirectoryWatcher::ChangedFile> empty;
+    REQUIRE_FALSE(bs::isLaunchBurst(empty));
+}

@@ -143,6 +143,25 @@ std::uint32_t computeFileChecksum(std::string_view name,
     return crc32Ieee(bytes);
 }
 
+bool isLaunchBurst(
+    std::span<const DirectoryWatcher::ChangedFile> files) {
+    // The launch signature is "reads-only burst with at least one read
+    // on a non-.d2s/.d2i file". See BackupScheduler.hpp + the analysis
+    // in memories for the derivation.
+    constexpr std::uint32_t kWriteBits =
+        IN_CLOSE_WRITE | IN_MODIFY | IN_MOVED_TO | IN_CREATE;
+    constexpr std::uint32_t kReadBits =
+        IN_ACCESS | IN_OPEN | IN_CLOSE_NOWRITE;
+    bool sawNonPersistedRead = false;
+    for (const auto& f : files) {
+        if (f.name.empty()) continue;   // ISDIR-only rows carry an empty name
+        if ((f.mask & kWriteBits) != 0) return false;
+        if ((f.mask & kReadBits)  == 0) continue;
+        if (!isPersistedFile(f.name)) sawNonPersistedRead = true;
+    }
+    return sawNonPersistedRead;
+}
+
 } // namespace backup_scheduler_detail
 
 // ---------------------------------------------------------------------------
@@ -236,6 +255,19 @@ void BackupScheduler::handleWatcherEvents(
     std::span<const DirectoryWatcher::ChangedFile> files) {
     if (files.empty()) return;
     const auto now = nowUnix();
+
+    // Launch-burst callback fires independently of the write-classifier
+    // tier. It's an observational signal; we don't record anything to
+    // the DB. A burst can only be EITHER a launch burst (reads only,
+    // non-persisted read present) OR contain writes -- the isLaunchBurst
+    // predicate excludes bursts with any write bit set, so writes still
+    // reach classifyBurst below via the normal path.
+    if (onLaunch_ && backup_scheduler_detail::isLaunchBurst(files)) {
+        try { onLaunch_(now); }
+        catch (const std::exception&) {}
+        return;   // reads-only burst: nothing to persist.
+    }
+
     const auto burstState = backup_scheduler_detail::classifyBurst(files);
 
     for (const auto& f : files) {

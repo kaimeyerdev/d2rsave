@@ -328,20 +328,10 @@ nlohmann::json toJson(const PaneNode& n) {
         j["backupViewMode"]     = std::string(toString(c.backupViewMode));
         j["selectedBackupFile"] = c.selectedBackupFile;
     }
-    if (c.type == PaneType::Session
-     || c.type == PaneType::Character
-     || c.type == PaneType::SessionLoot) {
-        // Session window overrides. Zero = auto. Only emit non-zero
-        // values to keep stored JSON tidy for the common auto/auto case.
-        // Invariant: custom end implies custom start (loader clears end
-        // when start is auto).
-        if (c.sessionCustomStartEpoch > 0) {
-            j["sessionCustomStartEpoch"] = c.sessionCustomStartEpoch;
-        }
-        if (c.sessionCustomEndEpoch > 0) {
-            j["sessionCustomEndEpoch"] = c.sessionCustomEndEpoch;
-        }
-    }
+    // NOTE: session-window overrides moved from PaneConfig to the
+    // AppSession singleton (in-memory only). We no longer emit
+    // sessionCustomStartEpoch / sessionCustomEndEpoch; any pre-
+    // existing keys in a loaded layout are silently dropped.
     if (c.type == PaneType::Character
      || c.type == PaneType::SessionLoot) {
         j["characterSelection"] = c.characterSelection;
@@ -402,33 +392,9 @@ PaneNode fromJson(const nlohmann::json& j) {
             n.config.selectedBackupFile = j.value(
                 "selectedBackupFile", std::string());
         }
-        if (n.config.type == PaneType::Session
-         || n.config.type == PaneType::Character
-         || n.config.type == PaneType::SessionLoot) {
-            // Preferred fields (post-simplification).
-            n.config.sessionCustomStartEpoch = j.value(
-                "sessionCustomStartEpoch", std::int64_t{0});
-            n.config.sessionCustomEndEpoch = j.value(
-                "sessionCustomEndEpoch", std::int64_t{0});
-            // Legacy fields (pre-simplification anchor-pin model). Only
-            // read when the preferred fields are absent, so that once a
-            // layout is re-saved the migration path drops away cleanly.
-            if (n.config.sessionCustomStartEpoch == 0
-             && j.value("sessionAnchorPinned", false)
-             && j.contains("sessionAnchorPinnedDate")) {
-                n.config.sessionCustomStartEpoch = j.value(
-                    "sessionAnchorPinnedDate", std::int64_t{0});
-            }
-            if (n.config.sessionCustomEndEpoch == 0
-             && j.contains("sessionAnchorPinnedEndDate")) {
-                n.config.sessionCustomEndEpoch = j.value(
-                    "sessionAnchorPinnedEndDate", std::int64_t{0});
-            }
-            // Enforce invariant: custom end only valid with custom start.
-            if (n.config.sessionCustomStartEpoch == 0) {
-                n.config.sessionCustomEndEpoch = 0;
-            }
-        }
+        // Session-window overrides no longer live on PaneConfig; any
+        // pre-existing sessionCustomStartEpoch / sessionCustomEndEpoch
+        // / legacy sessionAnchor* keys are silently dropped on load.
         if (n.config.type == PaneType::Character
          || n.config.type == PaneType::SessionLoot) {
             n.config.characterSelection = j.value(

@@ -400,10 +400,67 @@ struct SessionState {
 // `endEpoch` only bounds what the pane DISPLAYS (start/end timestamps,
 // elapsed duration). Auto-end sessions set `endEpoch` to "now"; user-
 // fixed end sessions clamp `endEpoch` to a past instant.
+//
+// `startIsCustom` / `endIsCustom` mirror the singleton
+// `AppSession::startIsCustom()` at build time so pane renderers can
+// vary their titles without needing to read the singleton themselves.
 struct Session {
-    std::int64_t startEpoch = 0;
-    std::int64_t endEpoch   = 0;
+    std::int64_t startEpoch    = 0;
+    std::int64_t endEpoch      = 0;
+    bool         startIsCustom = false;
+    bool         endIsCustom   = false;
     SessionState startState;
+};
+
+// AppSession: the application-wide session singleton. Character-
+// agnostic; not persisted across dashboard restarts. Both endpoints
+// have an "auto" default and a nullable user override.
+//
+// Semantics:
+//   * `autoStartEpoch` seeds at dashboard-boot wall-clock time. When a
+//     D2R launch burst is detected in-flight, the launch callback
+//     replaces it with the burst's timestamp.
+//   * `autoEndEpoch` tracks the newest backup date across all files;
+//     the ftxui layer refreshes it after each `rebuild()`.
+//   * `customStartEpoch` / `customEndEpoch` are user-set overrides.
+//     nullopt = auto. Sticky: not cleared by later auto-detection.
+//   * Invariant: `customEndEpoch.has_value()` implies
+//     `customStartEpoch.has_value()`. `clearCustom()` and
+//     `setCustomStart(nullopt)` enforce it.
+struct AppSession {
+    std::optional<std::int64_t> customStartEpoch;
+    std::optional<std::int64_t> customEndEpoch;
+    std::int64_t                autoStartEpoch = 0;
+    std::int64_t                autoEndEpoch   = 0;
+
+    [[nodiscard]] std::int64_t startEpoch() const noexcept {
+        return customStartEpoch.value_or(autoStartEpoch);
+    }
+    [[nodiscard]] std::int64_t endEpoch() const noexcept {
+        return customEndEpoch.value_or(autoEndEpoch);
+    }
+    // True iff the user has fixed the start (either directly or via a
+    // now-cleared invariant chain).
+    [[nodiscard]] bool startIsCustom() const noexcept {
+        return customStartEpoch.has_value();
+    }
+    [[nodiscard]] bool endIsCustom() const noexcept {
+        return customEndEpoch.has_value();
+    }
+    void clearCustom() noexcept {
+        customStartEpoch.reset();
+        customEndEpoch.reset();
+    }
+    // Setting a custom end without a custom start silently clears the
+    // end to preserve the invariant.
+    void setCustomEnd(std::optional<std::int64_t> v) noexcept {
+        customEndEpoch = customStartEpoch.has_value() ? v : std::nullopt;
+    }
+    // Clearing a custom start also clears the end.
+    void setCustomStart(std::optional<std::int64_t> v) noexcept {
+        customStartEpoch = v;
+        if (!customStartEpoch.has_value()) customEndEpoch.reset();
+    }
 };
 
 // Extract a SessionState from a fully-populated DashboardSnapshot.
