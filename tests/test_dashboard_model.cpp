@@ -11,7 +11,15 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <filesystem>
+#include <span>
 #include <string>
+#include <system_error>
+
+#include <unistd.h>
 
 namespace {
 
@@ -435,4 +443,215 @@ TEST_CASE("groupRunsForFile: Deleted and Startup rows are non-run signals",
     REQUIRE(runs[0].autosaveCount == 3);
     REQUIRE(runs[0].autosaveDates ==
             std::vector<std::int64_t>{200, 300, 400});
+}
+
+// ---------------------------------------------------------------------------
+// runDurationSecs.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("runDurationSecs: closed run uses first-autosave -> endEpoch",
+          "[dashboard_model][runs]") {
+    d2r::Run r;
+    r.characterFile = "Kai.d2s";
+    r.startEpoch    = 100;
+    r.endEpoch      = 500;
+    r.inProgress    = false;
+    r.autosaveCount = 3;
+    r.autosaveDates = {200, 300, 400};
+    REQUIRE(d2r::runDurationSecs(r) == 300);   // 500 - 200
+}
+
+TEST_CASE("runDurationSecs: in-progress run uses first->last autosave",
+          "[dashboard_model][runs]") {
+    d2r::Run r;
+    r.characterFile = "Kai.d2s";
+    r.startEpoch    = 100;
+    r.endEpoch      = 0;
+    r.inProgress    = true;
+    r.autosaveCount = 3;
+    r.autosaveDates = {200, 300, 400};
+    REQUIRE(d2r::runDurationSecs(r) == 200);   // 400 - 200
+}
+
+TEST_CASE("runDurationSecs: bare SaveAndExit with no autosaves -> 0",
+          "[dashboard_model][runs]") {
+    d2r::Run r;
+    r.characterFile = "Kai.d2s";
+    r.startEpoch    = 400;
+    r.endEpoch      = 500;
+    r.inProgress    = false;
+    r.autosaveCount = 0;
+    r.autosaveDates = {};
+    REQUIRE(d2r::runDurationSecs(r) == 0);
+}
+
+// ---------------------------------------------------------------------------
+// computeSessionRunStats.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Local scratch dir for backup DB tests.
+struct RunStatsScratch {
+    std::filesystem::path path;
+    RunStatsScratch() {
+        static std::atomic<int> counter{0};
+        const auto pid = static_cast<long>(::getpid());
+        const auto n   = counter.fetch_add(1, std::memory_order_relaxed);
+        const auto ts  = std::chrono::system_clock::now().time_since_epoch().count();
+        char name[128];
+        std::snprintf(name, sizeof(name), "d2rsave-runstats-%ld-%ld-%d",
+                      pid, static_cast<long>(ts), n);
+        path = std::filesystem::temp_directory_path() / name;
+        std::filesystem::create_directories(path);
+    }
+    ~RunStatsScratch() {
+        std::error_code ec;
+        std::filesystem::remove_all(path, ec);
+    }
+};
+
+// Insert a row with the right shape for grouping (no data / checksum
+// needed -- computeSessionRunStats only inspects date + state).
+void insertRow(d2r::BackupDb& db, std::string_view filename,
+                std::int64_t date, d2r::BackupDb::State st) {
+    const std::string tiny = "x";
+    db.insert(filename, date, st, /*checksum=*/0u,
+              std::span<const std::byte>{
+                  reinterpret_cast<const std::byte*>(tiny.data()),
+                  tiny.size()});
+}
+
+// Add a fake d2s cache entry with a character name.
+void addCacheEntry(d2r::DashboardFileCache& cache,
+                    const std::string& filename,
+                    const std::string& characterName) {
+    d2r::DashboardFileCache::D2sEntry entry;
+    entry.character.name = characterName;
+    cache.d2s.emplace(filename, std::move(entry));
+}
+
+} // namespace
+
+TEST_CASE("computeSessionRunStats: nullptr backupDb -> empty stats",
+          "[dashboard_model][runs][stats]") {
+    d2r::DashboardFileCache cache;
+    addCacheEntry(cache, "Kai.d2s", "Kai");
+    const auto stats = d2r::computeSessionRunStats(nullptr, cache, 0, 0);
+    REQUIRE(stats.perCharacter.empty());
+    REQUIRE(stats.totalRuns == 0);
+    REQUIRE_FALSE(stats.anyInProgress);
+    REQUIRE(stats.totalSecs == 0);
+}
+
+TEST_CASE("computeSessionRunStats: aggregates runs across two characters",
+          "[dashboard_model][runs][stats]") {
+    RunStatsScratch sc;
+    d2r::BackupDb db(sc.path / "backups.sqlite");
+
+    // Kai: two closed runs.
+    //  Run 1: autosaves at 100, 200, SaveAndExit at 300 -> duration 200.
+    //  Run 2: autosaves at 400, 500, SaveAndExit at 600 -> duration 200.
+    insertRow(db, "Kai.d2s", 100, d2r::BackupDb::State::Autosave);
+    insertRow(db, "Kai.d2s", 200, d2r::BackupDb::State::Autosave);
+    insertRow(db, "Kai.d2s", 300, d2r::BackupDb::State::SaveAndExit);
+    insertRow(db, "Kai.d2s", 400, d2r::BackupDb::State::Autosave);
+    insertRow(db, "Kai.d2s", 500, d2r::BackupDb::State::Autosave);
+    insertRow(db, "Kai.d2s", 600, d2r::BackupDb::State::SaveAndExit);
+    // Barbarian: one closed run + trailing in-progress.
+    //  Run 1: autosaves at 150, 250, SaveAndExit at 350 -> duration 200.
+    //  Run 2 in progress: autosaves at 450, 550 -> duration 100.
+    insertRow(db, "Barbarian.d2s", 150, d2r::BackupDb::State::Autosave);
+    insertRow(db, "Barbarian.d2s", 250, d2r::BackupDb::State::Autosave);
+    insertRow(db, "Barbarian.d2s", 350, d2r::BackupDb::State::SaveAndExit);
+    insertRow(db, "Barbarian.d2s", 450, d2r::BackupDb::State::Autosave);
+    insertRow(db, "Barbarian.d2s", 550, d2r::BackupDb::State::Autosave);
+
+    d2r::DashboardFileCache cache;
+    addCacheEntry(cache, "Kai.d2s",       "Kai");
+    addCacheEntry(cache, "Barbarian.d2s", "Karsh");
+
+    const auto stats = d2r::computeSessionRunStats(&db, cache,
+                                                     /*sessionStart=*/0,
+                                                     /*sessionEnd=*/0);
+    REQUIRE(stats.perCharacter.size() == 2);
+    REQUIRE(stats.totalRuns == 3);      // 2 + 1 closed
+    REQUIRE(stats.anyInProgress);
+    REQUIRE(stats.totalSecs == 700);    // 200+200 + 200 + 100
+
+    // Order: descending by accumulatedSecs (Kai 400 > Karsh 300).
+    REQUIRE(stats.perCharacter[0].characterName    == "Kai");
+    REQUIRE(stats.perCharacter[0].runCount         == 2);
+    REQUIRE_FALSE(stats.perCharacter[0].hasInProgress);
+    REQUIRE(stats.perCharacter[0].accumulatedSecs  == 400);
+
+    REQUIRE(stats.perCharacter[1].characterName    == "Karsh");
+    REQUIRE(stats.perCharacter[1].runCount         == 1);
+    REQUIRE(stats.perCharacter[1].hasInProgress);
+    REQUIRE(stats.perCharacter[1].accumulatedSecs  == 300);
+}
+
+TEST_CASE("computeSessionRunStats: sessionStart clips out earlier runs",
+          "[dashboard_model][runs][stats]") {
+    RunStatsScratch sc;
+    d2r::BackupDb db(sc.path / "backups.sqlite");
+    // Run 1: dates 100..300 (before session).
+    // Run 2: dates 400..600 (in session; sessionStart = 350).
+    insertRow(db, "Kai.d2s", 100, d2r::BackupDb::State::Autosave);
+    insertRow(db, "Kai.d2s", 200, d2r::BackupDb::State::Autosave);
+    insertRow(db, "Kai.d2s", 300, d2r::BackupDb::State::SaveAndExit);
+    insertRow(db, "Kai.d2s", 400, d2r::BackupDb::State::Autosave);
+    insertRow(db, "Kai.d2s", 500, d2r::BackupDb::State::Autosave);
+    insertRow(db, "Kai.d2s", 600, d2r::BackupDb::State::SaveAndExit);
+
+    d2r::DashboardFileCache cache;
+    addCacheEntry(cache, "Kai.d2s", "Kai");
+
+    const auto stats = d2r::computeSessionRunStats(&db, cache,
+                                                     /*sessionStart=*/350,
+                                                     /*sessionEnd=*/0);
+    REQUIRE(stats.perCharacter.size() == 1);
+    REQUIRE(stats.totalRuns == 1);
+    REQUIRE(stats.totalSecs == 200);   // 600 - 400
+}
+
+TEST_CASE("computeSessionRunStats: sessionEnd clips out later runs",
+          "[dashboard_model][runs][stats]") {
+    RunStatsScratch sc;
+    d2r::BackupDb db(sc.path / "backups.sqlite");
+    // Run 1 (in-window): dates 100..300, SaveAndExit at 300.
+    // Run 2 (past-end): dates 400..600, SaveAndExit at 600.
+    insertRow(db, "Kai.d2s", 100, d2r::BackupDb::State::Autosave);
+    insertRow(db, "Kai.d2s", 200, d2r::BackupDb::State::Autosave);
+    insertRow(db, "Kai.d2s", 300, d2r::BackupDb::State::SaveAndExit);
+    insertRow(db, "Kai.d2s", 400, d2r::BackupDb::State::Autosave);
+    insertRow(db, "Kai.d2s", 500, d2r::BackupDb::State::Autosave);
+    insertRow(db, "Kai.d2s", 600, d2r::BackupDb::State::SaveAndExit);
+
+    d2r::DashboardFileCache cache;
+    addCacheEntry(cache, "Kai.d2s", "Kai");
+
+    // sessionEnd = 350 excludes Run 2 (whose SaveAndExit is 600 > 350).
+    const auto stats = d2r::computeSessionRunStats(&db, cache,
+                                                     /*sessionStart=*/0,
+                                                     /*sessionEnd=*/350);
+    REQUIRE(stats.totalRuns == 1);
+    REQUIRE(stats.totalSecs == 200);   // 300 - 100
+}
+
+TEST_CASE("computeSessionRunStats: character name falls back to filename stem",
+          "[dashboard_model][runs][stats]") {
+    RunStatsScratch sc;
+    d2r::BackupDb db(sc.path / "backups.sqlite");
+    insertRow(db, "Warlock.d2s", 100, d2r::BackupDb::State::Autosave);
+    insertRow(db, "Warlock.d2s", 200, d2r::BackupDb::State::SaveAndExit);
+
+    d2r::DashboardFileCache cache;
+    // Cache entry with EMPTY character name -> should fall back to
+    // "Warlock" (stripping the ".d2s" suffix).
+    addCacheEntry(cache, "Warlock.d2s", "");
+
+    const auto stats = d2r::computeSessionRunStats(&db, cache, 0, 0);
+    REQUIRE(stats.perCharacter.size() == 1);
+    REQUIRE(stats.perCharacter[0].characterName == "Warlock");
 }

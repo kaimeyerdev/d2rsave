@@ -524,4 +524,48 @@ struct Run {
     std::span<const BackupDb::HistoryRow>       historyRows,
     std::int64_t                                sessionStart);
 
+// Wall-clock duration of `run` in seconds, using the same rule as the
+// Backups pane's collapsed-view VRow: the run spans its first-autosave
+// date through either its SaveAndExit (closed) or its last-autosave
+// date (in-progress). A run with zero autosaves returns 0 (a bare
+// SaveAndExit with no play activity captured).
+[[nodiscard]] std::int64_t runDurationSecs(const Run& run) noexcept;
+
+// Aggregated per-character run statistics for the current Session.
+// Populated by `computeSessionRunStats` and threaded onto the Session
+// singleton so pane renderers can display it without needing direct
+// access to the backup DB.
+struct SessionRunStats {
+    struct PerCharacter {
+        std::string  characterFile;      // "Kai.d2s"
+        std::string  characterName;      // parsed character name, else filename stem
+        std::int32_t runCount        = 0; // count of closed runs (SaveAndExit-bounded)
+        bool         hasInProgress   = false;
+        std::int64_t accumulatedSecs = 0; // sum of runDurationSecs across ALL that character's runs
+    };
+    // Sorted by `accumulatedSecs` descending, then `characterName`
+    // ascending for ties.
+    std::vector<PerCharacter> perCharacter;
+    std::int32_t totalRuns      = 0;      // sum of PerCharacter.runCount
+    bool         anyInProgress  = false;
+    std::int64_t totalSecs      = 0;      // sum of PerCharacter.accumulatedSecs
+};
+
+// Iterate every `.d2s` in `cache.d2s`, query per-file history from
+// `backupDb`, group into Runs via `groupRunsForFile(name, hist,
+// sessionStart)`, and aggregate. Runs whose closing SaveAndExit date
+// is > `sessionEnd` are excluded so the stats honor the same
+// [start, end] window the rest of the Session Info pane does; an
+// in-progress run whose oldest autosave is > `sessionEnd` is
+// excluded too. `sessionEnd == 0` disables the upper clip.
+//
+// `backupDb == nullptr` returns an empty stats value (fresh install
+// or DB unavailable). Missing character names in cache entries fall
+// back to the filename stem (without ".d2s").
+[[nodiscard]] SessionRunStats computeSessionRunStats(
+    BackupDb*                 backupDb,
+    const DashboardFileCache& cache,
+    std::int64_t              sessionStart,
+    std::int64_t              sessionEnd);
+
 } // namespace d2r

@@ -205,6 +205,13 @@ struct UiState {
     };
     SessionCacheKey                           sessionCacheKey{};
 
+    // Per-character run stats for the current session, refreshed on
+    // every rebuild(). Displayed by the Session Info pane's "Runs"
+    // section. Cheap to recompute (one indexed historyFor per file);
+    // done outside the buildSession cache so autosave bursts see fresh
+    // run counts + duration without invalidating the item-pool cache.
+    SessionRunStats                           sessionRunStats;
+
     // Ephemeral backup-action ring buffer for the BackupLog pane. Written
     // by the watcher/scheduler thread via setInsertCallback (and by the
     // Recovery flow), read by the render thread. `kBackupLogCap` bounds
@@ -702,6 +709,7 @@ std::string formatElapsedHMS(std::int64_t seconds) {
 Element renderSessionLootPane(const PaneConfig&        cfg,
                               const DashboardSnapshot& s,
                               const Session*           session,
+                              const SessionRunStats&   runStats,
                               bool                     focused) {
     // Title reflects custom-window state (read from the AppSession
     // singleton via the Session struct):
@@ -857,6 +865,53 @@ Element renderSessionLootPane(const PaneConfig&        cfg,
             }
         }
         body.push_back(vbox(std::move(runeRows)));
+    }
+
+    // ---- Runs section -----------------------------------------------
+    // Per-character run counts + accumulated wall-clock duration inside
+    // the session window. Populated by computeSessionRunStats on every
+    // rebuild (see UiState::sessionRunStats).
+    {
+        body.push_back(text(""));
+        auto formatRunCount = [](std::int32_t n, bool ip) {
+            std::string out = std::to_string(n) + (n == 1 ? " run" : " runs");
+            if (ip) out += " +1";
+            return out;
+        };
+        Elements runRows;
+        std::string headerCount = std::to_string(runStats.totalRuns)
+                                     + (runStats.totalRuns == 1 ? " run" : " runs");
+        if (runStats.anyInProgress) headerCount += " +1 in progress";
+        runRows.push_back(hbox({
+            text("Runs") | bold | color(kHighlightColor),
+            text("  "),
+            text("(" + headerCount + ")") | dim,
+        }));
+        if (runStats.perCharacter.empty()) {
+            runRows.push_back(text("  (none this session)") | dim);
+        } else {
+            for (const auto& pc : runStats.perCharacter) {
+                runRows.push_back(hbox({
+                    text("  "),
+                    text(pc.characterName) | flex,
+                    text("  "),
+                    text(formatRunCount(pc.runCount, pc.hasInProgress)),
+                    text("  "),
+                    text(formatElapsedHMS(pc.accumulatedSecs)) | dim,
+                }));
+            }
+            if (runStats.perCharacter.size() > 1) {
+                runRows.push_back(hbox({
+                    text("  Total") | bold,
+                    text("  ") | flex,
+                    text(formatRunCount(runStats.totalRuns,
+                                          runStats.anyInProgress)) | bold,
+                    text("  "),
+                    text(formatElapsedHMS(runStats.totalSecs)) | bold,
+                }));
+            }
+        }
+        body.push_back(vbox(std::move(runRows)));
     }
 
     return window(titleEl,
@@ -3069,7 +3124,8 @@ Element renderPane(PaneNode& node, const UiState& ui,
             break;
         case PaneType::SessionLoot:
             leafEl = renderSessionLootPane(node.config, s,
-                                            ui.session.get(), focused);
+                                            ui.session.get(),
+                                            ui.sessionRunStats, focused);
             break;
         case PaneType::Uber:
             leafEl = renderUberPane(node.config, s, ui.fileCache, focused);
@@ -3595,9 +3651,20 @@ int runDashboard(const std::filesystem::path& savePath,
         auto snap = std::make_shared<DashboardSnapshot>(
             aggregateDashboardSnapshot(db, ui.fileCache));
         auto session = buildSession(snap);
+        // Fresh per-character run stats for the current session
+        // window. Cheap enough to redo on every rebuild; not part of
+        // buildSession's cache since counts drift with each save.
+        SessionRunStats runStats;
+        {
+            std::lock_guard g(ui.snapshotMutex);
+            runStats = computeSessionRunStats(backupDb.get(), ui.fileCache,
+                                                ui.appSession.startEpoch(),
+                                                ui.appSession.endEpoch());
+        }
         std::lock_guard g(ui.snapshotMutex);
-        ui.snapshot = std::move(snap);
-        ui.session  = std::move(session);
+        ui.snapshot        = std::move(snap);
+        ui.session         = std::move(session);
+        ui.sessionRunStats = std::move(runStats);
     }
 
     auto screen = ScreenInteractive::Fullscreen();
@@ -3670,9 +3737,17 @@ int runDashboard(const std::filesystem::path& savePath,
         // (buildSession reads it via the singleton).
         refreshAutoEndEpoch();
         auto session = buildSession(snap);
+        SessionRunStats runStats;
+        {
+            std::lock_guard g(ui.snapshotMutex);
+            runStats = computeSessionRunStats(backupDb.get(), ui.fileCache,
+                                                ui.appSession.startEpoch(),
+                                                ui.appSession.endEpoch());
+        }
         std::lock_guard g(ui.snapshotMutex);
-        ui.snapshot = std::move(snap);
-        ui.session  = std::move(session);
+        ui.snapshot        = std::move(snap);
+        ui.session         = std::move(session);
+        ui.sessionRunStats = std::move(runStats);
     };
     auto persistLayout = [&]() {
         if (configDb) savePaneTree(configDb, ui.rootPane);
@@ -4113,9 +4188,18 @@ int runDashboard(const std::filesystem::path& savePath,
                             snapNow = ui.snapshot;
                         }
                         auto rebuilt = buildSession(snapNow);
+                        SessionRunStats runStats;
                         {
                             std::lock_guard<std::mutex> g(ui.snapshotMutex);
-                            ui.session = std::move(rebuilt);
+                            runStats = computeSessionRunStats(
+                                backupDb.get(), ui.fileCache,
+                                ui.appSession.startEpoch(),
+                                ui.appSession.endEpoch());
+                        }
+                        {
+                            std::lock_guard<std::mutex> g(ui.snapshotMutex);
+                            ui.session         = std::move(rebuilt);
+                            ui.sessionRunStats = std::move(runStats);
                         }
                         ui.configMode = false;
                         break;

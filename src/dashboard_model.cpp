@@ -1337,4 +1337,91 @@ std::vector<Run> groupRunsForFile(
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// runDurationSecs / computeSessionRunStats.
+// ---------------------------------------------------------------------------
+
+std::int64_t runDurationSecs(const Run& run) noexcept {
+    if (run.autosaveDates.empty()) return 0;
+    // Closed run: end = SaveAndExit's date (captured in run.endEpoch).
+    // In-progress: end = last autosave date on record. Both give a
+    // wall-clock span from first autosave to end, which matches how the
+    // Backups pane run-collapse view formats duration.
+    const std::int64_t start = run.autosaveDates.front();
+    const std::int64_t end   = run.inProgress
+                                  ? run.autosaveDates.back()
+                                  : run.endEpoch;
+    return (end > start) ? (end - start) : 0;
+}
+
+// Strip a trailing ".d2s" / ".D2S" from `name` to produce a display
+// stem. Case-insensitive; returns `name` unchanged if no such suffix.
+static std::string stripD2sSuffix(std::string name) {
+    if (name.size() < 4) return name;
+    const auto tail = name.substr(name.size() - 4);
+    if (tail == ".d2s" || tail == ".D2S") name.resize(name.size() - 4);
+    return name;
+}
+
+SessionRunStats computeSessionRunStats(
+    BackupDb*                 backupDb,
+    const DashboardFileCache& cache,
+    std::int64_t              sessionStart,
+    std::int64_t              sessionEnd) {
+    SessionRunStats out;
+    if (!backupDb) return out;
+
+    for (const auto& [filename, entry] : cache.d2s) {
+        std::vector<BackupDb::HistoryRow> hist;
+        try { hist = backupDb->historyFor(filename, 500); }
+        catch (const std::exception&) { continue; }
+        if (hist.empty()) continue;
+
+        auto runs = groupRunsForFile(filename, hist, sessionStart);
+
+        SessionRunStats::PerCharacter pc;
+        pc.characterFile = filename;
+        pc.characterName = entry.character.name.empty()
+                             ? stripD2sSuffix(filename)
+                             : entry.character.name;
+        for (const auto& r : runs) {
+            // Upper-bound clip: skip runs whose activity lies entirely
+            // past the session end. For closed runs the SaveAndExit
+            // date is the natural cutoff; for in-progress the OLDEST
+            // autosave in the run must be within the window (a run
+            // that started after the custom end doesn't count).
+            if (sessionEnd > 0) {
+                if (!r.inProgress && r.endEpoch > sessionEnd) continue;
+                if (r.inProgress
+                    && !r.autosaveDates.empty()
+                    && r.autosaveDates.front() > sessionEnd) continue;
+            }
+            if (r.inProgress) {
+                pc.hasInProgress = true;
+            } else {
+                ++pc.runCount;
+            }
+            pc.accumulatedSecs += runDurationSecs(r);
+        }
+        if (pc.runCount == 0 && !pc.hasInProgress) continue;
+
+        out.totalRuns     += pc.runCount;
+        out.totalSecs     += pc.accumulatedSecs;
+        if (pc.hasInProgress) out.anyInProgress = true;
+        out.perCharacter.push_back(std::move(pc));
+    }
+
+    // Sort by accumulated wall-clock time descending, then by
+    // character name ascending for ties. The Session Info pane
+    // renders in this order.
+    std::sort(out.perCharacter.begin(), out.perCharacter.end(),
+              [](const SessionRunStats::PerCharacter& a,
+                 const SessionRunStats::PerCharacter& b) {
+                  if (a.accumulatedSecs != b.accumulatedSecs)
+                      return a.accumulatedSecs > b.accumulatedSecs;
+                  return a.characterName < b.characterName;
+              });
+    return out;
+}
+
 } // namespace d2r
