@@ -58,9 +58,12 @@ user-facing display term for the resulting backup is **"run end"**
   pane, which shows a file's full run history uncollapsed by
   session).
 
-**Invariant.** A custom end requires a custom start. The config
-menu only surfaces the end control when start is already custom;
-the JSON loader clears the end when the start is auto.
+**Invariant.** A custom end requires a custom start. The
+`AppSession::setCustomEnd` helper silently drops end values when
+start is unset; `setCustomStart(nullopt)` also clears the end.
+The config menu on Session / Session Info / Character panes
+mirrors this by only surfacing the "end" control when start is
+already custom.
 
 ---
 
@@ -68,7 +71,7 @@ the JSON loader clears the end when the start is auto.
 
 ```mermaid
 flowchart LR
-    A[Custom start<br/>OR auto S&E boundary] --> B[Pick startEpoch]
+    A[AppSession singleton<br/>startEpoch, endEpoch] --> B[Read effective epochs]
     B --> C[Per-file:<br/>backupDb.at name, startEpoch]
     C --> D[Assemble temp<br/>DashboardSnapshot]
     D --> E[SessionState<br/>itemKeys + runeStacks]
@@ -87,37 +90,63 @@ unchanged.
 
 ## Auto start (default)
 
-The **auto** start tracks whatever Save & Exit last ended a
-session; the current session covers everything since that S&E.
+The **auto** start is the current value of
+`AppSession::autoStartEpoch`. On dashboard boot it seeds to the
+wall-clock time. Whenever the watcher fires a launch-burst
+callback (see [Launch-burst detection](#launch-burst-detection)
+below), the value shifts to the burst's timestamp. Custom
+overrides via `AppSession::customStartEpoch` are sticky and win
+via `AppSession::startEpoch()`'s `value_or(...)`.
 
-```mermaid
-flowchart LR
-    A[hist DESC] --> B{Newest row<br/>is Save & Exit?}
-    B -->|yes just-quit| C[seThreshold = 2]
-    B -->|no mid-session| D[seThreshold = 1]
-    C --> E[Walk hist forward.<br/>Boundary = the seThreshold'th<br/>S&E encountered.]
-    D --> E
-    E --> F[startEpoch = boundary date]
-    F --> G[endEpoch = newest hist date]
-```
+There is no per-character S&E boundary scan. The old auto-mode
+"walk hist to find the boundary S&E" heuristic is gone — the
+singleton is the sole source of truth for the effective start.
 
-**Fallback.** No qualifying S&E on record → start on the oldest
-save so the diff still says something (represents "everything since
-the DB started tracking this character").
+**Fallback.** With no launch burst detected and no user
+override, the effective start remains at dashboard-boot time,
+which is the natural "start of the current dashboard's
+observation window".
+
+---
+
+## Launch-burst detection
+
+`kSaveDirMask` in the watcher includes `IN_ACCESS`, so the
+scheduler sees the reads D2R.exe emits at startup. The
+`backup_scheduler_detail::isLaunchBurst` predicate flags a burst
+that is:
+
+- Reads-only (no `IN_CLOSE_WRITE | IN_MODIFY | IN_MOVED_TO |
+  IN_CREATE` on any file), AND
+- Contains at least one read on a non-`.d2s`/`.d2i` file
+  (any `.ctl`, `.key`, `.ma*`, `.map`, or `Settings.json`).
+
+The second clause distinguishes a real D2R launch from the
+dashboard's own `takeStartupSnapshot` (which only reads
+`.d2s`/`.d2i` per `isPersistedFile`).
+
+On a match, `BackupScheduler` invokes the launch callback
+installed by `runDashboard`, which updates
+`ui.appSession.autoStartEpoch` under the snapshot mutex and posts
+a redraw event. **No row is written to the backup DB** — launch
+events are purely observational.
 
 ---
 
 ## Custom start
 
 Triggered by the user typing a datetime into the "start: custom"
-config menu. The epoch is a moment in time; the start-state
-represents the account's state at that moment.
+config menu on any Session / Session Info / Character pane. The
+menu writes to `AppSession::customStartEpoch` via
+`setCustomStart`; `startEpoch()` then returns the custom value.
+The epoch is a moment in time; the start-state represents the
+account's state at that moment.
 
 ```mermaid
 flowchart LR
     A[customStartEpoch] --> B[startEpoch = value]
     B --> C[Per-file:<br/>backupDb.at name, startEpoch]
-    B --> D[endEpoch = max newest save, startEpoch]
+    B --> D[endEpoch = autoEndEpoch or customEndEpoch]
 ```
 
 Each file's row is picked with `date <= startEpoch`. If a file has
@@ -130,6 +159,10 @@ state. Every currently-owned item then counts as "new since session
 started" (matches user intent: "session started before I had any
 saves; everything I own is new since then").
 
+Custom overrides are **sticky**: they persist until the user hits
+"reset session" (`AppSession::clearCustom`) even if a later launch
+burst arrives.
+
 ---
 
 ## Custom end
@@ -138,6 +171,10 @@ When set, `customEndEpoch` clamps the displayed session window's
 end. If `customEndEpoch < startEpoch`, both collapse to the end so
 the pane reads "0h 00m 00s starting at &lt;end&gt;" instead of a
 negative duration.
+
+`AppSession::setCustomEnd(v)` enforces the invariant "custom end
+requires custom start" — calling it while `customStartEpoch` is
+unset silently drops the value.
 
 **Diff endpoint.** The custom-end value bounds the *displayed*
 start/end/duration only. The item/rune diff endpoint remains the
@@ -226,20 +263,22 @@ sides include it, so `count - before = 0`).
 
 ## Caching
 
-The cache key is
-`(characterDate, stashDate, customStartEpoch, customEndEpoch)`.
-Autosave bursts leave all four unchanged, so the cache hits and the
-parser is untouched. On a hit that only advances the session window
-(a new autosave lands within the current session), the cache
-returns a shallow-cloned `Session` with updated `startEpoch` /
-`endEpoch` — no byte parsing.
+The cache key is `(characterDate, stashDate, startEpoch)`.
+`endEpoch` is deliberately NOT part of the key — new saves
+landing advance `autoEndEpoch` but the start-state's item pool is
+invariant under end drift, so we clone-and-patch the cached
+`Session` with the new `endEpoch` and return it. The renderer's
+duration display stays live during autosave bursts without any
+byte parsing.
 
 The cache is invalidated by:
 
-- Auto mode: a new Save & Exit crossing the session boundary.
-- Custom mode: the user changing `customStartEpoch` or
-  `customEndEpoch`.
-- Any pane's "reset session" action.
+- A new backup landing at/before `startEpoch` on the active
+  player's file (character-side row date shifts).
+- The user changing the custom start / end (via time-input modal).
+- A launch burst updating `autoStartEpoch` (the effective
+  `startEpoch` shifts).
+- A "reset session" action clearing custom overrides.
 
 ---
 
@@ -258,14 +297,20 @@ The cache is invalidated by:
 
 ## References
 
-- `buildSession` — [src/dashboard_ftxui.cpp](../src/dashboard_ftxui.cpp)
+- `AppSession` singleton, `Session` / `SessionState` structs,
+  `makeSessionStateFromSnapshot`, `Run` / `groupRunsForFile` —
+  [include/d2r/DashboardModel.hpp](../include/d2r/DashboardModel.hpp),
+  [src/dashboard_model.cpp](../src/dashboard_model.cpp)
+- `buildSession`, `SessionCacheKey`, `renderBackupsDetail` (run-
+  collapse view), `renderSessionLootPane`, launch-callback
+  installation — [src/dashboard_ftxui.cpp](../src/dashboard_ftxui.cpp)
 - `overrideActivePlayerFromBytes` /
   `overrideSharedStashFromBytes` / `clearSharedStashInSnapshot` —
   [src/dashboard_model.cpp](../src/dashboard_model.cpp)
-- `makeSessionStateFromSnapshot`, `Session` / `SessionState` structs —
-  [include/d2r/DashboardModel.hpp](../include/d2r/DashboardModel.hpp),
-  [src/dashboard_model.cpp](../src/dashboard_model.cpp)
-- `SessionCacheKey`, `renderSessionLootPane` —
-  [src/dashboard_ftxui.cpp](../src/dashboard_ftxui.cpp)
+- `isLaunchBurst`, `BackupScheduler::setLaunchCallback` —
+  [include/d2r/BackupScheduler.hpp](../include/d2r/BackupScheduler.hpp),
+  [src/backup_scheduler.cpp](../src/backup_scheduler.cpp)
+- `kSaveDirMask` (`IN_ACCESS` inclusion) —
+  [src/watcher_inotify.cpp](../src/watcher_inotify.cpp)
 - `parseUserDateTime` (manual time entry) —
   [src/dashboard_config.cpp](../src/dashboard_config.cpp)
