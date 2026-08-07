@@ -6,6 +6,7 @@
 #include "d2r/Dashboard.hpp"
 #include "d2r/DashboardConfig.hpp"
 #include "d2r/DashboardModel.hpp"
+#include "d2r/ItemColors.hpp"
 #include "d2r/RefDb.hpp"
 
 #if D2R_HAVE_INOTIFY
@@ -790,6 +791,7 @@ Element renderSessionLootPane(const PaneConfig&        cfg,
 
     // ---- Render helpers ----
     auto renderItemList = [](std::string_view header,
+                             ChronicleKind kind,
                              const std::vector<const InventoryItem*>& xs) {
         Elements rows;
         rows.push_back(hbox({
@@ -803,7 +805,7 @@ Element renderSessionLootPane(const PaneConfig&        cfg,
             for (const auto* it : xs) {
                 rows.push_back(hbox({
                     text("  "),
-                    text(it->name) | flex,
+                    text(it->name) | color(item_colors::forKind(kind)) | flex,
                     text("  "),
                     text(it->location) | dim,
                 }));
@@ -840,9 +842,9 @@ Element renderSessionLootPane(const PaneConfig&        cfg,
     }
     body.push_back(separator());
 
-    body.push_back(renderItemList("New Uniques", newUniques));
+    body.push_back(renderItemList("New Uniques", ChronicleKind::Unique, newUniques));
     body.push_back(text(""));
-    body.push_back(renderItemList("New Sets", newSets));
+    body.push_back(renderItemList("New Sets", ChronicleKind::Set, newSets));
 
     if (cfg.sessionLootShowRunes) {
         body.push_back(text(""));
@@ -1557,10 +1559,12 @@ Element renderChronicleByTier(const PaneConfig& c, const DashboardSnapshot& s,
         for (int t = 0; t < 3; ++t) {
             const auto* r = dr.cells[t];
             const std::string txt = cellTextFor(r);
-            // Dim owned cells individually so a row with mixed
-            // ownership keeps the unowned tiers at full brightness.
+            // Color owned cells with the muted unique-gold and unowned
+            // cells with full unique-gold so a row with mixed ownership
+            // still lets the eye pick out the unowned tiers at a glance.
             Element cell = cellText(txt, colW[t]);
-            if (r && r->discovered) cell = cell | dim;
+            if (r) cell = cell | color(item_colors::forKind(
+                                          ChronicleKind::Unique, r->discovered));
             cells.push_back(cell);
         }
         Element row = hbox(std::move(cells));
@@ -1660,9 +1664,13 @@ Element renderChronicleLeaf(const PaneConfig& c, const DashboardSnapshot& s,
         cells.push_back(cellText(r->displayName, w.item));
         cells.push_back(cellText(r->baseName,    w.base));
         if (isSet) cells.push_back(cellText(r->setName, w.setLbl));
-        Element row = hbox(std::move(cells));
-        if (focused && i == clamped)  row = row | inverted | ftxui::focus;
-        else if (r->discovered)       row = row | dim;
+        // Type-colored row: canonical D2R hue per kind (gold uniques,
+        // green sets, orange runewords), muted variant for discovered
+        // rows so ownership is visible without collapsing every quality
+        // to a single grey.
+        Element row = hbox(std::move(cells))
+                    | color(item_colors::forKind(kt.kind, r->discovered));
+        if (focused && i == clamped) row = row | inverted | ftxui::focus;
         body.push_back(row);
     }
 
@@ -1754,7 +1762,7 @@ Element renderInventoryLeaf(const PaneConfig& c, const DashboardSnapshot& s,
             cellText(it->name,     wName),
             cellText(it->baseName, wBase),
             cellText(it->location, wLoc),
-        });
+        }) | color(item_colors::forQuality(it->quality));
         if (focused && i == clamped) row = row | inverted | ftxui::focus;
         body.push_back(row);
     }
@@ -1883,7 +1891,7 @@ Element renderReconcileLeaf(const PaneConfig& c, const DashboardSnapshot& s,
             cellText(r->baseName,              wBase),
             cellText(r->owned      ? "✓" : "", wOwn),
             cellText(r->discovered ? "✓" : "", wDisc),
-        });
+        }) | color(item_colors::forKind(r->kind));
         if (focused && i == clamped) row = row | inverted | ftxui::focus;
         body.push_back(row);
     }
