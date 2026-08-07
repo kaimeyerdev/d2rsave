@@ -162,6 +162,13 @@ struct InventoryItem {
     // with `stacks=99`; incrementing by 1 undercounts by 98.
     std::uint16_t    stacks      = 0;
     bool             identified  = false;
+    // True when this item was parsed as one of a parent item's
+    // `socketedItems` (a rune / jewel / gem locked inside a socketed
+    // weapon or armor). Callers that classify by physical location
+    // treat these as unrecoverable: retrieving a socketed rune
+    // destroys it in the game. The parent's location string is
+    // still copied here so we know *which* item holds the socket.
+    bool             socketed    = false;
 };
 
 // One entry in the reconcile diff. Emitted for every unique/set that is

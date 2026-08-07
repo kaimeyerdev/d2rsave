@@ -353,6 +353,7 @@ DashboardFileCache::D2sEntry parseD2sIntoEntry(
                 sInv.fingerprint = s.fingerprint;
                 sInv.stacks      = s.stacks;
                 sInv.identified  = s.identified;
+                sInv.socketed    = true;
                 out.items.push_back(std::move(sInv));
                 // Socketed uniques/sets (Rainbow Facets, Defender's Fire)
                 // must count for reconcile ownership too.
@@ -431,6 +432,7 @@ DashboardFileCache::D2iEntry parseD2iIntoEntry(
                 sInv.fingerprint = s.fingerprint;
                 sInv.stacks      = s.stacks;
                 sInv.identified  = s.identified;
+                sInv.socketed    = true;
                 out.items.push_back(std::move(sInv));
                 if (s.quality == ItemQuality::Unique) {
                     out.ownedUniqueLocs.emplace_back(s.uniqueId, loc);
@@ -1084,6 +1086,7 @@ bool overrideActivePlayerFromBytes(DashboardSnapshot&         snap,
                     sInv.fingerprint = s.fingerprint;
                     sInv.stacks      = s.stacks;
                     sInv.identified  = s.identified;
+                    sInv.socketed    = true;
                     snap.inventory.push_back(std::move(sInv));
                 }
             }
@@ -1196,6 +1199,7 @@ bool overrideSharedStashFromBytes(DashboardSnapshot&         snap,
                 sInv.fingerprint = s.fingerprint;
                 sInv.stacks      = s.stacks;
                 sInv.identified  = s.identified;
+                sInv.socketed    = true;
                 snap.inventory.push_back(std::move(sInv));
             }
         }

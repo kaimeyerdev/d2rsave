@@ -141,6 +141,23 @@ TEST_CASE("SessionState.runeStacks: sums stack sizes for material-tab piles",
     REQUIRE(anchor.runeStacks.at("r33") == 1);
 }
 
+TEST_CASE("SessionState.runeStacks: socketed flag doesn't hide runes from the total",
+          "[dashboard_model][runes]") {
+    // A socketed rune is unrecoverable in-game (unsocketing destroys
+    // it), but the account still *has* it. The rune-stacks aggregation
+    // must count socketed runes toward the per-code total so the
+    // Session Loot diff doesn't spuriously flag them as "new" when the
+    // player socketes a fresh rune into an existing item.
+    d2r::DashboardSnapshot snap;
+    d2r::InventoryItem sock = makeRune("r14", "Dol Rune", "Kai.d2s");
+    sock.socketed = true;
+    snap.inventory.push_back(sock);
+    snap.inventory.push_back(makeRune("r14", "Dol Rune", "Kai.d2s"));  // one loose
+
+    const auto anchor = d2r::makeSessionStateFromSnapshot(snap);
+    REQUIRE(anchor.runeStacks.at("r14") == 2);
+}
+
 TEST_CASE("SessionState: unique/set fingerprints go into itemKeys",
           "[dashboard_model][session_loot]") {
     d2r::DashboardSnapshot snap;

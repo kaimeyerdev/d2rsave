@@ -1048,32 +1048,26 @@ Element renderTerrorZonePane(const DashboardSnapshot& s, bool focused) {
 }
 
 // -----------------------------------------------------------------------
-// Runes pane: full 33-rune ledger with per-location totals.
+// Runes pane: full 33-rune ledger split by physical location.
 //
-// Bypasses the Session diff -- renders the LIVE snapshot's inventory
-// directly. Enumerates all 33 canonical runes (r01 El -> r33 Zod)
-// regardless of ownership so the user can see at a glance which runes
-// are missing. Each row splits its total between three columns:
+// Enumerates all 33 canonical runes (r01 El -> r33 Zod) regardless of
+// ownership so the user sees at a glance which runes are missing.
+// Each row splits its total between three location buckets:
 //
-//   * stash -- items whose location begins with "stash tab " AND
-//              whose stash tab index >= 6 (the material tab; earlier
-//              tabs are the standard grid tabs, whose runes still
-//              count under `stash`).
-//   * carry -- items on characters or their mercenaries.
-//   * total -- the sum, which is what the Session Loot pane's
-//              "New Runes" diff uses on the "now" side.
+//   * stash     -- items whose location begins with "stash tab "
+//                  (either a standard grid tab or the material tab).
+//                  The material tab stores each rune as one item with
+//                  `stacks = N`; this bucket sums stack sizes.
+//   * inventory -- runes carried in a character's grid, belt, cube,
+//                  or mercenary. Typically 0 for accounts that keep
+//                  their runes in the material tab.
+//   * socketed  -- runes inserted into a socketed weapon or armor.
+//                  Unrecoverable in the game (unsocketing destroys
+//                  the socketed items), so these are split out to
+//                  give an accurate "usable inventory" picture.
 //
-// Stack size matters: the RotW material tab stores a pile of 99 Amn
-// Runes as a single InventoryItem with `stacks=99`. Every count in
-// this pane sums `stacks` (defaulting to 1 when the field is zero).
-//
-// Diagnostic wiring:
-//   * If a rune shows up here (total > 0) but doesn't show as
-//     "New Runes" in the Session Info pane, the missing piece is
-//     diff-side (startState or nowStacks).
-//   * If a rune isn't counted here at all, the missing piece is
-//     upstream in aggregation (parseD2iIntoEntry -> snap.inventory
-//     or the item parser's `stacks` extraction).
+// A rune's `total` is the sum of all three; that's the same number
+// the Session Loot pane's "New Runes" diff uses on the "now" side.
 // -----------------------------------------------------------------------
 Element renderRunesPane(const DashboardSnapshot& s, bool focused) {
     Element titleEl = text(" Runes ");
@@ -1091,47 +1085,58 @@ Element renderRunesPane(const DashboardSnapshot& s, bool focused) {
     };
 
     struct Row {
-        std::string code;   // "r01".."r33"
-        std::string name;   // e.g. "El Rune" (with " Rune" suffix appended)
-        std::uint32_t stash = 0;   // any location starting with "stash tab "
-        std::uint32_t carry = 0;   // everything else (character .d2s / merc)
+        std::string name;   // e.g. "El Rune"
+        std::uint32_t stash    = 0;
+        std::uint32_t inv      = 0;   // carried loose (character grid / merc)
+        std::uint32_t socketed = 0;   // locked in a socketed item
     };
     std::array<Row, 33> rows{};
     for (std::size_t i = 0; i < 33; ++i) {
-        char buf[4] = {'r', static_cast<char>('0' + (i + 1) / 10),
-                            static_cast<char>('0' + (i + 1) % 10), 0};
-        rows[i].code = std::string(buf);
         rows[i].name = std::string(kRuneNames[i]) + " Rune";
     }
 
     static const std::string kStashPrefix = "stash tab ";
     for (const auto& it : s.inventory) {
         if (!isRuneCode(it.code)) continue;
-        // Decode the tail two digits of the code (already validated by
-        // isRuneCode) into a 0-based index into `rows`.
+        // Decode the tail two digits (already validated by isRuneCode)
+        // into a 0-based tier index.
         const int n = (it.code[1] - '0') * 10 + (it.code[2] - '0');
         if (n < 1 || n > 33) continue;   // future-proof: skip unknown codes
         const std::uint32_t qty = it.stacks > 0 ? it.stacks : 1u;
-        const bool inStash =
-            it.location.size() >= kStashPrefix.size() &&
-            it.location.compare(0, kStashPrefix.size(), kStashPrefix) == 0;
-        (inStash ? rows[n - 1].stash : rows[n - 1].carry) += qty;
+        // Bucket priority: socketed wins over stash. A rune socketed
+        // into an item stored in the stash is still unrecoverable, so
+        // it belongs in the "socketed" bucket regardless of the
+        // parent's location.
+        auto& row = rows[n - 1];
+        if (it.socketed) {
+            row.socketed += qty;
+        } else if (it.location.size() >= kStashPrefix.size() &&
+                   it.location.compare(0, kStashPrefix.size(), kStashPrefix) == 0) {
+            row.stash += qty;
+        } else {
+            row.inv += qty;
+        }
     }
 
     // Totals summary.
-    std::uint32_t totStash = 0, totCarry = 0, distinct = 0;
+    std::uint32_t totStash = 0, totInv = 0, totSock = 0, distinct = 0;
     for (const auto& r : rows) {
         totStash += r.stash;
-        totCarry += r.carry;
-        if (r.stash + r.carry > 0) ++distinct;
+        totInv   += r.inv;
+        totSock  += r.socketed;
+        if (r.stash + r.inv + r.socketed > 0) ++distinct;
     }
 
-    // Column widths chosen for a compact ledger: 4 chars per number
-    // (up to 9999) leaves ~15 cols total plus the rune name.
-    constexpr int wCount = 4;
+    // Compact ledger: 6-char right-aligned number columns fit any
+    // realistic per-rune total and give the headers ("stash", "inv",
+    // "socket", "total") enough breathing room.
+    constexpr int wCount = 6;
     auto numCell = [](std::uint32_t n) {
         return text(std::to_string(n))
              | align_right | size(WIDTH, EQUAL, wCount);
+    };
+    auto headerCell = [](const char* label) {
+        return text(label) | align_right | size(WIDTH, EQUAL, wCount);
     };
 
     Elements body;
@@ -1139,57 +1144,56 @@ Element renderRunesPane(const DashboardSnapshot& s, bool focused) {
         text("all runes") | bold | color(kHighlightColor),
         text("  "),
         text("(" + std::to_string(distinct) + "/33 distinct; "
-             + std::to_string(totStash + totCarry) + " total: "
-             + std::to_string(totStash) + " stash + "
-             + std::to_string(totCarry) + " carry)") | dim,
+             + std::to_string(totStash + totInv + totSock) + " total: "
+             + std::to_string(totStash)  + " stash + "
+             + std::to_string(totInv)    + " inv + "
+             + std::to_string(totSock)   + " socketed)") | dim,
     }));
     body.push_back(separator());
     body.push_back(hbox({
         text("  "),
-        text("  #  code   name") | flex,
-        text("stash") | align_right | size(WIDTH, EQUAL, wCount + 1),
+        text("name") | flex,
+        headerCell("stash"),
         text(" "),
-        text("carry") | align_right | size(WIDTH, EQUAL, wCount + 1),
+        headerCell("inv"),
         text(" "),
-        text("total") | align_right | size(WIDTH, EQUAL, wCount + 1),
+        headerCell("socket"),
+        text(" "),
+        headerCell("total"),
     }) | bold);
     body.push_back(separator());
     for (std::size_t i = 0; i < rows.size(); ++i) {
         const auto& r = rows[i];
-        const std::uint32_t total = r.stash + r.carry;
-        char tierBuf[8];
-        std::snprintf(tierBuf, sizeof(tierBuf), "  %2d  ",
-                      static_cast<int>(i + 1));
-        // Use the runeword palette hue for rune names: in D2R rune text
-        // shares the same warm-orange family as runewords. Muted for
-        // runes we don't own so the eye jumps to what's present.
+        const std::uint32_t total = r.stash + r.inv + r.socketed;
+        // D2R renders rune text in the same warm-orange family as
+        // runewords; muted for missing runes so the eye jumps to what
+        // is present.
         const auto nameColor = total > 0
             ? item_colors::runewordFull()
             : item_colors::runewordMuted();
         auto nameCell = hbox({
-            text(std::string(tierBuf)) | dim,
-            text(r.code + "    ") | dim,
+            text("  "),
             text(r.name) | color(nameColor) | flex,
         }) | flex;
-        // Right-side count columns; totals bolded for owned runes, all
-        // three columns dimmed when the rune is missing entirely so a
-        // sparse ledger still scans well.
         auto stashCell = numCell(r.stash);
-        auto carryCell = numCell(r.carry);
+        auto invCell   = numCell(r.inv);
+        auto sockCell  = numCell(r.socketed);
         auto totalCell = numCell(total);
         if (total == 0) {
             stashCell = stashCell | dim;
-            carryCell = carryCell | dim;
+            invCell   = invCell   | dim;
+            sockCell  = sockCell  | dim;
             totalCell = totalCell | dim;
         } else {
             totalCell = totalCell | bold;
         }
         body.push_back(hbox({
             nameCell,
-            text(" "),
             stashCell,
             text(" "),
-            carryCell,
+            invCell,
+            text(" "),
+            sockCell,
             text(" "),
             totalCell,
         }));
