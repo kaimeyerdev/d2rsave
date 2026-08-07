@@ -282,6 +282,15 @@ struct UiState {
     // no run is expanded. Ephemeral (not persisted).
     std::optional<std::int64_t>               expandedRunEndEpoch;
 
+    // Per-leaf scroll fraction for panes that don't drive their
+    // viewport off a row-index cursor (Session Info, Runes). Keyed by
+    // the PaneNode address so a two-column layout can scroll the
+    // Session pane independently of the Runes pane. Value in [0, 1]
+    // feeds `focusPositionRelative(0, frac)` inside the pane's yframe;
+    // 0 == top, 1 == bottom. Missing entry defaults to 0 (top).
+    // Ephemeral: not persisted across dashboard restarts.
+    std::unordered_map<const PaneNode*, float> paneScrollFrac;
+
     // Recovery modal state. Populated when the user presses [R] on the
     // Backups pane detail view; cleared on confirm or cancel.
     struct RecoveryModal {
@@ -711,7 +720,8 @@ Element renderSessionLootPane(const PaneConfig&        cfg,
                               const DashboardSnapshot& s,
                               const Session*           session,
                               const SessionRunStats&   runStats,
-                              bool                     focused) {
+                              bool                     focused,
+                              float                    scrollFrac) {
     // Title reflects custom-window state (read from the AppSession
     // singleton via the Session struct):
     //   " Session Info "                       -- start + end both auto
@@ -920,7 +930,9 @@ Element renderSessionLootPane(const PaneConfig&        cfg,
     }
 
     return window(titleEl,
-                  vbox(std::move(body)) | vscroll_indicator | yframe | flex);
+                  vbox(std::move(body))
+                    | focusPositionRelative(0.f, scrollFrac)
+                    | vscroll_indicator | yframe | flex);
 }
 
 // -----------------------------------------------------------------------
@@ -1069,7 +1081,8 @@ Element renderTerrorZonePane(const DashboardSnapshot& s, bool focused) {
 // A rune's `total` is the sum of all three; that's the same number
 // the Session Loot pane's "New Runes" diff uses on the "now" side.
 // -----------------------------------------------------------------------
-Element renderRunesPane(const DashboardSnapshot& s, bool focused) {
+Element renderRunesPane(const DashboardSnapshot& s, bool focused,
+                        float scrollFrac) {
     Element titleEl = text(" Runes ");
     if (focused) titleEl = titleEl | inverted;
 
@@ -1199,7 +1212,9 @@ Element renderRunesPane(const DashboardSnapshot& s, bool focused) {
         }));
     }
     return window(titleEl,
-                  vbox(std::move(body)) | vscroll_indicator | yframe | flex);
+                  vbox(std::move(body))
+                    | focusPositionRelative(0.f, scrollFrac)
+                    | vscroll_indicator | yframe | flex);
 }
 
 // -------------------------- chronicle rendering -----------------------------
@@ -3247,6 +3262,13 @@ Element renderPane(PaneNode& node, const UiState& ui,
                                           &node) != nullptr;
         return renderConfigMenu(ui, node.config, canDelete);
     }
+    // Per-leaf scroll fraction lookup for panes that use
+    // `focusPositionRelative` (Session Info, Runes). Absent entry
+    // defaults to 0.f (viewport pinned at the top).
+    auto paneScrollFrac = [&](const PaneNode* n) -> float {
+        const auto it = ui.paneScrollFrac.find(n);
+        return it == ui.paneScrollFrac.end() ? 0.f : it->second;
+    };
     Element leafEl;
     switch (node.config.type) {
         case PaneType::Chronicle:
@@ -3291,7 +3313,8 @@ Element renderPane(PaneNode& node, const UiState& ui,
         case PaneType::SessionLoot:
             leafEl = renderSessionLootPane(node.config, s,
                                             ui.session.get(),
-                                            ui.sessionRunStats, focused);
+                                            ui.sessionRunStats, focused,
+                                            paneScrollFrac(&node));
             break;
         case PaneType::Uber:
             leafEl = renderUberPane(node.config, s, ui.fileCache, focused);
@@ -3300,7 +3323,7 @@ Element renderPane(PaneNode& node, const UiState& ui,
             leafEl = renderTerrorZonePane(s, focused);
             break;
         case PaneType::Runes:
-            leafEl = renderRunesPane(s, focused);
+            leafEl = renderRunesPane(s, focused, paneScrollFrac(&node));
             break;
     }
     // Pin the leaf so ftxui doesn't grow it to fit larger content (which
@@ -3321,8 +3344,8 @@ Element renderHelpModal() {
         text("  Tab / S-Tab focus next / prev pane"),
         text("  c           configure focused pane"),
         text("  /           search within focused pane"),
-        text("  Up/Down     move cursor in focused pane"),
-        text("  PgUp/PgDn   page cursor"),
+        text("  Up/Down     move cursor / scroll in focused pane"),
+        text("  PgUp/PgDn   page cursor / scroll"),
         text("  Home/End    jump to first / last row"),
         text(""),
         text("Config menu (per pane)") | bold,
@@ -4528,6 +4551,25 @@ int runDashboard(const std::filesystem::path& savePath,
         // Row navigation in focused pane.
         auto* leaf = focusedLeaf();
         if (!leaf) return false;
+
+        // Session Info and Runes panes are not row-cursor driven; they
+        // scroll via a per-leaf fraction that feeds focusPositionRelative
+        // inside the pane's yframe. Handle arrows here so the shownRows
+        // path below (which only knows about cursor-driven panes) never
+        // sees the event.
+        if (leaf->config.type == PaneType::SessionLoot ||
+            leaf->config.type == PaneType::Runes) {
+            auto& frac = ui.paneScrollFrac[leaf];
+            auto nudge = [&](float delta) {
+                frac = std::clamp(frac + delta, 0.f, 1.f);
+            };
+            if (e == Event::ArrowUp)   { nudge(-0.05f); return true; }
+            if (e == Event::ArrowDown) { nudge(+0.05f); return true; }
+            if (e == Event::PageUp)    { nudge(-0.25f); return true; }
+            if (e == Event::PageDown)  { nudge(+0.25f); return true; }
+            if (e == Event::Home)      { frac = 0.f;    return true; }
+            if (e == Event::End)       { frac = 1.f;    return true; }
+        }
 
         // Backups pane: Enter drills from summary into detail for the
         // filename at the cursor; Escape from detail returns to summary.
