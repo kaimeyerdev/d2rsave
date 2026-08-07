@@ -764,7 +764,10 @@ Element renderSessionLootPane(const PaneConfig&        cfg,
         std::unordered_map<std::string, std::string>   nameByCode;
         for (const auto& it : s.inventory) {
             if (!isRuneCode(it.code)) continue;
-            ++nowStacks[it.code];
+            // Stackable material-tab entries carry their pile size in
+            // `stacks`; treat a zero stacks field as a single loose rune.
+            const std::uint32_t qty = it.stacks > 0 ? it.stacks : 1u;
+            nowStacks[it.code] += qty;
             // First occurrence wins; runes always share the same name
             // for a given code so any exemplar is fine.
             nameByCode.try_emplace(it.code, it.name);
@@ -1042,6 +1045,157 @@ Element renderTerrorZonePane(const DashboardSnapshot& s, bool focused) {
         row("Deep Worldstone Shard",     t.shardDeep),
         row("Northern Worldstone Shard", t.shardNorthern),
     }));
+}
+
+// -----------------------------------------------------------------------
+// Runes pane: full 33-rune ledger with per-location totals.
+//
+// Bypasses the Session diff -- renders the LIVE snapshot's inventory
+// directly. Enumerates all 33 canonical runes (r01 El -> r33 Zod)
+// regardless of ownership so the user can see at a glance which runes
+// are missing. Each row splits its total between three columns:
+//
+//   * stash -- items whose location begins with "stash tab " AND
+//              whose stash tab index >= 6 (the material tab; earlier
+//              tabs are the standard grid tabs, whose runes still
+//              count under `stash`).
+//   * carry -- items on characters or their mercenaries.
+//   * total -- the sum, which is what the Session Loot pane's
+//              "New Runes" diff uses on the "now" side.
+//
+// Stack size matters: the RotW material tab stores a pile of 99 Amn
+// Runes as a single InventoryItem with `stacks=99`. Every count in
+// this pane sums `stacks` (defaulting to 1 when the field is zero).
+//
+// Diagnostic wiring:
+//   * If a rune shows up here (total > 0) but doesn't show as
+//     "New Runes" in the Session Info pane, the missing piece is
+//     diff-side (startState or nowStacks).
+//   * If a rune isn't counted here at all, the missing piece is
+//     upstream in aggregation (parseD2iIntoEntry -> snap.inventory
+//     or the item parser's `stacks` extraction).
+// -----------------------------------------------------------------------
+Element renderRunesPane(const DashboardSnapshot& s, bool focused) {
+    Element titleEl = text(" Runes ");
+    if (focused) titleEl = titleEl | inverted;
+
+    // Canonical 33-rune name table (order = tier). Hard-coded because
+    // the pane may render before the RefDb has loaded a lookup and
+    // because these names are immutable across every D2/D2R patch.
+    static constexpr std::array<const char*, 33> kRuneNames = {
+        "El",   "Eld", "Tir",  "Nef",  "Eth", "Ith", "Tal",   "Ral",
+        "Ort",  "Thul","Amn",  "Sol",  "Shael","Dol","Hel",   "Io",
+        "Lum",  "Ko",  "Fal",  "Lem",  "Pul", "Um",  "Mal",   "Ist",
+        "Gul",  "Vex", "Ohm",  "Lo",   "Sur", "Ber", "Jah",   "Cham",
+        "Zod",
+    };
+
+    struct Row {
+        std::string code;   // "r01".."r33"
+        std::string name;   // e.g. "El Rune" (with " Rune" suffix appended)
+        std::uint32_t stash = 0;   // any location starting with "stash tab "
+        std::uint32_t carry = 0;   // everything else (character .d2s / merc)
+    };
+    std::array<Row, 33> rows{};
+    for (std::size_t i = 0; i < 33; ++i) {
+        char buf[4] = {'r', static_cast<char>('0' + (i + 1) / 10),
+                            static_cast<char>('0' + (i + 1) % 10), 0};
+        rows[i].code = std::string(buf);
+        rows[i].name = std::string(kRuneNames[i]) + " Rune";
+    }
+
+    static const std::string kStashPrefix = "stash tab ";
+    for (const auto& it : s.inventory) {
+        if (!isRuneCode(it.code)) continue;
+        // Decode the tail two digits of the code (already validated by
+        // isRuneCode) into a 0-based index into `rows`.
+        const int n = (it.code[1] - '0') * 10 + (it.code[2] - '0');
+        if (n < 1 || n > 33) continue;   // future-proof: skip unknown codes
+        const std::uint32_t qty = it.stacks > 0 ? it.stacks : 1u;
+        const bool inStash =
+            it.location.size() >= kStashPrefix.size() &&
+            it.location.compare(0, kStashPrefix.size(), kStashPrefix) == 0;
+        (inStash ? rows[n - 1].stash : rows[n - 1].carry) += qty;
+    }
+
+    // Totals summary.
+    std::uint32_t totStash = 0, totCarry = 0, distinct = 0;
+    for (const auto& r : rows) {
+        totStash += r.stash;
+        totCarry += r.carry;
+        if (r.stash + r.carry > 0) ++distinct;
+    }
+
+    // Column widths chosen for a compact ledger: 4 chars per number
+    // (up to 9999) leaves ~15 cols total plus the rune name.
+    constexpr int wCount = 4;
+    auto numCell = [](std::uint32_t n) {
+        return text(std::to_string(n))
+             | align_right | size(WIDTH, EQUAL, wCount);
+    };
+
+    Elements body;
+    body.push_back(hbox({
+        text("all runes") | bold | color(kHighlightColor),
+        text("  "),
+        text("(" + std::to_string(distinct) + "/33 distinct; "
+             + std::to_string(totStash + totCarry) + " total: "
+             + std::to_string(totStash) + " stash + "
+             + std::to_string(totCarry) + " carry)") | dim,
+    }));
+    body.push_back(separator());
+    body.push_back(hbox({
+        text("  "),
+        text("  #  code   name") | flex,
+        text("stash") | align_right | size(WIDTH, EQUAL, wCount + 1),
+        text(" "),
+        text("carry") | align_right | size(WIDTH, EQUAL, wCount + 1),
+        text(" "),
+        text("total") | align_right | size(WIDTH, EQUAL, wCount + 1),
+    }) | bold);
+    body.push_back(separator());
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+        const auto& r = rows[i];
+        const std::uint32_t total = r.stash + r.carry;
+        char tierBuf[8];
+        std::snprintf(tierBuf, sizeof(tierBuf), "  %2d  ",
+                      static_cast<int>(i + 1));
+        // Use the runeword palette hue for rune names: in D2R rune text
+        // shares the same warm-orange family as runewords. Muted for
+        // runes we don't own so the eye jumps to what's present.
+        const auto nameColor = total > 0
+            ? item_colors::runewordFull()
+            : item_colors::runewordMuted();
+        auto nameCell = hbox({
+            text(std::string(tierBuf)) | dim,
+            text(r.code + "    ") | dim,
+            text(r.name) | color(nameColor) | flex,
+        }) | flex;
+        // Right-side count columns; totals bolded for owned runes, all
+        // three columns dimmed when the rune is missing entirely so a
+        // sparse ledger still scans well.
+        auto stashCell = numCell(r.stash);
+        auto carryCell = numCell(r.carry);
+        auto totalCell = numCell(total);
+        if (total == 0) {
+            stashCell = stashCell | dim;
+            carryCell = carryCell | dim;
+            totalCell = totalCell | dim;
+        } else {
+            totalCell = totalCell | bold;
+        }
+        body.push_back(hbox({
+            nameCell,
+            text(" "),
+            stashCell,
+            text(" "),
+            carryCell,
+            text(" "),
+            totalCell,
+        }));
+    }
+    return window(titleEl,
+                  vbox(std::move(body)) | vscroll_indicator | yframe | flex);
 }
 
 // -------------------------- chronicle rendering -----------------------------
@@ -3141,6 +3295,9 @@ Element renderPane(PaneNode& node, const UiState& ui,
         case PaneType::TerrorZone:
             leafEl = renderTerrorZonePane(s, focused);
             break;
+        case PaneType::Runes:
+            leafEl = renderRunesPane(s, focused);
+            break;
     }
     // Pin the leaf so ftxui doesn't grow it to fit larger content (which
     // would steal rows from a horizontally-split sibling).
@@ -3273,6 +3430,7 @@ void cyclePaneType(PaneNode& leaf, int dir = 1) {
         PaneType::SessionLoot,
         PaneType::Uber,
         PaneType::TerrorZone,
+        PaneType::Runes,
     }, dir);
     leaf.config.cursor = 0;
     // Reset the Backups sub-mode so a freshly-cycled-into pane always

@@ -36,6 +36,16 @@ d2r::InventoryItem makeRune(std::string_view code, std::string_view name,
     return inv;
 }
 
+// Rune stack as it appears in the RotW material tab: a single
+// InventoryItem with `stacks = N` instead of N individual instances.
+d2r::InventoryItem makeRuneStack(std::string_view code, std::string_view name,
+                                  std::uint16_t stackSize,
+                                  std::string_view loc = "stash tab 6") {
+    auto inv = makeRune(code, name, loc);
+    inv.stacks = stackSize;
+    return inv;
+}
+
 d2r::InventoryItem makeUnique(std::uint32_t fingerprint, std::string_view name,
                                std::string_view code = "uni") {
     d2r::InventoryItem inv;
@@ -108,6 +118,27 @@ TEST_CASE("SessionState.runeStacks: ignores non-rune codes",
     const auto anchor = d2r::makeSessionStateFromSnapshot(snap);
     REQUIRE(anchor.runeStacks.size() == 1);
     REQUIRE(anchor.runeStacks.at("r08") == 1);
+}
+
+TEST_CASE("SessionState.runeStacks: sums stack sizes for material-tab piles",
+          "[dashboard_model][runes]") {
+    // D2R's material/rune tab stores each rune pile as a single
+    // InventoryItem with `stacks = N`. Aggregation must sum stacks
+    // instead of incrementing by 1 or a stack of 99 Amn Runes shows
+    // up as 1 in "New Runes" / the Runes pane.
+    d2r::DashboardSnapshot snap;
+    snap.inventory.push_back(makeRuneStack("r11", "Amn Rune", 99));  // full stack
+    snap.inventory.push_back(makeRuneStack("r05", "Eth Rune", 49));
+    // Extra loose Amn on a character adds 1 (stacks == 0 -> treated as 1).
+    snap.inventory.push_back(makeRune("r11", "Amn Rune", "Kai.d2s"));
+    // A stack of 1 must still contribute 1 (not double-counted as 0+1).
+    snap.inventory.push_back(makeRuneStack("r33", "Zod Rune", 1));
+
+    const auto anchor = d2r::makeSessionStateFromSnapshot(snap);
+    REQUIRE(anchor.runeStacks.size() == 3);
+    REQUIRE(anchor.runeStacks.at("r11") == 100);  // 99 stack + 1 loose
+    REQUIRE(anchor.runeStacks.at("r05") == 49);
+    REQUIRE(anchor.runeStacks.at("r33") == 1);
 }
 
 TEST_CASE("SessionState: unique/set fingerprints go into itemKeys",

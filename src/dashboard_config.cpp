@@ -117,6 +117,7 @@ std::string_view toString(PaneType t) {
         case PaneType::SessionLoot: return "session_loot";
         case PaneType::Uber:        return "uber";
         case PaneType::TerrorZone:  return "terror_zone";
+        case PaneType::Runes:       return "runes";
     }
     return "blank";
 }
@@ -210,6 +211,7 @@ std::string paneTitle(const PaneConfig& c) {
         case PaneType::SessionLoot: return "Session Info";
         case PaneType::Uber:        return "Uber";
         case PaneType::TerrorZone:  return "Terror Zone";
+        case PaneType::Runes:       return "Runes";
     }
     return "(unconfigured)";
 }
@@ -225,6 +227,7 @@ PaneType paneTypeFromString(std::string_view s) {
     if (s == "session_loot") return PaneType::SessionLoot;
     if (s == "uber")         return PaneType::Uber;
     if (s == "terror_zone")  return PaneType::TerrorZone;
+    if (s == "runes")        return PaneType::Runes;
     return PaneType::Blank;
 }
 
@@ -440,6 +443,7 @@ bool treeHasTopRowPane(const PaneNode& n) {
         case PaneType::SessionLoot:
         case PaneType::Uber:
         case PaneType::TerrorZone:
+        case PaneType::Runes:
             return true;
         default:
             return false;

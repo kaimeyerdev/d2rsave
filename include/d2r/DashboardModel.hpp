@@ -154,6 +154,13 @@ struct InventoryItem {
     // save of the current-or-just-ended play session; sessions end with
     // an S&E backup).
     std::uint32_t    fingerprint = 0;
+    // Stack count for stackable items (RotW material-stash: gems, runes,
+    // essences, keys, etc. are stored as a single item with `stacks=N`
+    // rather than N individual JM items). Zero means "not a stack" and
+    // callers must treat it as 1 for count purposes. Crucial for
+    // rune-tab totals -- a stack of 99 Amn Runes is one InventoryItem
+    // with `stacks=99`; incrementing by 1 undercounts by 98.
+    std::uint16_t    stacks      = 0;
     bool             identified  = false;
 };
 
