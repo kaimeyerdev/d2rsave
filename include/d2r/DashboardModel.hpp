@@ -650,6 +650,38 @@ struct SessionRunStats {
 // in-progress run whose oldest autosave is > `sessionEnd` is
 // excluded too. `sessionEnd == 0` disables the upper clip.
 //
+// Merge every character file's SaveAndExit events into a single
+// session-scoped chronology. This is the character-agnostic run
+// timeline the Session Info pane displays.
+//
+// Semantics: only one game is active at a time in D2R, so runs
+// within a session are strictly serial. Each run's `startEpoch` is
+// the previous run's `endEpoch` (across ALL characters), or
+// `sessionStart` when the run is first. The sum of durations
+// therefore exactly tiles `[sessionStart, sessionEnd]`, which the
+// old per-file `groupRunsForFile` couldn't guarantee (per-file
+// startEpochs clamped independently to sessionStart, so
+// two-character sessions double-counted).
+//
+// Algorithm: query per-file history via `backupDb->historyFor`,
+// collect every SaveAndExit row inside the window into a flat
+// vector `(date, file)`, sort ascending by date, then walk with a
+// cursor initialised to `sessionStart` -- each SaveAndExit closes
+// one run and opens the next. The trailing in-progress run
+// (autosaves past the last SaveAndExit) is attributed to whichever
+// file holds the newest such autosave; there's at most one because
+// only one D2R game can be live at a time.
+//
+// `backupDb == nullptr` returns an empty vector. `sessionEnd == 0`
+// disables the upper clip for in-progress duration (the trailing
+// run falls back to its last known autosave date, mirroring the
+// `runDurationSecs` convention).
+[[nodiscard]] std::vector<Run> groupSessionRuns(
+    BackupDb*                 backupDb,
+    const DashboardFileCache& cache,
+    std::int64_t              sessionStart,
+    std::int64_t              sessionEnd);
+
 // `backupDb == nullptr` returns an empty stats value (fresh install
 // or DB unavailable). Missing character names in cache entries fall
 // back to the filename stem (without ".d2s").

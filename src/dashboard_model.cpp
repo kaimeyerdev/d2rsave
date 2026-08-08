@@ -1451,6 +1451,117 @@ static std::string stripD2sSuffix(std::string name) {
     return name;
 }
 
+std::vector<Run> groupSessionRuns(
+    BackupDb*                 backupDb,
+    const DashboardFileCache& cache,
+    std::int64_t              sessionStart,
+    std::int64_t              sessionEnd) {
+    std::vector<Run> out;
+    if (!backupDb) return out;
+
+    // Step 1: collect every SaveAndExit event across every file
+    // whose date lies inside `[sessionStart, sessionEnd]`. Also
+    // remember, per file, the newest autosave date in the window --
+    // that's what identifies the trailing in-progress run below.
+    struct SaeEvent {
+        std::int64_t date;
+        std::string  file;
+    };
+    std::vector<SaeEvent> saes;
+    struct AutosaveTail {
+        std::int64_t newestAutosaveDate = 0;
+        std::vector<std::int64_t> pastLastSae;   // autosaves > lastSaeDate
+        std::int64_t              lastSaeDate    = 0;
+    };
+    std::unordered_map<std::string, AutosaveTail> tails;
+    for (const auto& [filename, entry] : cache.d2s) {
+        (void)entry;
+        std::vector<BackupDb::HistoryRow> hist;
+        try { hist = backupDb->historyFor(filename, 500); }
+        catch (const std::exception&) { continue; }
+        if (hist.empty()) continue;
+
+        auto& tail = tails[filename];
+        for (const auto& r : hist) {
+            if (r.date < sessionStart) continue;
+            if (sessionEnd > 0 && r.date > sessionEnd) continue;
+            switch (r.state) {
+                case BackupDb::State::SaveAndExit:
+                    saes.push_back({r.date, filename});
+                    if (r.date > tail.lastSaeDate) tail.lastSaeDate = r.date;
+                    break;
+                case BackupDb::State::Autosave:
+                case BackupDb::State::Other:
+                    if (r.date > tail.newestAutosaveDate) {
+                        tail.newestAutosaveDate = r.date;
+                    }
+                    break;
+                default: break;   // Deleted / Startup ignored
+            }
+        }
+        // Second pass: capture autosaves past the last SaveAndExit
+        // (drives the in-progress-run autosaveDates payload).
+        for (const auto& r : hist) {
+            if (r.date < sessionStart) continue;
+            if (sessionEnd > 0 && r.date > sessionEnd) continue;
+            if (r.state != BackupDb::State::Autosave
+                && r.state != BackupDb::State::Other) continue;
+            if (r.date <= tail.lastSaeDate) continue;
+            tail.pastLastSae.push_back(r.date);
+        }
+        std::sort(tail.pastLastSae.begin(), tail.pastLastSae.end());
+    }
+
+    // Step 2: sort SaveAndExit events chronologically and walk with a
+    // cursor. Each event closes the current run and opens the next
+    // one, regardless of which file owns it.
+    std::sort(saes.begin(), saes.end(),
+              [](const SaeEvent& a, const SaeEvent& b) {
+                  if (a.date != b.date) return a.date < b.date;
+                  return a.file < b.file;   // stable tiebreak
+              });
+    std::int64_t cursor = sessionStart;
+    for (const auto& e : saes) {
+        Run r;
+        r.characterFile = e.file;
+        r.startEpoch    = cursor;
+        r.endEpoch      = e.date;
+        r.inProgress    = false;
+        // Attach any autosaves the closing file emitted between
+        // cursor and e.date (best-effort; only used by the Backups
+        // pane which reruns the per-file grouper separately).
+        cursor          = e.date;
+        out.push_back(std::move(r));
+    }
+
+    // Step 3: at most one trailing in-progress run. Pick the file
+    // with the newest autosave date > cursor -- that's the game
+    // that's currently open, and the other files' post-SaveAndExit
+    // autosaves (if any) belong to a run whose SaveAndExit already
+    // fired inside the window and got emitted above.
+    std::string  inProgressFile;
+    std::int64_t inProgressNewest = 0;
+    for (const auto& [filename, tail] : tails) {
+        if (tail.newestAutosaveDate <= cursor) continue;
+        if (tail.newestAutosaveDate > inProgressNewest) {
+            inProgressNewest = tail.newestAutosaveDate;
+            inProgressFile   = filename;
+        }
+    }
+    if (!inProgressFile.empty()) {
+        Run r;
+        r.characterFile = inProgressFile;
+        r.startEpoch    = cursor;
+        r.endEpoch      = 0;
+        r.inProgress    = true;
+        auto& tail = tails[inProgressFile];
+        r.autosaveDates = std::move(tail.pastLastSae);
+        r.autosaveCount = static_cast<std::int32_t>(r.autosaveDates.size());
+        out.push_back(std::move(r));
+    }
+    return out;
+}
+
 SessionRunStats computeSessionRunStats(
     BackupDb*                 backupDb,
     const DashboardFileCache& cache,
@@ -1459,45 +1570,43 @@ SessionRunStats computeSessionRunStats(
     SessionRunStats out;
     if (!backupDb) return out;
 
-    for (const auto& [filename, entry] : cache.d2s) {
-        std::vector<BackupDb::HistoryRow> hist;
-        try { hist = backupDb->historyFor(filename, 500); }
-        catch (const std::exception&) { continue; }
-        if (hist.empty()) continue;
+    // Session Info's per-character rollup is now a thin aggregation
+    // over the session-wide chronology produced by
+    // `groupSessionRuns`. That path anchors each run to the previous
+    // run's endEpoch across ALL characters, so the sum of durations
+    // exactly tiles the session window instead of double-counting
+    // when two characters ran serially.
+    const auto runs = groupSessionRuns(backupDb, cache, sessionStart, sessionEnd);
 
-        auto runs = groupRunsForFile(filename, hist, sessionStart);
-
-        SessionRunStats::PerCharacter pc;
-        pc.characterFile = filename;
-        pc.characterName = entry.character.name.empty()
-                             ? stripD2sSuffix(filename)
-                             : entry.character.name;
-        for (const auto& r : runs) {
-            // Upper-bound clip: skip runs whose activity lies entirely
-            // past the session end. For closed runs the SaveAndExit
-            // date is the natural cutoff; for in-progress the OLDEST
-            // autosave in the run must be within the window (a run
-            // that started after the custom end doesn't count).
-            if (sessionEnd > 0) {
-                if (!r.inProgress && r.endEpoch > sessionEnd) continue;
-                if (r.inProgress
-                    && !r.autosaveDates.empty()
-                    && r.autosaveDates.front() > sessionEnd) continue;
-            }
-            if (r.inProgress) {
-                pc.hasInProgress = true;
-            } else {
-                ++pc.runCount;
-            }
-            pc.accumulatedSecs += runDurationSecs(r, sessionEnd);
+    // Cache per-character display names + files for the final PerCharacter
+    // rollup entries.
+    auto displayName = [&](const std::string& filename) -> std::string {
+        auto it = cache.d2s.find(filename);
+        if (it != cache.d2s.end() && !it->second.character.name.empty()) {
+            return it->second.character.name;
         }
-        if (pc.runCount == 0 && !pc.hasInProgress) continue;
+        return stripD2sSuffix(filename);
+    };
 
-        out.totalRuns     += pc.runCount;
-        out.totalSecs     += pc.accumulatedSecs;
-        if (pc.hasInProgress) out.anyInProgress = true;
-        out.perCharacter.push_back(std::move(pc));
+    std::unordered_map<std::string, SessionRunStats::PerCharacter> perFile;
+    for (const auto& r : runs) {
+        auto& pc = perFile[r.characterFile];
+        if (pc.characterFile.empty()) {
+            pc.characterFile = r.characterFile;
+            pc.characterName = displayName(r.characterFile);
+        }
+        if (r.inProgress) {
+            pc.hasInProgress = true;
+            out.anyInProgress = true;
+        } else {
+            ++pc.runCount;
+            ++out.totalRuns;
+        }
+        const std::int64_t secs = runDurationSecs(r, sessionEnd);
+        pc.accumulatedSecs += secs;
+        out.totalSecs      += secs;
     }
+    for (auto& [_, pc] : perFile) out.perCharacter.push_back(std::move(pc));
 
     // Sort by accumulated wall-clock time descending, then by
     // character name ascending for ties. The Session Info pane

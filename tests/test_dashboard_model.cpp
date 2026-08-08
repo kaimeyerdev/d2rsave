@@ -721,24 +721,27 @@ TEST_CASE("computeSessionRunStats: aggregates runs across two characters",
     RunStatsScratch sc;
     d2r::BackupDb db(sc.path / "backups.sqlite");
 
-    // Kai: two closed runs.
-    //  Run 1: startEpoch=0 (sessionStart), SaveAndExit at 300 -> 300.
-    //  Run 2: startEpoch=300 (prev SaveAndExit), SaveAndExit at 600 -> 300.
+    // Session-wide chronology has to be strictly serial -- D2R only
+    // ever has one game live at a time. Kai plays first (two closed
+    // runs), then Barbarian takes over (one closed run + a trailing
+    // in-progress run whose autosaves come after Kai's last
+    // SaveAndExit).
+    //
+    //  Kai run 1:      0 -> 300  (autosaves 100, 200; S&E 300)  = 300
+    //  Kai run 2:      300 -> 600 (autosaves 400, 500; S&E 600) = 300
+    //  Barbarian r1:   600 -> 800 (autosaves 700; S&E 800)      = 200
+    //  Barbarian r2*:  800 -> 950 (autosaves 900, 950; in prog) = 150
+    //  Total:          950 (= session span from 0 to 950)
     insertRow(db, "Kai.d2s", 100, d2r::BackupDb::State::Autosave);
     insertRow(db, "Kai.d2s", 200, d2r::BackupDb::State::Autosave);
     insertRow(db, "Kai.d2s", 300, d2r::BackupDb::State::SaveAndExit);
     insertRow(db, "Kai.d2s", 400, d2r::BackupDb::State::Autosave);
     insertRow(db, "Kai.d2s", 500, d2r::BackupDb::State::Autosave);
     insertRow(db, "Kai.d2s", 600, d2r::BackupDb::State::SaveAndExit);
-    // Barbarian: one closed run + trailing in-progress.
-    //  Run 1: startEpoch=0, SaveAndExit at 350 -> 350.
-    //  Run 2 in progress: startEpoch=350, sessionEnd=0 in this test
-    //    (fallback to last autosave at 550) -> 200.
-    insertRow(db, "Barbarian.d2s", 150, d2r::BackupDb::State::Autosave);
-    insertRow(db, "Barbarian.d2s", 250, d2r::BackupDb::State::Autosave);
-    insertRow(db, "Barbarian.d2s", 350, d2r::BackupDb::State::SaveAndExit);
-    insertRow(db, "Barbarian.d2s", 450, d2r::BackupDb::State::Autosave);
-    insertRow(db, "Barbarian.d2s", 550, d2r::BackupDb::State::Autosave);
+    insertRow(db, "Barbarian.d2s", 700, d2r::BackupDb::State::Autosave);
+    insertRow(db, "Barbarian.d2s", 800, d2r::BackupDb::State::SaveAndExit);
+    insertRow(db, "Barbarian.d2s", 900, d2r::BackupDb::State::Autosave);
+    insertRow(db, "Barbarian.d2s", 950, d2r::BackupDb::State::Autosave);
 
     d2r::DashboardFileCache cache;
     addCacheEntry(cache, "Kai.d2s",       "Kai");
@@ -749,10 +752,10 @@ TEST_CASE("computeSessionRunStats: aggregates runs across two characters",
                                                      /*sessionEnd=*/0);
     REQUIRE(stats.perCharacter.size() == 2);
     REQUIRE(stats.totalRuns == 3);      // 2 + 1 closed
-    REQUIRE(stats.anyInProgress);
-    REQUIRE(stats.totalSecs == 1150);   // 300 + 300 + 350 + 200
+    REQUIRE(stats.anyInProgress);       // Barbarian's tail is in progress
+    REQUIRE(stats.totalSecs == 950);    // 300 + 300 + 200 + 150
 
-    // Order: descending by accumulatedSecs (Kai 600 > Karsh 550).
+    // Order: descending by accumulatedSecs (Kai 600 > Karsh 350).
     REQUIRE(stats.perCharacter[0].characterName    == "Kai");
     REQUIRE(stats.perCharacter[0].runCount         == 2);
     REQUIRE_FALSE(stats.perCharacter[0].hasInProgress);
@@ -761,7 +764,7 @@ TEST_CASE("computeSessionRunStats: aggregates runs across two characters",
     REQUIRE(stats.perCharacter[1].characterName    == "Karsh");
     REQUIRE(stats.perCharacter[1].runCount         == 1);
     REQUIRE(stats.perCharacter[1].hasInProgress);
-    REQUIRE(stats.perCharacter[1].accumulatedSecs  == 550);
+    REQUIRE(stats.perCharacter[1].accumulatedSecs  == 350);
 }
 
 TEST_CASE("computeSessionRunStats: sessionStart clips out earlier runs",
@@ -862,6 +865,47 @@ TEST_CASE("computeSessionRunStats: character name falls back to filename stem",
     const auto stats = d2r::computeSessionRunStats(&db, cache, 0, 0);
     REQUIRE(stats.perCharacter.size() == 1);
     REQUIRE(stats.perCharacter[0].characterName == "Warlock");
+}
+
+TEST_CASE("computeSessionRunStats: cross-character sequential runs tile the "
+          "session window exactly",
+          "[dashboard_model][runs][stats]") {
+    // Regression for the "Total run time was 8h 14m in a 2h 23m
+    // session" report. Two characters play back-to-back inside the
+    // window; the sum of per-character accumulatedSecs must equal
+    // the window itself, because run N+1's startEpoch is defined as
+    // run N's endEpoch (across ALL characters) rather than the
+    // per-file previous SaveAndExit.
+    RunStatsScratch sc;
+    d2r::BackupDb db(sc.path / "backups.sqlite");
+
+    // Kai plays first (200 seconds), then Barbarian takes over and
+    // plays for the rest of the window.
+    insertRow(db, "Kai.d2s",       150, d2r::BackupDb::State::Autosave);
+    insertRow(db, "Kai.d2s",       300, d2r::BackupDb::State::SaveAndExit);
+    insertRow(db, "Barbarian.d2s", 400, d2r::BackupDb::State::Autosave);
+    insertRow(db, "Barbarian.d2s", 500, d2r::BackupDb::State::SaveAndExit);
+
+    d2r::DashboardFileCache cache;
+    addCacheEntry(cache, "Kai.d2s",       "Kai");
+    addCacheEntry(cache, "Barbarian.d2s", "Karsh");
+
+    const std::int64_t sessionStart = 100;
+    const std::int64_t sessionEnd   = 500;
+    const auto stats = d2r::computeSessionRunStats(&db, cache,
+                                                     sessionStart,
+                                                     sessionEnd);
+    REQUIRE(stats.perCharacter.size() == 2);
+    // Kai's one run: 100 -> 300 = 200s.
+    REQUIRE(stats.perCharacter[0].characterName    == "Kai");
+    REQUIRE(stats.perCharacter[0].accumulatedSecs  == 200);
+    // Barbarian's one run: 300 (Kai's endEpoch) -> 500 = 200s.
+    REQUIRE(stats.perCharacter[1].characterName    == "Karsh");
+    REQUIRE(stats.perCharacter[1].accumulatedSecs  == 200);
+    // Sum tiles the window exactly (400 seconds), not the old per-file
+    // total of 400 + 400 = 800 (each character clipped to
+    // sessionStart individually).
+    REQUIRE(stats.totalSecs == sessionEnd - sessionStart);
 }
 
 // ---------------------------------------------------------------------------

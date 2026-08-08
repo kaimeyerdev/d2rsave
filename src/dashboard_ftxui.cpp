@@ -924,6 +924,11 @@ Element renderSessionLootPane(const PaneConfig&        cfg,
         if (runStats.perCharacter.empty()) {
             runRows.push_back(text("  (none this session)") | dim);
         } else {
+            // Per-character rows. Totals aren't emitted -- they're
+            // trivially the sum of what's already listed, and the
+            // pane's Time header line already shows session
+            // wall-clock which now equals the total (session-scoped
+            // run timeline tiles the window exactly).
             for (const auto& pc : runStats.perCharacter) {
                 runRows.push_back(hbox({
                     text("  "),
@@ -932,16 +937,6 @@ Element renderSessionLootPane(const PaneConfig&        cfg,
                     text(formatRunCount(pc.runCount, pc.hasInProgress)),
                     text("  "),
                     text(formatElapsedHMS(pc.accumulatedSecs)) | dim,
-                }));
-            }
-            if (runStats.perCharacter.size() > 1) {
-                runRows.push_back(hbox({
-                    text("  Total") | bold,
-                    text("  ") | flex,
-                    text(formatRunCount(runStats.totalRuns,
-                                          runStats.anyInProgress)) | bold,
-                    text("  "),
-                    text(formatElapsedHMS(runStats.totalSecs)) | bold,
                 }));
             }
         }
