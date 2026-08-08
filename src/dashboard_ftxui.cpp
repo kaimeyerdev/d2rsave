@@ -1072,164 +1072,6 @@ Element renderTerrorZonePane(const DashboardSnapshot& s, bool focused) {
     }));
 }
 
-// -----------------------------------------------------------------------
-// Runes pane: full 33-rune ledger split by physical location.
-//
-// Enumerates all 33 canonical runes (r01 El -> r33 Zod) regardless of
-// ownership so the user sees at a glance which runes are missing.
-// Each row splits its total between three location buckets:
-//
-//   * stash     -- items whose location begins with "stash tab "
-//                  (either a standard grid tab or the material tab).
-//                  The material tab stores each rune as one item with
-//                  `stacks = N`; this bucket sums stack sizes.
-//   * inventory -- runes carried in a character's grid, belt, cube,
-//                  or mercenary. Typically 0 for accounts that keep
-//                  their runes in the material tab.
-//   * socketed  -- runes inserted into a socketed weapon or armor.
-//                  Unrecoverable in the game (unsocketing destroys
-//                  the socketed items), so these are split out to
-//                  give an accurate "usable inventory" picture.
-//
-// A rune's `total` is the sum of all three; that's the same number
-// the Session Loot pane's "New Runes" diff uses on the "now" side.
-// -----------------------------------------------------------------------
-Element renderRunesPane(const DashboardSnapshot& s, bool focused,
-                        float scrollFrac) {
-    Element titleEl = text(" Runes ");
-    if (focused) titleEl = titleEl | inverted;
-
-    // Canonical 33-rune name table (order = tier). Hard-coded because
-    // the pane may render before the RefDb has loaded a lookup and
-    // because these names are immutable across every D2/D2R patch.
-    static constexpr std::array<const char*, 33> kRuneNames = {
-        "El",   "Eld", "Tir",  "Nef",  "Eth", "Ith", "Tal",   "Ral",
-        "Ort",  "Thul","Amn",  "Sol",  "Shael","Dol","Hel",   "Io",
-        "Lum",  "Ko",  "Fal",  "Lem",  "Pul", "Um",  "Mal",   "Ist",
-        "Gul",  "Vex", "Ohm",  "Lo",   "Sur", "Ber", "Jah",   "Cham",
-        "Zod",
-    };
-
-    struct Row {
-        std::string name;   // e.g. "El Rune"
-        std::uint32_t stash    = 0;
-        std::uint32_t inv      = 0;   // carried loose (character grid / merc)
-        std::uint32_t socketed = 0;   // locked in a socketed item
-    };
-    std::array<Row, 33> rows{};
-    for (std::size_t i = 0; i < 33; ++i) {
-        rows[i].name = std::string(kRuneNames[i]) + " Rune";
-    }
-
-    static const std::string kStashPrefix = "stash tab ";
-    for (const auto& it : s.inventory) {
-        if (!isRuneCode(it.code)) continue;
-        // Decode the tail two digits (already validated by isRuneCode)
-        // into a 0-based tier index.
-        const int n = (it.code[1] - '0') * 10 + (it.code[2] - '0');
-        if (n < 1 || n > 33) continue;   // future-proof: skip unknown codes
-        const std::uint32_t qty = it.stacks > 0 ? it.stacks : 1u;
-        // Bucket priority: socketed wins over stash. A rune socketed
-        // into an item stored in the stash is still unrecoverable, so
-        // it belongs in the "socketed" bucket regardless of the
-        // parent's location.
-        auto& row = rows[n - 1];
-        if (it.socketed) {
-            row.socketed += qty;
-        } else if (it.location.size() >= kStashPrefix.size() &&
-                   it.location.compare(0, kStashPrefix.size(), kStashPrefix) == 0) {
-            row.stash += qty;
-        } else {
-            row.inv += qty;
-        }
-    }
-
-    // Totals summary.
-    std::uint32_t totStash = 0, totInv = 0, totSock = 0, distinct = 0;
-    for (const auto& r : rows) {
-        totStash += r.stash;
-        totInv   += r.inv;
-        totSock  += r.socketed;
-        if (r.stash + r.inv + r.socketed > 0) ++distinct;
-    }
-
-    // Compact ledger: 6-char right-aligned number columns fit any
-    // realistic per-rune total and give the headers ("stash", "inv",
-    // "socket", "total") enough breathing room.
-    constexpr int wCount = 6;
-    auto numCell = [](std::uint32_t n) {
-        return text(std::to_string(n))
-             | align_right | size(WIDTH, EQUAL, wCount);
-    };
-    auto headerCell = [](const char* label) {
-        return text(label) | align_right | size(WIDTH, EQUAL, wCount);
-    };
-
-    Elements body;
-    body.push_back(hbox({
-        text("all runes") | bold | color(kHighlightColor),
-        text("  "),
-        text("(" + std::to_string(distinct) + "/33 distinct; "
-             + std::to_string(totStash + totInv + totSock) + " total: "
-             + std::to_string(totStash)  + " stash + "
-             + std::to_string(totInv)    + " inv + "
-             + std::to_string(totSock)   + " socketed)") | dim,
-    }));
-    body.push_back(separator());
-    body.push_back(hbox({
-        text("  "),
-        text("name") | flex,
-        headerCell("stash"),
-        text(" "),
-        headerCell("inv"),
-        text(" "),
-        headerCell("socket"),
-        text(" "),
-        headerCell("total"),
-    }) | bold);
-    body.push_back(separator());
-    for (std::size_t i = 0; i < rows.size(); ++i) {
-        const auto& r = rows[i];
-        const std::uint32_t total = r.stash + r.inv + r.socketed;
-        // D2R renders rune text in the same warm-orange family as
-        // runewords; muted for missing runes so the eye jumps to what
-        // is present.
-        const auto nameColor = total > 0
-            ? item_colors::runewordFull()
-            : item_colors::runewordMuted();
-        auto nameCell = hbox({
-            text("  "),
-            text(r.name) | color(nameColor) | flex,
-        }) | flex;
-        auto stashCell = numCell(r.stash);
-        auto invCell   = numCell(r.inv);
-        auto sockCell  = numCell(r.socketed);
-        auto totalCell = numCell(total);
-        if (total == 0) {
-            stashCell = stashCell | dim;
-            invCell   = invCell   | dim;
-            sockCell  = sockCell  | dim;
-            totalCell = totalCell | dim;
-        } else {
-            totalCell = totalCell | bold;
-        }
-        body.push_back(hbox({
-            nameCell,
-            stashCell,
-            text(" "),
-            invCell,
-            text(" "),
-            sockCell,
-            text(" "),
-            totalCell,
-        }));
-    }
-    return window(titleEl,
-                  vbox(std::move(body))
-                    | focusPositionRelative(0.f, scrollFrac)
-                    | vscroll_indicator | yframe | flex);
-}
-
 // -------------------------- chronicle rendering -----------------------------
 
 std::string sortKeyLabel(PaneSortKey k) {
@@ -3658,9 +3500,6 @@ Element renderPane(PaneNode& node, const UiState& ui,
         case PaneType::TerrorZone:
             leafEl = renderTerrorZonePane(s, focused);
             break;
-        case PaneType::Runes:
-            leafEl = renderRunesPane(s, focused, paneScrollFrac(&node));
-            break;
     }
     // Pin the leaf so ftxui doesn't grow it to fit larger content (which
     // would steal rows from a horizontally-split sibling).
@@ -3799,7 +3638,6 @@ void cyclePaneType(PaneNode& leaf, int dir = 1) {
         PaneType::SessionLoot,
         PaneType::Uber,
         PaneType::TerrorZone,
-        PaneType::Runes,
     }, dir);
     leaf.config.cursor = 0;
     // Reset the Backups sub-mode so a freshly-cycled-into pane always
@@ -4894,13 +4732,12 @@ int runDashboard(const std::filesystem::path& savePath,
         auto* leaf = focusedLeaf();
         if (!leaf) return false;
 
-        // Session Info and Runes panes are not row-cursor driven; they
-        // scroll via a per-leaf fraction that feeds focusPositionRelative
-        // inside the pane's yframe. Handle arrows here so the shownRows
-        // path below (which only knows about cursor-driven panes) never
+        // Session Info pane isn't row-cursor driven; it scrolls via a
+        // per-leaf fraction that feeds focusPositionRelative inside
+        // the pane's yframe. Handle arrows here so the shownRows path
+        // below (which only knows about cursor-driven panes) never
         // sees the event.
-        if (leaf->config.type == PaneType::SessionLoot ||
-            leaf->config.type == PaneType::Runes) {
+        if (leaf->config.type == PaneType::SessionLoot) {
             auto& frac = ui.paneScrollFrac[leaf];
             auto nudge = [&](float delta) {
                 frac = std::clamp(frac + delta, 0.f, 1.f);

@@ -44,7 +44,7 @@ TEST_CASE("PaneType enum round-trips through toString/fromString", "[dashboard_c
         d2r::PaneType::Blank, d2r::PaneType::Chronicle, d2r::PaneType::Inventory,
         d2r::PaneType::Reconcile, d2r::PaneType::Backups, d2r::PaneType::BackupLog,
         d2r::PaneType::Session, d2r::PaneType::Character, d2r::PaneType::SessionLoot,
-        d2r::PaneType::Uber, d2r::PaneType::TerrorZone, d2r::PaneType::Runes,
+        d2r::PaneType::Uber, d2r::PaneType::TerrorZone,
     }) {
         INFO("PaneType index=" << static_cast<int>(t));
         REQUIRE(d2r::paneTypeFromString(d2r::toString(t)) == t);
@@ -56,7 +56,7 @@ TEST_CASE("paneTitle produces non-empty labels for every PaneType", "[dashboard_
         d2r::PaneType::Blank, d2r::PaneType::Chronicle, d2r::PaneType::Inventory,
         d2r::PaneType::Reconcile, d2r::PaneType::Backups, d2r::PaneType::BackupLog,
         d2r::PaneType::Session, d2r::PaneType::Character, d2r::PaneType::SessionLoot,
-        d2r::PaneType::Uber, d2r::PaneType::TerrorZone, d2r::PaneType::Runes,
+        d2r::PaneType::Uber, d2r::PaneType::TerrorZone,
     }) {
         d2r::PaneConfig c;
         c.type = t;

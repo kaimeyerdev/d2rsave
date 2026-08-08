@@ -39,8 +39,6 @@ enum class PaneType : std::uint8_t {
     SessionLoot, // New uniques, sets, and runes since the session anchor.
     Uber,        // Uber-key state: keys, torch, ubers, ancients, torch-by-class.
     TerrorZone,  // Worldstone shard counts for terror-zone farming.
-    Runes,       // Per-code counts of runes currently in the shared stash.
-                 // Bypasses the session diff; renders the raw snapshot.
 };
 
 enum class ChronicleCategory : std::uint8_t {
