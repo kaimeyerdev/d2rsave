@@ -140,6 +140,15 @@ struct InventoryItem {
     std::string      name;         // primary display name
     std::string      baseName;     // base item type (may equal name)
     std::string      location;     // e.g. "Kai.d2s" or "stash tab 3"
+    // Second-level bucket used by the Inventory pane's tree grouping.
+    // For character (`.d2s`) sources: "Equipped" / "Inventory" /
+    // "Stash" / "Belt" / "Cube" / "Merc" / "Corpse" / "Iron Golem" --
+    // computed from `Item.container` and `Item.location` for the main
+    // character-items pass, hard-coded for the merc / corpse /
+    // iron-golem passes. For shared-stash (`.d2i`) sources this is
+    // left empty; the pane derives Tab N / Runes / Gems / Materials
+    // from the `location` string and the item's `code` at render time.
+    std::string      subLocation;
     // Base item code (3 chars, e.g. "r15" for Hel Rune, "pk1" for Key
     // of Terror). Used by the Session Loot pane to bucket runes by
     // code without a name-string dance; empty when the item didn't
@@ -214,6 +223,16 @@ struct DashboardSnapshot {
 [[nodiscard]] DashboardSnapshot buildSnapshot(RefDb& db,
                                               const std::filesystem::path& saveDir,
                                               const std::filesystem::path& stashPath);
+
+// Classify a character-owned item's parent container into the label the
+// Inventory pane's tree renders as a sub-node under the character
+// (see `InventoryItem::subLocation`). Reads `Item.location` (3 bits,
+// 1 = equipped body slot, 2 = belt) and `Item.container` (3 bits,
+// 1 = personal grid, 4 = horadric cube, 5 = personal stash); falls
+// through to "Inventory" when neither field pins a specific bucket.
+// Exposed for the classifier tests; the aggregator sites in
+// `dashboard_model.cpp` use it directly.
+[[nodiscard]] std::string characterItemSubLoc(const Item& it) noexcept;
 
 // ---------------------------------------------------------------------------
 // Incremental snapshot pipeline (dashboard hot path).

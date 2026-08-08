@@ -158,6 +158,42 @@ TEST_CASE("SessionState.runeStacks: socketed flag doesn't hide runes from the to
     REQUIRE(anchor.runeStacks.at("r14") == 2);
 }
 
+TEST_CASE("characterItemSubLoc: on-disk container/location bits map to tree labels",
+          "[dashboard_model][inventory_tree]") {
+    // Verifies the wire-format decoding used by the Inventory pane's
+    // tree grouping. Item.location values 1/2 pin equipped body slots
+    // and belt slots regardless of what container is set to; the
+    // container field only matters for the location=0 (stored) case.
+    d2r::Item it;
+
+    it.location = 1;  it.container = 0;  // equipped body slot
+    REQUIRE(d2r::characterItemSubLoc(it) == "Equipped");
+
+    it.location = 2;  it.container = 0;  // belt slot
+    REQUIRE(d2r::characterItemSubLoc(it) == "Belt");
+
+    it.location = 0;  it.container = 5;  // personal .d2s stash
+    REQUIRE(d2r::characterItemSubLoc(it) == "Stash");
+
+    it.location = 0;  it.container = 4;  // horadric cube
+    REQUIRE(d2r::characterItemSubLoc(it) == "Cube");
+
+    it.location = 0;  it.container = 1;  // grid inventory
+    REQUIRE(d2r::characterItemSubLoc(it) == "Inventory");
+
+    // Location=1 wins over any container assignment: an equipped item
+    // whose container bits were left as 5 (stash) still reads as
+    // Equipped -- location decides first.
+    it.location = 1;  it.container = 5;
+    REQUIRE(d2r::characterItemSubLoc(it) == "Equipped");
+
+    // Anything we don't recognise (D2R adds a bit later, a raw fixture
+    // that never set the flag, etc.) falls back to Inventory so items
+    // still show up in the tree instead of vanishing.
+    it.location = 0;  it.container = 0;
+    REQUIRE(d2r::characterItemSubLoc(it) == "Inventory");
+}
+
 TEST_CASE("SessionState: unique/set fingerprints go into itemKeys",
           "[dashboard_model][session_loot]") {
     d2r::DashboardSnapshot snap;

@@ -316,14 +316,18 @@ DashboardFileCache::D2sEntry parseD2sIntoEntry(
     ItemParser p(db);
     const std::string filestr(filename);
     auto record = [&](const std::vector<Item>& items,
-                      const std::string&       loc) {
+                      const std::string&       loc,
+                      const std::string&       subLocOverride) {
         for (const auto& it : items) {
             countQuestItem(it, out.hellfire, out.colossal, out.terror);
+            const std::string subLoc =
+                subLocOverride.empty() ? characterItemSubLoc(it) : subLocOverride;
             InventoryItem inv;
             inv.name        = primaryName(db, it);
             inv.baseName    = lookupBaseName(db, it.code);
             inv.code        = it.code;
             inv.location    = loc;
+            inv.subLocation = subLoc;
             inv.quality     = it.quality;
             inv.fingerprint = it.fingerprint;
             inv.stacks      = it.stacks;
@@ -349,6 +353,7 @@ DashboardFileCache::D2sEntry parseD2sIntoEntry(
                 sInv.baseName    = lookupBaseName(db, s.code);
                 sInv.code        = s.code;
                 sInv.location    = loc;
+                sInv.subLocation = subLoc;   // inherit parent's bucket
                 sInv.quality     = s.quality;
                 sInv.fingerprint = s.fingerprint;
                 sInv.stacks      = s.stacks;
@@ -366,20 +371,20 @@ DashboardFileCache::D2sEntry parseD2sIntoEntry(
         }
     };
     try {
-        record(p.parseItems(bytes, out.character.itemsOffset), filestr);
+        record(p.parseItems(bytes, out.character.itemsOffset), filestr, "");
         if (out.character.mercItemsJMOffset) {
             record(p.parseItems(bytes, out.character.mercItemsJMOffset),
-                   filestr + " (merc)");
+                   filestr + " (merc)", "Merc");
         }
         if (out.character.corpseJMOffset && out.character.corpseItemCount == 1) {
             record(p.parseItems(bytes, out.character.corpseJMOffset + 16),
-                   filestr + " (corpse)");
+                   filestr + " (corpse)", "Corpse");
         }
         if (out.character.hasIronGolem && out.character.ironGolemItemOffset) {
             try {
                 std::vector<Item> golem{
                     p.parseSingleItem(bytes, out.character.ironGolemItemOffset)};
-                record(golem, filestr + " (iron golem)");
+                record(golem, filestr + " (iron golem)", "Iron Golem");
             } catch (const std::exception&) {}
         }
     } catch (const std::exception&) {
@@ -562,6 +567,18 @@ void ensureCacheTables(RefDb& db, DashboardFileCache& cache) {
 std::uint64_t experienceToReachLevel(std::uint32_t level) noexcept {
     if (level >= 100) return kExpToReachLevel[99];
     return kExpToReachLevel[level];
+}
+
+// Definition matches the declaration in DashboardModel.hpp. Lives at
+// d2r:: scope (not the anonymous namespace above) so tests can reach
+// it. The aggregator sites inside the anonymous namespace still call
+// it unqualified via enclosing-namespace lookup.
+std::string characterItemSubLoc(const Item& it) noexcept {
+    if (it.location == 1)  return "Equipped";
+    if (it.location == 2)  return "Belt";
+    if (it.container == 5) return "Stash";
+    if (it.container == 4) return "Cube";
+    return "Inventory";
 }
 
 // ---------------------------------------------------------------------------
@@ -1064,13 +1081,17 @@ bool overrideActivePlayerFromBytes(DashboardSnapshot&         snap,
     if (ch.itemsOffset != 0) {
         ItemParser p(db);
         auto push = [&](const std::vector<Item>& items,
-                        const std::string& loc) {
+                        const std::string& loc,
+                        const std::string& subLocOverride) {
             for (const auto& it : items) {
+                const std::string subLoc = subLocOverride.empty()
+                    ? characterItemSubLoc(it) : subLocOverride;
                 InventoryItem inv;
                 inv.name        = primaryName(db, it);
                 inv.baseName    = lookupBaseName(db, it.code);
                 inv.code        = it.code;
                 inv.location    = loc;
+                inv.subLocation = subLoc;
                 inv.quality     = it.quality;
                 inv.fingerprint = it.fingerprint;
                 inv.stacks      = it.stacks;
@@ -1082,6 +1103,7 @@ bool overrideActivePlayerFromBytes(DashboardSnapshot&         snap,
                     sInv.baseName    = lookupBaseName(db, s.code);
                     sInv.code        = s.code;
                     sInv.location    = loc;
+                    sInv.subLocation = subLoc;   // inherit parent's bucket
                     sInv.quality     = s.quality;
                     sInv.fingerprint = s.fingerprint;
                     sInv.stacks      = s.stacks;
@@ -1092,20 +1114,20 @@ bool overrideActivePlayerFromBytes(DashboardSnapshot&         snap,
             }
         };
         try {
-            push(p.parseItems(characterBytes, ch.itemsOffset), filenameStr);
+            push(p.parseItems(characterBytes, ch.itemsOffset), filenameStr, "");
             if (ch.mercItemsJMOffset) {
                 push(p.parseItems(characterBytes, ch.mercItemsJMOffset),
-                     filenameStr + " (merc)");
+                     filenameStr + " (merc)", "Merc");
             }
             if (ch.corpseJMOffset && ch.corpseItemCount == 1) {
                 push(p.parseItems(characterBytes, ch.corpseJMOffset + 16),
-                     filenameStr + " (corpse)");
+                     filenameStr + " (corpse)", "Corpse");
             }
             if (ch.hasIronGolem && ch.ironGolemItemOffset) {
                 try {
                     std::vector<Item> golem{
                         p.parseSingleItem(characterBytes, ch.ironGolemItemOffset)};
-                    push(golem, filenameStr + " (iron golem)");
+                    push(golem, filenameStr + " (iron golem)", "Iron Golem");
                 } catch (const std::exception&) {}
             }
         } catch (const std::exception&) {
