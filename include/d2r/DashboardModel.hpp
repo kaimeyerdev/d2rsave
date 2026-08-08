@@ -165,11 +165,19 @@ struct InventoryItem {
     std::uint32_t    fingerprint = 0;
     // Stack count for stackable items (RotW material-stash: gems, runes,
     // essences, keys, etc. are stored as a single item with `stacks=N`
-    // rather than N individual JM items). Zero means "not a stack" and
-    // callers must treat it as 1 for count purposes. Crucial for
-    // rune-tab totals -- a stack of 99 Amn Runes is one InventoryItem
-    // with `stacks=99`; incrementing by 1 undercounts by 98.
+    // rather than N individual JM items). Interpretation depends on
+    // `hasStackSlot` below: a material-tab slot with `stacks==0` means
+    // the user owns zero of that rune/gem; a loose non-stackable item
+    // with `stacks==0` means the field was never written and the item
+    // counts as 1. Callers should route through `effectiveStackCount`
+    // rather than reading `stacks` directly.
     std::uint16_t    stacks      = 0;
+    // True when `stacks` came from a RotW material-stash slot header
+    // (i.e., the parser hit the material-stash bit). Distinguishes an
+    // authoritatively-empty slot from a loose item whose field
+    // defaulted to zero. See the `Item.hasStackSlot` comment for the
+    // wire-format details.
+    bool             hasStackSlot = false;
     bool             identified  = false;
     // True when this item was parsed as one of a parent item's
     // `socketedItems` (a rune / jewel / gem locked inside a socketed
@@ -179,6 +187,16 @@ struct InventoryItem {
     // still copied here so we know *which* item holds the socket.
     bool             socketed    = false;
 };
+
+// Effective per-item stack count used everywhere we sum ownership:
+//   * Material-tab slot (`hasStackSlot == true`): `stacks` verbatim,
+//     including 0 for empty slots.
+//   * Everywhere else: `stacks` if positive, otherwise 1 (loose
+//     non-stackable item).
+[[nodiscard]] inline std::uint32_t effectiveStackCount(const InventoryItem& it) noexcept {
+    if (it.hasStackSlot) return it.stacks;
+    return it.stacks > 0 ? it.stacks : 1u;
+}
 
 // One entry in the reconcile diff. Emitted for every unique/set that is
 // either owned but not discovered OR discovered but not owned (i.e. the

@@ -471,7 +471,8 @@ Item ItemParser::parseItem(BitReader& br) {
 
         // RotW material-stash stack count.
         if (br.readBool()) {
-            item.stacks = br.readByte(8);
+            item.stacks       = br.readByte(8);
+            item.hasStackSlot = true;
         }
 
         // Socketed sub-items recurse via parseItem().
@@ -490,7 +491,10 @@ Item ItemParser::parseItem(BitReader& br) {
     if (item.simple) {
         if (misc && misc->advancedStashStackable) {
             const bool hasData = br.readBool();
-            if (hasData) item.stacks = br.readByte(8);
+            if (hasData) {
+                item.stacks       = br.readByte(8);
+                item.hasStackSlot = true;
+            }
         }
         const auto peek = br.peekNextByte();
         if (br.bitsToNextBoundary() == 0 && peek != 16 &&

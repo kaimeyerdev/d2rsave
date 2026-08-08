@@ -788,10 +788,11 @@ Element renderSessionLootPane(const PaneConfig&        cfg,
         std::unordered_map<std::string, std::string>   nameByCode;
         for (const auto& it : s.inventory) {
             if (!isRuneCode(it.code)) continue;
-            // Stackable material-tab entries carry their pile size in
-            // `stacks`; treat a zero stacks field as a single loose rune.
-            const std::uint32_t qty = it.stacks > 0 ? it.stacks : 1u;
-            nowStacks[it.code] += qty;
+            // Route through effectiveStackCount so a material-tab
+            // slot's `stacks==0` reads as 0 (empty slot, user owns
+            // none) while a loose rune whose stacks field was never
+            // written still counts as 1.
+            nowStacks[it.code] += effectiveStackCount(it);
             // First occurrence wins; runes always share the same name
             // for a given code so any exemplar is fine.
             nameByCode.try_emplace(it.code, it.name);
@@ -1532,7 +1533,7 @@ struct InvVisibleRow {
             sec.entries.reserve(raw.size());
             for (auto* it : raw) {
                 sec.entries.push_back(InvSectionEntry{it, {}, {}});
-                sec.stackSum += it->stacks > 0 ? it->stacks : 1u;
+                sec.stackSum += effectiveStackCount(*it);
                 ++sec.realItemCount;
             }
             return sec;
@@ -1544,9 +1545,21 @@ struct InvVisibleRow {
         // renders with a count of 0. Placeholder rows respect the
         // search query so a targeted lookup ("Zod") only surfaces
         // its match rather than every catalog entry.
+        //
+        // A material-tab slot with `hasStackSlot && stacks == 0` is
+        // an authoritatively-empty slot -- the game reserves a row
+        // for every rune type regardless of ownership. Treat those
+        // as "not owned" so they fall through to the placeholder
+        // path and render dim with a count of 0, matching the
+        // in-game rune-stash page.
+        auto ownsAny = [](const InventoryItem& it) noexcept {
+            return effectiveStackCount(it) > 0;
+        };
         std::unordered_map<std::string_view, const InventoryItem*> byCode;
         byCode.reserve(raw.size() * 2);
-        for (auto* it : raw) byCode[it->code] = it;
+        for (auto* it : raw) {
+            if (ownsAny(*it)) byCode[it->code] = it;
+        }
         const auto catalog = catalogForCountSection(sec.label);
         std::unordered_set<std::string_view> seenCodes;
         for (const auto& entry : catalog) {
@@ -1555,7 +1568,7 @@ struct InvVisibleRow {
             auto found = byCode.find(entry.code);
             if (found != byCode.end()) {
                 e.item = found->second;
-                sec.stackSum += e.item->stacks > 0 ? e.item->stacks : 1u;
+                sec.stackSum += effectiveStackCount(*e.item);
                 ++sec.realItemCount;
                 sec.entries.push_back(e);
                 continue;
@@ -1572,13 +1585,16 @@ struct InvVisibleRow {
         // Any owned items whose code isn't in the catalog (defensive:
         // a future D2R patch adds Ral 2.0, an as-yet-uncatalogued
         // essence, etc.) slot in after every catalog row so nothing
-        // silently disappears from the tree.
+        // silently disappears from the tree. Empty slots skipped
+        // via `ownsAny` -- there's nothing user-actionable about a
+        // zero-count row for an unknown code.
         for (auto* it : raw) {
             if (seenCodes.count(it->code)) continue;
+            if (!ownsAny(*it)) continue;
             InvSectionEntry e;
             e.item = it;
             sec.entries.push_back(e);
-            sec.stackSum += it->stacks > 0 ? it->stacks : 1u;
+            sec.stackSum += effectiveStackCount(*it);
             ++sec.realItemCount;
         }
         return sec;
@@ -2333,7 +2349,7 @@ Element renderInventoryLeaf(const PaneConfig& c, const DashboardSnapshot& s,
         bump(wName, name.size(), 40);
         if (r.isCountSection) {
             const std::uint32_t q = isPlaceholder
-                ? 0u : (r.item->stacks > 0 ? r.item->stacks : 1u);
+                ? 0u : effectiveStackCount(*r.item);
             bump(wSecond, std::to_string(q).size(), 8);
         } else if (!isPlaceholder) {
             bump(wSecond, r.item->baseName.size(), 28);
@@ -2390,7 +2406,7 @@ Element renderInventoryLeaf(const PaneConfig& c, const DashboardSnapshot& s,
                 const auto quality = isPlaceholder
                     ? ItemQuality::Normal : r.item->quality;
                 const std::uint32_t count = isPlaceholder
-                    ? 0u : (r.item->stacks > 0 ? r.item->stacks : 1u);
+                    ? 0u : effectiveStackCount(*r.item);
 
                 auto rowColor = isRuneCode(std::string(code))
                     ? item_colors::runewordFull()

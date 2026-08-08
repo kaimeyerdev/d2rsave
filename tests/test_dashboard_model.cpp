@@ -918,14 +918,18 @@ TEST_CASE("Shared-stash fixture: stash runes flow into SessionState.runeStacks",
     REQUIRE(d2r::overrideSharedStashFromBytes(snap, sharedFixtureDb(),
                                                 stashBytes));
 
-    // Collect stash-located runes we saw.
+    // Collect stash-located runes we saw. Count effective ownership
+    // (a material-tab slot storing stacks=99 contributes 99; an
+    // empty slot with stacks=0 contributes 0) rather than raw item
+    // instances so the comparison against `state.runeStacks` below
+    // stays apples-to-apples.
     std::unordered_map<std::string, std::uint32_t> stashRuneCounts;
     for (const auto& it : snap.inventory) {
         if (it.location.rfind("stash tab ", 0) != 0) continue;
         if (it.code.size() == 3 && it.code[0] == 'r'
             && it.code[1] >= '0' && it.code[1] <= '9'
             && it.code[2] >= '0' && it.code[2] <= '9') {
-            ++stashRuneCounts[it.code];
+            stashRuneCounts[it.code] += d2r::effectiveStackCount(it);
         }
     }
     // Confirm the parser is producing per-instance rune rows: the
@@ -956,13 +960,16 @@ TEST_CASE("Shared-stash fixture: stash runes flow into SessionState.runeStacks",
         nowSnap.inventory.push_back(
             makeRune("r33", "Zod Rune", "stash tab 3"));
     }
-    // Recompute nowStacks the way renderSessionLootPane does.
+    // Recompute nowStacks the way renderSessionLootPane does. It
+    // routes through `effectiveStackCount`, so a material-tab slot
+    // with stacks=0 contributes 0 (empty slot) and a synthesized
+    // loose rune with stacks=0 contributes 1.
     std::unordered_map<std::string, std::uint32_t> nowStacks;
     for (const auto& it : nowSnap.inventory) {
         if (it.code.size() == 3 && it.code[0] == 'r'
             && it.code[1] >= '0' && it.code[1] <= '9'
             && it.code[2] >= '0' && it.code[2] <= '9') {
-            ++nowStacks[it.code];
+            nowStacks[it.code] += d2r::effectiveStackCount(it);
         }
     }
     REQUIRE(nowStacks.at("r33") == beforeZod + 3);
@@ -985,7 +992,10 @@ TEST_CASE("Full-account buildSnapshot fixture: stash + character runes appear "
     const auto snap        = d2r::buildSnapshot(sharedFixtureDb(),
                                                  fixtureDir, stashPath);
 
-    // Count rune instances at each location kind.
+    // Count owned runes at each location kind, using
+    // `effectiveStackCount` so a material-tab slot storing 99 Amn
+    // Runes contributes 99 and an empty slot with stacks=0
+    // contributes 0 (matches `makeSessionStateFromSnapshot`).
     std::size_t stashRuneInstances = 0;
     std::size_t charRuneInstances  = 0;
     std::unordered_map<std::string, std::uint32_t> stashByCode;
@@ -993,11 +1003,12 @@ TEST_CASE("Full-account buildSnapshot fixture: stash + character runes appear "
         if (it.code.size() != 3 || it.code[0] != 'r') continue;
         if (it.code[1] < '0' || it.code[1] > '9') continue;
         if (it.code[2] < '0' || it.code[2] > '9') continue;
+        const auto q = d2r::effectiveStackCount(it);
         if (it.location.rfind("stash tab ", 0) == 0) {
-            ++stashRuneInstances;
-            ++stashByCode[it.code];
+            stashRuneInstances += q;
+            stashByCode[it.code] += q;
         } else {
-            ++charRuneInstances;
+            charRuneInstances += q;
         }
     }
     // The fixture is known to hold plenty of runes in the stash --

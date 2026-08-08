@@ -330,7 +330,8 @@ DashboardFileCache::D2sEntry parseD2sIntoEntry(
             inv.subLocation = subLoc;
             inv.quality     = it.quality;
             inv.fingerprint = it.fingerprint;
-            inv.stacks      = it.stacks;
+            inv.stacks       = it.stacks;
+            inv.hasStackSlot = it.hasStackSlot;
             inv.identified  = it.identified;
             out.items.push_back(std::move(inv));
 
@@ -356,7 +357,8 @@ DashboardFileCache::D2sEntry parseD2sIntoEntry(
                 sInv.subLocation = subLoc;   // inherit parent's bucket
                 sInv.quality     = s.quality;
                 sInv.fingerprint = s.fingerprint;
-                sInv.stacks      = s.stacks;
+                sInv.stacks       = s.stacks;
+                sInv.hasStackSlot = s.hasStackSlot;
                 sInv.identified  = s.identified;
                 sInv.socketed    = true;
                 out.items.push_back(std::move(sInv));
@@ -418,7 +420,8 @@ DashboardFileCache::D2iEntry parseD2iIntoEntry(
             inv.location    = loc;
             inv.quality     = it.quality;
             inv.fingerprint = it.fingerprint;
-            inv.stacks      = it.stacks;
+            inv.stacks       = it.stacks;
+            inv.hasStackSlot = it.hasStackSlot;
             inv.identified  = it.identified;
             out.items.push_back(std::move(inv));
             if (it.quality == ItemQuality::Unique) {
@@ -435,7 +438,8 @@ DashboardFileCache::D2iEntry parseD2iIntoEntry(
                 sInv.location    = loc;
                 sInv.quality     = s.quality;
                 sInv.fingerprint = s.fingerprint;
-                sInv.stacks      = s.stacks;
+                sInv.stacks       = s.stacks;
+                sInv.hasStackSlot = s.hasStackSlot;
                 sInv.identified  = s.identified;
                 sInv.socketed    = true;
                 out.items.push_back(std::move(sInv));
@@ -1094,7 +1098,8 @@ bool overrideActivePlayerFromBytes(DashboardSnapshot&         snap,
                 inv.subLocation = subLoc;
                 inv.quality     = it.quality;
                 inv.fingerprint = it.fingerprint;
-                inv.stacks      = it.stacks;
+                inv.stacks       = it.stacks;
+                inv.hasStackSlot = it.hasStackSlot;
                 inv.identified  = it.identified;
                 snap.inventory.push_back(std::move(inv));
                 for (const auto& s : it.socketedItems) {
@@ -1106,7 +1111,8 @@ bool overrideActivePlayerFromBytes(DashboardSnapshot&         snap,
                     sInv.subLocation = subLoc;   // inherit parent's bucket
                     sInv.quality     = s.quality;
                     sInv.fingerprint = s.fingerprint;
-                    sInv.stacks      = s.stacks;
+                    sInv.stacks       = s.stacks;
+                    sInv.hasStackSlot = s.hasStackSlot;
                     sInv.identified  = s.identified;
                     sInv.socketed    = true;
                     snap.inventory.push_back(std::move(sInv));
@@ -1208,7 +1214,8 @@ bool overrideSharedStashFromBytes(DashboardSnapshot&         snap,
             inv.location    = loc;
             inv.quality     = it.quality;
             inv.fingerprint = it.fingerprint;
-            inv.stacks      = it.stacks;
+            inv.stacks       = it.stacks;
+            inv.hasStackSlot = it.hasStackSlot;
             inv.identified  = it.identified;
             snap.inventory.push_back(std::move(inv));
             for (const auto& s : it.socketedItems) {
@@ -1219,7 +1226,8 @@ bool overrideSharedStashFromBytes(DashboardSnapshot&         snap,
                 sInv.location    = loc;
                 sInv.quality     = s.quality;
                 sInv.fingerprint = s.fingerprint;
-                sInv.stacks      = s.stacks;
+                sInv.stacks       = s.stacks;
+                sInv.hasStackSlot = s.hasStackSlot;
                 sInv.identified  = s.identified;
                 sInv.socketed    = true;
                 snap.inventory.push_back(std::move(sInv));
@@ -1265,17 +1273,18 @@ SessionState makeSessionStateFromSnapshot(const DashboardSnapshot& snap) {
         out.itemKeys.insert({it.fingerprint, it.quality});
     }
 
-    // Rune counts per base code -- summed with per-item stack size, so
-    // a rune-stash entry storing 99 Amn Runes as `stacks=99` contributes
-    // 99 to the total. Session Loot pane subtracts these from the
-    // current snapshot's per-code counts to surface positive deltas.
+    // Rune counts per base code -- summed via `effectiveStackCount`
+    // so a material-tab pile of 99 Amn Runes contributes 99, a loose
+    // rune on a character contributes 1, and an empty material-tab
+    // slot (r33 with stacks==0, hasStackSlot==true) contributes 0.
+    // Session Loot pane subtracts these from the current snapshot's
+    // per-code counts to surface positive deltas.
     // Filter: code begins with 'r' and is exactly 3 chars ("r01".."r33").
     for (const auto& it : snap.inventory) {
         if (it.code.size() == 3 && it.code[0] == 'r'
             && it.code[1] >= '0' && it.code[1] <= '9'
             && it.code[2] >= '0' && it.code[2] <= '9') {
-            const std::uint32_t qty = it.stacks > 0 ? it.stacks : 1u;
-            out.runeStacks[it.code] += qty;
+            out.runeStacks[it.code] += effectiveStackCount(it);
         }
     }
     return out;

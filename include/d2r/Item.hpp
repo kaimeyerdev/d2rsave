@@ -88,6 +88,16 @@ struct Item {
     std::uint16_t durability     = 0;
     std::uint16_t stacks         = 0;
     std::uint16_t maxStacks      = 0;
+    // True when the `stacks` field was read from a RotW/D2R
+    // material-stash slot header (either the general
+    // material-stash-stack bit or the simple-item
+    // `advancedStashStackable` variant). Distinguishes a legitimately
+    // empty slot (`stacks == 0` == "user owns 0 of this rune/gem")
+    // from a loose non-stackable item whose `stacks` field was never
+    // written and stayed at the default 0 (which callers treat as 1).
+    // Only meaningful when the item lives in the shared-stash
+    // material tab; false everywhere else.
+    bool          hasStackSlot   = false;
     std::uint8_t  cntSockets     = 0;
     std::uint8_t  cntFilledSockets = 0;
     std::uint16_t tomeId         = 0;
