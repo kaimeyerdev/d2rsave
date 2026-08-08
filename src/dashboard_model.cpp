@@ -1255,12 +1255,17 @@ void clearSharedStashInSnapshot(DashboardSnapshot& snap) {
 // byte overrides to a working snapshot.
 SessionState makeSessionStateFromSnapshot(const DashboardSnapshot& snap) {
     SessionState out;
-    out.hasActivePlayer = snap.hasActivePlayer;
-    if (snap.hasActivePlayer) {
-        out.playerName   = snap.activePlayer.name;
-        out.playerClass  = snap.activePlayer.characterClass;
-        out.level        = snap.activePlayer.level;
-        out.expInLevel   = snap.activePlayer.expInLevel;
+    // Seed the baselines map with whatever the snapshot's active
+    // player is at the anchor moment. `buildSession` in the ftxui
+    // layer fills in additional characters (from the backup DB) that
+    // aren't the currently-active file.
+    if (snap.hasActivePlayer && !snap.activePlayer.file.empty()) {
+        SessionState::PlayerBaseline b;
+        b.playerName  = snap.activePlayer.name;
+        b.playerClass = snap.activePlayer.characterClass;
+        b.level       = snap.activePlayer.level;
+        b.expInLevel  = snap.activePlayer.expInLevel;
+        out.baselines.emplace(snap.activePlayer.file, std::move(b));
     }
     // Pre-computed lookup set: identified Unique/Set items with a
     // non-zero fingerprint. Renderer's diff loop just probes contains().
@@ -1287,6 +1292,30 @@ SessionState makeSessionStateFromSnapshot(const DashboardSnapshot& snap) {
             out.runeStacks[it.code] += effectiveStackCount(it);
         }
     }
+    return out;
+}
+
+// Cheap `.d2s` -> baseline extract. Used by `buildSession` to grab a
+// per-character session-start baseline without paying for the full
+// inventory/stash override pipeline. Level/XP math mirrors what
+// `overrideActivePlayerFromBytes` does when it stamps `activePlayer`
+// on the working snapshot, so callers get the same numbers whether
+// they went through that path or this one.
+std::optional<SessionState::PlayerBaseline>
+extractPlayerBaseline(std::span<const std::byte> characterBytes) {
+    Character ch;
+    try {
+        ch = parseCharacter(characterBytes);
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+    SessionState::PlayerBaseline out;
+    out.playerName  = ch.name;
+    out.playerClass = ch.characterClass;
+    out.level       = ch.attributes.level ? ch.attributes.level : ch.level;
+    const std::uint64_t curFloor = experienceToReachLevel(out.level);
+    out.expInLevel  = ch.attributes.experience > curFloor
+                        ? ch.attributes.experience - curFloor : 0;
     return out;
 }
 

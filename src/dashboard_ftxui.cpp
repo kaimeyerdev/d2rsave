@@ -553,42 +553,46 @@ Element renderCharacterPane(const PaneConfig&        cfg,
     const bool tableStale = in.expForLevel > 0 && in.expInLevel > in.expForLevel;
 
     // ---- Session XP delta ----
-    // Only meaningful when the session start-state tracks a real player
-    // and the pane's target matches (otherwise the delta compares
-    // apples/oranges).
+    // Look up this character's baseline in the session start-state's
+    // per-character map. Absent entry (character has no
+    // session-relevant backup on record) hides the delta silently;
+    // no warning, no yellow banner. A session is character-agnostic
+    // by design, so it's normal for any given character not to have
+    // a baseline yet.
     const SessionState* startState =
         session ? &session->startState : nullptr;
+    const SessionState::PlayerBaseline* baseline = nullptr;
+    if (startState && !in.file.empty()) {
+        const auto it = startState->baselines.find(in.file);
+        if (it != startState->baselines.end()) baseline = &it->second;
+    }
     std::int64_t xpDelta    = 0;
     std::int32_t levelDelta = 0;
     double       pctDelta   = 0.0;
     bool         deltaValid = false;
-    bool         anchorMismatch = false;
-    if (startState && startState->hasActivePlayer) {
-        anchorMismatch = (startState->playerName != in.name);
-        if (!anchorMismatch) {
-            const std::uint64_t aCum = cumulativeXp(startState->level, startState->expInLevel);
-            const std::uint64_t nCum = cumulativeXp(in.level, in.expInLevel);
-            xpDelta = static_cast<std::int64_t>(nCum) - static_cast<std::int64_t>(aCum);
-            levelDelta = static_cast<std::int32_t>(in.level)
-                       - static_cast<std::int32_t>(startState->level);
-            const std::uint64_t anchorFloor = experienceToReachLevel(startState->level);
-            const std::uint64_t anchorCeil  = experienceToReachLevel(startState->level + 1);
-            const std::uint64_t anchorSpan  = anchorCeil > anchorFloor
-                                                ? anchorCeil - anchorFloor : 0;
-            const double anchorFrac = (anchorSpan > 0)
-                ? static_cast<double>(startState->expInLevel)
-                  / static_cast<double>(anchorSpan) : 0.0;
-            const double nowFrac = (in.expForLevel > 0)
-                ? static_cast<double>(in.expInLevel)
-                  / static_cast<double>(in.expForLevel) : 0.0;
-            pctDelta = 100.0 * (static_cast<double>(levelDelta)
-                                + nowFrac - anchorFrac);
-            deltaValid = true;
-        }
+    if (baseline) {
+        const std::uint64_t aCum = cumulativeXp(baseline->level, baseline->expInLevel);
+        const std::uint64_t nCum = cumulativeXp(in.level, in.expInLevel);
+        xpDelta = static_cast<std::int64_t>(nCum) - static_cast<std::int64_t>(aCum);
+        levelDelta = static_cast<std::int32_t>(in.level)
+                   - static_cast<std::int32_t>(baseline->level);
+        const std::uint64_t anchorFloor = experienceToReachLevel(baseline->level);
+        const std::uint64_t anchorCeil  = experienceToReachLevel(baseline->level + 1);
+        const std::uint64_t anchorSpan  = anchorCeil > anchorFloor
+                                            ? anchorCeil - anchorFloor : 0;
+        const double anchorFrac = (anchorSpan > 0)
+            ? static_cast<double>(baseline->expInLevel)
+              / static_cast<double>(anchorSpan) : 0.0;
+        const double nowFrac = (in.expForLevel > 0)
+            ? static_cast<double>(in.expInLevel)
+              / static_cast<double>(in.expForLevel) : 0.0;
+        pctDelta = 100.0 * (static_cast<double>(levelDelta)
+                            + nowFrac - anchorFrac);
+        deltaValid = true;
     }
 
     // ---- Exp bar ----
-    // Anchor fraction only makes sense when the start-state tracks this
+    // Anchor fraction only makes sense when a baseline exists for this
     // character AND we haven't leveled up since (levelDelta == 0).
     // Otherwise start the bar's "white" segment at zero and show all
     // current progress as the highlight-colored gain -- reads as
@@ -598,11 +602,11 @@ Element renderCharacterPane(const PaneConfig&        cfg,
                      / static_cast<double>(in.expForLevel), 0.0, 1.0)
         : 0.0;
     double anchorFrac = 0.0;
-    if (deltaValid && levelDelta == 0 && startState->expInLevel > 0) {
-        const std::uint64_t aFloor = experienceToReachLevel(startState->level);
-        const std::uint64_t aCeil  = experienceToReachLevel(startState->level + 1);
+    if (deltaValid && levelDelta == 0 && baseline->expInLevel > 0) {
+        const std::uint64_t aFloor = experienceToReachLevel(baseline->level);
+        const std::uint64_t aCeil  = experienceToReachLevel(baseline->level + 1);
         if (aCeil > aFloor) {
-            anchorFrac = std::clamp(static_cast<double>(startState->expInLevel)
+            anchorFrac = std::clamp(static_cast<double>(baseline->expInLevel)
                                     / static_cast<double>(aCeil - aFloor), 0.0, 1.0);
         }
     }
@@ -648,10 +652,10 @@ Element renderCharacterPane(const PaneConfig&        cfg,
         filler(),
         text("Seed " + std::to_string(in.mapSeed)) | dim,
     }));
-    if (anchorMismatch) {
-        body.push_back(text("* session start was " + startState->playerName
-                            + "; delta not shown") | color(Color::Yellow));
-    } else if (!deltaValid && startState && !startState->hasActivePlayer) {
+    // No "session start was X" warning here -- sessions are
+    // character-agnostic, so it's expected that any character
+    // without a session-start backup simply shows no delta.
+    if (!deltaValid && startState && startState->baselines.empty()) {
         body.push_back(text("* session start not yet initialised") | dim);
     }
     body.push_back(separator());
@@ -3247,43 +3251,45 @@ Element renderSessionLeaf(const DashboardSnapshot& now,
     }
     body.push_back(hbox(std::move(header)));
 
-    // Warn if the active-player identity changed since the session start
-    // -- the XP delta only makes sense within a single character, so we
-    // still show the numbers but flag the mismatch so the user knows
-    // to reset the session from the pane config.
-    if (startState.hasActivePlayer && now.hasActivePlayer &&
-        startState.playerName != now.activePlayer.name) {
-        body.push_back(text(
-            "  * session start was " + startState.playerName +
-            "; reset session for this character") | color(Color::Yellow));
-    }
+    // A session is character-agnostic, so we don't blame the user
+    // when the active character has no session-start baseline;
+    // we just render the numbers we can and hide the delta line
+    // (via the fall-through path below) when we can't.
     body.push_back(separator());
 
     // XP delta. Compute in cumulative-XP space so a level-up isn't
     // interpreted as XP loss (expInLevel resets to 0 at each ding).
+    // Baseline comes from the per-character map on startState so a
+    // dashboard that saw multiple characters play still shows a
+    // meaningful delta for whichever character is active right now.
+    const SessionState::PlayerBaseline* baseline = nullptr;
+    if (now.hasActivePlayer && !now.activePlayer.file.empty()) {
+        const auto it = startState.baselines.find(now.activePlayer.file);
+        if (it != startState.baselines.end()) baseline = &it->second;
+    }
     std::int64_t xpDelta = 0;
     std::int32_t levelDelta = 0;
     double       pctDelta = 0.0;
-    if (startState.hasActivePlayer && now.hasActivePlayer) {
+    if (baseline && now.hasActivePlayer) {
         const auto& n = now.activePlayer;
-        const std::uint64_t aCum = cumulativeXp(startState.level, startState.expInLevel);
+        const std::uint64_t aCum = cumulativeXp(baseline->level, baseline->expInLevel);
         const std::uint64_t nCum = cumulativeXp(n.level,          n.expInLevel);
         xpDelta = static_cast<std::int64_t>(nCum)
                 - static_cast<std::int64_t>(aCum);
         levelDelta = static_cast<std::int32_t>(n.level)
-                   - static_cast<std::int32_t>(startState.level);
+                   - static_cast<std::int32_t>(baseline->level);
         // Percentage is expressed as "fraction of the XP bar filled
         // during the session", matching the in-game XP bar. A level-up
         // contributes 100% (the start's remaining bar + all subsequent
         // full bars + progress into the current bar). Late-game sessions
         // therefore read as "3.0%" rather than a cumulative-XP fraction
         // that trends toward zero as total XP grows.
-        const std::uint64_t anchorFloor = experienceToReachLevel(startState.level);
-        const std::uint64_t anchorCeil  = experienceToReachLevel(startState.level + 1);
+        const std::uint64_t anchorFloor = experienceToReachLevel(baseline->level);
+        const std::uint64_t anchorCeil  = experienceToReachLevel(baseline->level + 1);
         const std::uint64_t anchorSpan  = anchorCeil > anchorFloor
                                             ? anchorCeil - anchorFloor : 0;
         const double anchorFrac = (anchorSpan > 0)
-            ? static_cast<double>(startState.expInLevel)
+            ? static_cast<double>(baseline->expInLevel)
               / static_cast<double>(anchorSpan)
             : 0.0;
         const double nowFrac = (n.expForLevel > 0)
@@ -4273,6 +4279,40 @@ int runDashboard(const std::filesystem::path& savePath,
         // parse entirely. Typically the vast majority of character
         // files.
         DashboardSnapshot temp = *current;
+        // Per-file baselines assembled as we walk the backup DB. The
+        // fallback chain honours the character-agnostic session model:
+        //   1. newest backup with `date <= startEpoch`  (true "before"
+        //      state; step 4's existing lookup already produces this).
+        //   2. oldest backup with `date >= startEpoch`  (brand-new
+        //      character created mid-session, or first-ever character
+        //      before any prior backup exists).
+        // Files with no backup at all get no baseline entry -- the
+        // Character pane hides its XP delta line for those.
+        auto oldestBackupSince = [&](const std::string& fname)
+            -> std::optional<BackupDb::Row> {
+            std::vector<BackupDb::HistoryRow> hist;
+            try { hist = backupDb->historyFor(fname, 1000); }
+            catch (const std::exception&) { return std::nullopt; }
+            // historyFor returns newest-first; walk in reverse to
+            // find the oldest row whose date >= startEpoch.
+            for (auto it = hist.rbegin(); it != hist.rend(); ++it) {
+                if (it->state == BackupDb::State::Deleted) continue;
+                if (it->sizeBytes <= 0) continue;
+                if (it->date < startEpoch) continue;
+                std::optional<BackupDb::Row> ret;
+                try { ret = backupDb->at(fname, it->date); }
+                catch (const std::exception&) {}
+                if (ret && !ret->data.empty()) return ret;
+            }
+            return std::nullopt;
+        };
+        std::unordered_map<std::string, SessionState::PlayerBaseline> baselines;
+        auto stampBaseline = [&](const std::string& fname,
+                                  std::span<const std::byte> bytes) {
+            if (auto b = extractPlayerBaseline(bytes); b) {
+                baselines[fname] = std::move(*b);
+            }
+        };
         const auto lookupU32 = startEpoch > 0
             ? static_cast<std::uint32_t>(startEpoch) : 0u;
         auto stripCharacterItems = [&](const std::string& prefix) {
@@ -4286,24 +4326,53 @@ int runDashboard(const std::filesystem::path& savePath,
         };
         for (const auto& [otherName, otherEntry] : ui.fileCache.d2s) {
             if (otherName == filename) continue;   // active player handled below
+            // Optimization: files whose in-file timestamp is
+            // <= startEpoch haven't been touched since the start,
+            // so their current cache entry already reflects the
+            // start state -- skip the historical parse for items.
+            // But we still owe the baselines map an entry, which
+            // we can extract straight from `otherEntry.character`.
             if (lookupU32 != 0 && otherEntry.character.timestamp <= lookupU32) {
-                continue;   // unchanged since start; current entry is correct
+                SessionState::PlayerBaseline b;
+                b.playerName  = otherEntry.character.name;
+                b.playerClass = otherEntry.character.characterClass;
+                b.level       = otherEntry.character.attributes.level
+                              ? otherEntry.character.attributes.level
+                              : otherEntry.character.level;
+                const std::uint64_t curFloor = experienceToReachLevel(b.level);
+                b.expInLevel  = otherEntry.character.attributes.experience > curFloor
+                                ? otherEntry.character.attributes.experience - curFloor : 0;
+                baselines[otherName] = std::move(b);
+                continue;
             }
             std::optional<BackupDb::Row> otherRow;
             try { otherRow = backupDb->at(otherName, startEpoch); }
             catch (const std::exception&) {}
             if (otherRow && !otherRow->data.empty()) {
                 (void)overrideActivePlayerFromBytes(temp, db, otherRow->data, otherName);
+                stampBaseline(otherName, otherRow->data);
             } else {
                 stripCharacterItems(otherName);
+                // Fallback for baseline only: brand-new character with
+                // no pre-start backup. Item override still strips (their
+                // items are all "new" acquisitions post-start), but
+                // the XP baseline uses the first post-start snapshot
+                // so the Character pane can still show a delta.
+                if (auto fallback = oldestBackupSince(otherName); fallback) {
+                    stampBaseline(otherName, fallback->data);
+                }
             }
         }
         if (row && !row->data.empty()) {
             if (!overrideActivePlayerFromBytes(temp, db, row->data, filename)) {
                 return sessionFromCurrent();
             }
+            stampBaseline(filename, row->data);
         } else {
             stripCharacterItems(filename);
+            if (auto fallback = oldestBackupSince(filename); fallback) {
+                stampBaseline(filename, fallback->data);
+            }
         }
         if (stashRow && !stashRow->data.empty()) {
             (void)overrideSharedStashFromBytes(temp, db, stashRow->data);
@@ -4317,6 +4386,13 @@ int runDashboard(const std::filesystem::path& savePath,
         out->startIsCustom = startIsCustom;
         out->endIsCustom   = endIsCustom;
         out->startState = makeSessionStateFromSnapshot(temp);
+        // `makeSessionStateFromSnapshot` seeds only the active player's
+        // baseline; overlay the full per-file map we just built so the
+        // Character pane can render deltas for every character we've
+        // seen a session-relevant backup for.
+        for (auto& [fname, b] : baselines) {
+            out->startState.baselines[fname] = std::move(b);
+        }
         ui.sessionCacheKey = key;
         return out;
 #else

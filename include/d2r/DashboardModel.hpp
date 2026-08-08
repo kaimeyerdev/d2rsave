@@ -431,12 +431,30 @@ struct SessionItemKeyHash {
 
 // SessionState = the diff-relevant slice of a DashboardSnapshot at one
 // moment in time (start-of-session, or a user-fixed end-of-session).
+//
+// Everything here is character-agnostic. A play session is a
+// `[startEpoch, endEpoch]` time window in which any number of
+// characters may play in strict serial order (D2R has one active
+// game at a time). Per-character XP baselines live on the `baselines`
+// map so the Character pane can look up its target character's start
+// state without the session itself owning a single "session
+// character".
 struct SessionState {
-    bool           hasActivePlayer = false;
-    std::string    playerName;
-    CharacterClass playerClass     = CharacterClass::Unknown;
-    std::uint32_t  level           = 0;
-    std::uint64_t  expInLevel      = 0;
+    // XP baseline for one character file at the session start. The
+    // Character pane's XP delta looks these up by `characterFile`
+    // (e.g. `Kai.d2s`) and hides its delta line silently when no
+    // entry exists (character truly never played, or the backup DB
+    // has no snapshot we can anchor to).
+    struct PlayerBaseline {
+        std::string    playerName;
+        CharacterClass playerClass = CharacterClass::Unknown;
+        std::uint32_t  level       = 0;
+        std::uint64_t  expInLevel  = 0;
+    };
+    // Populated by `buildSession` (ftxui layer) after visiting each
+    // known character file's backup history. Populated for a subset
+    // of files: only the ones that had a backup we could anchor to.
+    std::unordered_map<std::string, PlayerBaseline> baselines;
     // Identified Unique / Set items observed in the account at this
     // moment. The renderer's diff loop probes contains() per item.
     std::unordered_set<SessionItemKey, SessionItemKeyHash> itemKeys;
@@ -517,9 +535,20 @@ struct AppSession {
 // Extract a SessionState from a fully-populated DashboardSnapshot.
 // Used by the ftxui layer after overlaying historical bytes onto a
 // working DashboardSnapshot (for the start side and, when the user
-// fixed the end, for the end side too).
+// fixed the end, for the end side too). Populates
+// `baselines[snap.activePlayer.file]` from the snapshot's active
+// player when one exists; additional baselines get folded in by
+// `buildSession` as it walks the backup DB for other characters.
 [[nodiscard]] SessionState makeSessionStateFromSnapshot(
     const DashboardSnapshot& snap);
+
+// Parse `characterBytes` (a `.d2s` blob) into a per-character XP
+// baseline. Returns `nullopt` on any parse failure. Used by
+// `buildSession` to grab each known character's session-start state
+// from the backup DB without paying for the full inventory/stash
+// override pipeline.
+[[nodiscard]] std::optional<SessionState::PlayerBaseline>
+extractPlayerBaseline(std::span<const std::byte> characterBytes);
 
 // Experience needed to reach `level` from a fresh character. Levels
 // outside [1..99] clamp to the boundary. Values are the standard D2/D2R
