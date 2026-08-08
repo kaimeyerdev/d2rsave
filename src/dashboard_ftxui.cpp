@@ -37,9 +37,11 @@
 #include <cstdio>
 #include <ctime>
 #include <deque>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -290,6 +292,17 @@ struct UiState {
     // 0 == top, 1 == bottom. Missing entry defaults to 0 (top).
     // Ephemeral: not persisted across dashboard restarts.
     std::unordered_map<const PaneNode*, float> paneScrollFrac;
+
+    // Per-leaf collapse state for the Inventory pane's tree view.
+    // The nested set holds the section paths the user has expanded
+    // ("Shared Stash", "Kai/Equipped", etc.); a missing entry (or
+    // absent leaf) means the section is collapsed. Default is empty
+    // -- everything starts collapsed and the user drills in with the
+    // right arrow. Search mode overrides this (all sections
+    // effectively expanded) without mutating the set, so clearing
+    // the query restores the user's earlier drill-in. Ephemeral:
+    // not persisted across dashboard restarts.
+    std::unordered_map<const PaneNode*, std::unordered_set<std::string>> paneExpanded;
 
     // Recovery modal state. Populated when the user presses [R] on the
     // Backups pane detail view; cleared on confirm or cancel.
@@ -1313,6 +1326,257 @@ std::vector<const InventoryItem*> filterInventory(const PaneConfig& c,
     return out;
 }
 
+// ---- Inventory tree ---------------------------------------------------
+// The Inventory pane groups items into a two-level tree:
+//
+//   * Shared Stash
+//       Tab 1..5              (grid-tabs; canonical Base column)
+//       Gems / Runes / Materials
+//                             (material tab; count column instead of Base)
+//   * Character-name(s)       (one node per .d2s file, alphabetical)
+//       Equipped / Inventory / Stash / Belt / Cube
+//       Merc / Corpse / Iron Golem
+//                             (all standard sections, Base column)
+//
+// Sub-nodes with zero items are elided. Section-path strings (e.g.
+// "Shared Stash/Runes", "Kai/Equipped") are the keys the pane uses to
+// track expand/collapse state in `UiState::paneExpanded`.
+// ------------------------------------------------------------------------
+
+// Recognise gem base codes: three chars starting with 'g' (chipped /
+// flawed / normal / flawless / perfect ruby / sapphire / amethyst /
+// topaz / emerald / diamond) or 's' + 'k' (the skull variants sit in
+// the same in-game bucket as the coloured gems).
+[[nodiscard]] inline bool isGemCode(std::string_view code) noexcept {
+    if (code.size() != 3) return false;
+    if (code[0] == 'g') return true;
+    return code[0] == 's' && code[1] == 'k';
+}
+
+// Ordered sub-section labels. Sections not present in the item pool
+// are elided at build time; the arrays only fix the display order.
+constexpr std::array<std::string_view, 8> kSharedSubOrder{{
+    "Tab 1", "Tab 2", "Tab 3", "Tab 4", "Tab 5",
+    "Gems",  "Runes", "Materials",
+}};
+constexpr std::array<std::string_view, 8> kCharSubOrder{{
+    "Equipped",  "Inventory", "Stash",  "Belt", "Cube",
+    "Merc",      "Corpse",    "Iron Golem",
+}};
+
+// Result of classifying one item into (top-level, sub-level).
+struct InvClassification {
+    std::string topLevel;
+    std::string subLevel;
+    bool        isCountSection = false;
+};
+
+// Map an item to its tree location. Shared-stash tab 6 splits by code
+// (runes / gems / materials); tabs 1-5 stay as grid sub-nodes. Character
+// files use the pre-computed `it.subLocation` and derive the top-level
+// name from the filename stem (`Kai.d2s (merc)` -> `Kai`).
+[[nodiscard]] InvClassification classifyInventoryItem(const InventoryItem& it) {
+    InvClassification out;
+    static constexpr std::string_view kStashPrefix = "stash tab ";
+    if (it.location.size() >= kStashPrefix.size() &&
+        it.location.compare(0, kStashPrefix.size(), kStashPrefix) == 0) {
+        out.topLevel = "Shared Stash";
+        // Parse the tab number after the prefix. Any non-digit / missing
+        // number falls into the materials bucket rather than a bogus
+        // "Tab ?" section.
+        int tab = 0;
+        for (std::size_t i = kStashPrefix.size(); i < it.location.size(); ++i) {
+            const char ch = it.location[i];
+            if (ch < '0' || ch > '9') break;
+            tab = tab * 10 + (ch - '0');
+        }
+        if (tab >= 1 && tab <= 5) {
+            out.subLevel = "Tab " + std::to_string(tab);
+        } else {
+            if      (isRuneCode(it.code)) out.subLevel = "Runes";
+            else if (isGemCode(it.code))  out.subLevel = "Gems";
+            else                          out.subLevel = "Materials";
+            out.isCountSection = true;
+        }
+        return out;
+    }
+    // Character source: strip ".d2s" (and anything after) for the
+    // top-level name. `it.subLocation` is populated at aggregation
+    // time by characterItemSubLoc / merc / corpse / iron-golem
+    // passes; fall back to "Inventory" if it's empty for any reason.
+    const auto dot = it.location.find(".d2s");
+    out.topLevel = dot == std::string::npos
+        ? it.location
+        : it.location.substr(0, dot);
+    out.subLevel = it.subLocation.empty() ? "Inventory" : it.subLocation;
+    return out;
+}
+
+struct InvSection {
+    std::string label;
+    std::string path;                    // "TopLevel/SubLabel"
+    std::vector<const InventoryItem*> items;
+    bool        isCountSection = false;
+    std::uint32_t stackSum = 0;          // sum of stacks (loose = 1)
+};
+struct InvTopLevel {
+    std::string label;
+    std::string path;                    // = label (top-level is flat)
+    std::vector<InvSection> sections;
+    int         totalItems = 0;
+};
+using InvTree = std::vector<InvTopLevel>;
+
+struct InvVisibleRow {
+    enum class Kind : std::uint8_t { TopLevel, Section, Item };
+    Kind        kind        = Kind::TopLevel;
+    int         depth       = 0;         // 0 top, 1 section, 2 item
+    std::string label;                   // header text (unused for items)
+    std::string path;                    // section/top-level path (empty for items)
+    std::string parentPath;              // path of enclosing header
+    const InventoryItem* item = nullptr; // only set for items
+    bool        expanded    = false;     // header only
+    int         itemCount   = 0;         // header only
+    std::uint32_t stackSum  = 0;         // count-section header only
+    bool        isCountSection = false;
+};
+
+// Bucket filtered items into the tree structure, applying the canonical
+// ordering and sorting items alphabetically within each section.
+[[nodiscard]] InvTree buildInventoryTree(
+        const std::vector<const InventoryItem*>& items) {
+    // Preserve ordering deterministically by using std::map for both
+    // levels of the outer bucketing. The canonical sub-order arrays
+    // then re-arrange sections into the final order below.
+    std::map<std::string, std::map<std::string, std::vector<const InventoryItem*>>> bucket;
+    std::map<std::string, std::map<std::string, bool>> countFlag;
+    for (auto* it : items) {
+        auto c = classifyInventoryItem(*it);
+        bucket[c.topLevel][c.subLevel].push_back(it);
+        if (c.isCountSection) countFlag[c.topLevel][c.subLevel] = true;
+    }
+    for (auto& [top, subs] : bucket) {
+        for (auto& [sub, sitems] : subs) {
+            std::sort(sitems.begin(), sitems.end(),
+                      [](const InventoryItem* a, const InventoryItem* b) {
+                          return a->name < b->name;
+                      });
+        }
+    }
+
+    // Top-level order: Shared Stash first (if present), then characters
+    // alphabetically (std::map iterates sorted, so we can just skip
+    // Shared Stash on the first pass).
+    std::vector<std::string> topOrder;
+    if (bucket.count("Shared Stash")) topOrder.push_back("Shared Stash");
+    for (const auto& [top, _] : bucket) {
+        if (top != "Shared Stash") topOrder.push_back(top);
+    }
+
+    InvTree tree;
+    for (const auto& top : topOrder) {
+        InvTopLevel tl;
+        tl.label = top;
+        tl.path  = top;
+
+        const auto& subs = bucket[top];
+        const bool isShared = (top == "Shared Stash");
+        const auto& order = isShared ? kSharedSubOrder : kCharSubOrder;
+
+        std::set<std::string> emitted;
+        auto pushSection = [&](std::string_view label) {
+            const std::string key(label);
+            auto it = subs.find(key);
+            if (it == subs.end() || it->second.empty()) return;
+            InvSection sec;
+            sec.label = key;
+            sec.path  = top + "/" + key;
+            sec.items = it->second;
+            sec.isCountSection = countFlag[top].count(key) > 0;
+            for (auto* p : sec.items) sec.stackSum += p->stacks > 0 ? p->stacks : 1u;
+            tl.sections.push_back(std::move(sec));
+            emitted.insert(key);
+        };
+        for (auto label : order) pushSection(label);
+        // Any sub-labels we don't recognise (defensive; shouldn't
+        // happen unless a future patch adds a new bucket) slide in
+        // after the canonical order in alphabetical order.
+        for (const auto& [sub, sitems] : subs) {
+            if (emitted.count(sub)) continue;
+            if (sitems.empty()) continue;
+            InvSection sec;
+            sec.label = sub;
+            sec.path  = top + "/" + sub;
+            sec.items = sitems;
+            sec.isCountSection = countFlag[top][sub];
+            for (auto* p : sec.items) sec.stackSum += p->stacks > 0 ? p->stacks : 1u;
+            tl.sections.push_back(std::move(sec));
+        }
+        for (const auto& sec : tl.sections) tl.totalItems += (int)sec.items.size();
+        if (tl.totalItems > 0) tree.push_back(std::move(tl));
+    }
+    return tree;
+}
+
+// Flatten the tree into the ordered visible-row list, honouring the
+// user's collapse state (`expandedPaths`). A non-empty search query
+// force-expands everything so matched items are always shown; the
+// user's expand set is preserved so a subsequent Esc-clear returns
+// to the pre-search shape.
+[[nodiscard]] std::vector<InvVisibleRow> emitInventoryRows(
+        const InvTree& tree,
+        const std::unordered_set<std::string>& expandedPaths,
+        bool searchActive) {
+    std::vector<InvVisibleRow> rows;
+    for (const auto& tl : tree) {
+        InvVisibleRow tr;
+        tr.kind      = InvVisibleRow::Kind::TopLevel;
+        tr.depth     = 0;
+        tr.label     = tl.label;
+        tr.path      = tl.path;
+        tr.itemCount = tl.totalItems;
+        tr.expanded  = searchActive || expandedPaths.count(tl.path) > 0;
+        rows.push_back(tr);
+        if (!tr.expanded) continue;
+        for (const auto& sec : tl.sections) {
+            InvVisibleRow sr;
+            sr.kind        = InvVisibleRow::Kind::Section;
+            sr.depth       = 1;
+            sr.label       = sec.label;
+            sr.path        = sec.path;
+            sr.parentPath  = tl.path;
+            sr.isCountSection = sec.isCountSection;
+            sr.itemCount   = (int)sec.items.size();
+            sr.stackSum    = sec.stackSum;
+            sr.expanded    = searchActive || expandedPaths.count(sec.path) > 0;
+            rows.push_back(sr);
+            if (!sr.expanded) continue;
+            for (auto* it : sec.items) {
+                InvVisibleRow ir;
+                ir.kind        = InvVisibleRow::Kind::Item;
+                ir.depth       = 2;
+                ir.item        = it;
+                ir.parentPath  = sec.path;
+                ir.isCountSection = sec.isCountSection;
+                rows.push_back(ir);
+            }
+        }
+    }
+    return rows;
+}
+
+// Collect all section-and-top-level paths a tree exposes, used to
+// implement the `+` "expand all" key without needing to walk the item
+// pool separately.
+[[nodiscard]] std::vector<std::string> collectExpandablePaths(const InvTree& tree) {
+    std::vector<std::string> out;
+    for (const auto& tl : tree) {
+        out.push_back(tl.path);
+        for (const auto& sec : tl.sections) out.push_back(sec.path);
+    }
+    return out;
+}
+
 // --- content-width helpers ---
 
 struct ChronWidths {
@@ -1899,54 +2163,116 @@ Element renderChronicleLeaf(const PaneConfig& c, const DashboardSnapshot& s,
     }));
 }
 
-// Render a leaf as an Inventory pane. Shares scrolling model with
-// chronicle panes; the row set is different.
+// Render a leaf as an Inventory pane. Groups items into a two-level
+// tree (Shared Stash / character-file top-level nodes; Tab N or
+// physical-location sub-nodes). Cursor navigates over visible rows
+// (top-level headers + section headers + item rows); expand state
+// lives in `expandedPaths` and is preserved across search mode
+// (search just force-expands display without mutating the set).
 Element renderInventoryLeaf(const PaneConfig& c, const DashboardSnapshot& s,
+                             const std::unordered_set<std::string>& expandedPaths,
                              bool focused, bool searchMode) {
-    const auto rows = filterInventory(c, s);
+    const auto filtered = filterInventory(c, s);
+    const InvTree tree  = buildInventoryTree(filtered);
+    const bool searchActive = !c.searchQuery.empty();
+    const auto rows = emitInventoryRows(tree, expandedPaths, searchActive);
 
-    // Widths (per-pane content).
-    int wName = 4, wBase = 4, wLoc = 8;
+    // Widths (per-pane content). `wName` is the primary column across
+    // every visible row (headers + items); `wSecond` covers whichever
+    // secondary text an item exposes -- baseName for standard
+    // sections, count-string for Gems/Runes/Materials.
+    int wName = 12, wSecond = 4;
     auto bump = [](int& cur, std::size_t n, int cap) {
         cur = std::min(cap, std::max(cur, static_cast<int>(n)));
     };
-    for (const auto* it : rows) {
-        bump(wName, it->name.size(),     36);
-        bump(wBase, it->baseName.size(), 26);
-        bump(wLoc,  it->location.size(), 26);
+    for (const auto& r : rows) {
+        if (r.kind != InvVisibleRow::Kind::Item) continue;
+        bump(wName, r.item->name.size(), 40);
+        if (r.isCountSection) {
+            const std::uint32_t q = r.item->stacks > 0 ? r.item->stacks : 1u;
+            bump(wSecond, std::to_string(q).size(), 8);
+        } else {
+            bump(wSecond, r.item->baseName.size(), 28);
+        }
     }
-
-    Elements header{
-        cellText("Name",     wName),
-        cellText("Base",     wBase),
-        cellText("Location", wLoc),
-    };
 
     const int shown = static_cast<int>(rows.size());
     const int clamped = std::clamp(c.cursor, 0, std::max(0, shown - 1));
 
+    // Format one visible row. Depth-based indent + expand-marker
+    // (▶ collapsed / ▼ expanded) prefix each header; item rows use
+    // four spaces of leading indent to line up beneath their
+    // section's label text.
+    auto renderRow = [&](const InvVisibleRow& r, bool isCursor) -> Element {
+        Element el;
+        switch (r.kind) {
+            case InvVisibleRow::Kind::TopLevel: {
+                const char* icon = r.expanded ? "\u25BC " : "\u25B6 ";
+                el = hbox({
+                    text(icon) | bold,
+                    text(r.label) | bold,
+                    text("  "),
+                    text("(" + std::to_string(r.itemCount) + ")") | dim,
+                });
+                break;
+            }
+            case InvVisibleRow::Kind::Section: {
+                const char* icon = r.expanded ? "\u25BC " : "\u25B6 ";
+                std::string tail;
+                if (r.isCountSection) {
+                    tail = "  " + std::to_string(r.itemCount) + " codes, "
+                         + std::to_string(r.stackSum) + " total";
+                } else {
+                    tail = "  " + std::to_string(r.itemCount) + " items";
+                }
+                el = hbox({
+                    text("  "),
+                    text(icon),
+                    text(r.label),
+                    text(tail) | dim,
+                });
+                break;
+            }
+            case InvVisibleRow::Kind::Item: {
+                const auto* it = r.item;
+                const auto rowColor = isRuneCode(it->code)
+                    ? item_colors::runewordFull()
+                    : item_colors::forQuality(it->quality);
+                std::string secondText;
+                if (r.isCountSection) {
+                    const std::uint32_t q = it->stacks > 0 ? it->stacks : 1u;
+                    secondText = std::to_string(q);
+                } else {
+                    secondText = it->baseName;
+                }
+                Element second = r.isCountSection
+                    ? (text(secondText) | align_right
+                                        | size(WIDTH, EQUAL, wSecond + kCellPad))
+                    : cellText(secondText, wSecond);
+                el = hbox({
+                    text("      "),   // four-space indent + one cell pad
+                    cellText(it->name, wName),
+                    second,
+                }) | color(rowColor);
+                break;
+            }
+        }
+        if (isCursor) el = el | inverted | ftxui::focus;
+        return el;
+    };
+
     Elements body;
-    body.reserve(static_cast<std::size_t>(shown + 2));
-    body.push_back(hbox(std::move(header)) | bold);
-    body.push_back(separator());
-    for (int i = 0; i < shown; ++i) {
-        const auto* it = rows[static_cast<std::size_t>(i)];
-        // Runes are Normal quality but render in the orange rune-text
-        // hue in-game; special-case them so a stash-tab full of runes
-        // reads correctly instead of blending into normal whites.
-        const auto rowColor = isRuneCode(it->code)
-            ? item_colors::runewordFull()
-            : item_colors::forQuality(it->quality);
-        Element row = hbox({
-            cellText(it->name,     wName),
-            cellText(it->baseName, wBase),
-            cellText(it->location, wLoc),
-        }) | color(rowColor);
-        if (focused && i == clamped) row = row | inverted | ftxui::focus;
-        body.push_back(row);
+    body.reserve(static_cast<std::size_t>(shown + 1));
+    if (rows.empty()) {
+        body.push_back(text("  (no items match)") | dim);
+    } else {
+        for (int i = 0; i < shown; ++i) {
+            body.push_back(renderRow(rows[static_cast<std::size_t>(i)],
+                                      focused && i == clamped));
+        }
     }
 
-    std::string title = " Inventory  " + std::to_string(shown) + " items ";
+    std::string title = " Inventory  " + std::to_string(filtered.size()) + " items ";
     Element titleEl = text(title);
     if (focused) titleEl = titleEl | inverted;
 
@@ -1982,7 +2308,7 @@ Element renderInventoryLeaf(const PaneConfig& c, const DashboardSnapshot& s,
     if (!c.searchQuery.empty() && !searchMode) {
         status += "  |  q=\"" + c.searchQuery + "\"";
     } else if (c.searchQuery.empty() && !searchMode) {
-        status += "  |  [/] search";
+        status += "  |  [/] search  [+/-] expand-all/collapse-all";
     }
 
     Element topLine = focused && searchMode
@@ -3281,10 +3607,14 @@ Element renderPane(PaneNode& node, const UiState& ui,
             leafEl = renderChronicleLeaf(node.config, s, focused,
                                           focused && ui.searchMode);
             break;
-        case PaneType::Inventory:
-            leafEl = renderInventoryLeaf(node.config, s, focused,
+        case PaneType::Inventory: {
+            static const std::unordered_set<std::string> kEmpty;
+            const auto it = ui.paneExpanded.find(&node);
+            const auto& expanded = it == ui.paneExpanded.end() ? kEmpty : it->second;
+            leafEl = renderInventoryLeaf(node.config, s, expanded, focused,
                                           focused && ui.searchMode);
             break;
+        }
         case PaneType::Reconcile:
             leafEl = renderReconcileLeaf(node.config, s, focused,
                                           focused && ui.searchMode);
@@ -3353,6 +3683,12 @@ Element renderHelpModal() {
         text("  Up/Down     move cursor / scroll in focused pane"),
         text("  PgUp/PgDn   page cursor / scroll"),
         text("  Home/End    jump to first / last row"),
+        text(""),
+        text("Inventory pane (tree)") | bold,
+        text("  Right       expand section (or step into first child)"),
+        text("  Left        collapse section (or jump to parent)"),
+        text("  +           expand all sections"),
+        text("  -           collapse all sections"),
         text(""),
         text("Config menu (per pane)") | bold,
         text("  Up/Down     navigate options"),
@@ -4577,6 +4913,89 @@ int runDashboard(const std::filesystem::path& savePath,
             if (e == Event::End)       { frac = 1.f;    return true; }
         }
 
+        // Inventory pane: tree navigation with Left/Right and bulk
+        // expand/collapse with +/-. Everything happens against the
+        // currently-visible row list so cursor jumps and expand
+        // toggles stay in sync with the render.
+        if (leaf->config.type == PaneType::Inventory) {
+            auto rebuildRows = [&]() {
+                auto snap = currentSnapshot();
+                const auto filtered = filterInventory(leaf->config, *snap);
+                const auto tree     = buildInventoryTree(filtered);
+                static const std::unordered_set<std::string> kEmpty;
+                const auto pit = ui.paneExpanded.find(leaf);
+                const auto& expanded = pit == ui.paneExpanded.end() ? kEmpty : pit->second;
+                const bool searchActive = !leaf->config.searchQuery.empty();
+                return std::pair{tree, emitInventoryRows(tree, expanded, searchActive)};
+            };
+            auto& expandSet = ui.paneExpanded[leaf];
+            // + expands every top-level and section path present.
+            if (e == Event::Character('+') || e == Event::Character('=')) {
+                auto [tree, _rows] = rebuildRows();
+                for (const auto& p : collectExpandablePaths(tree)) {
+                    expandSet.insert(p);
+                }
+                return true;
+            }
+            // - collapses everything.
+            if (e == Event::Character('-') || e == Event::Character('_')) {
+                expandSet.clear();
+                leaf->config.cursor = 0;
+                return true;
+            }
+            if (e == Event::ArrowRight) {
+                auto [_tree, rows] = rebuildRows();
+                if (rows.empty()) return true;
+                const int cur = std::clamp(leaf->config.cursor,
+                                            0, (int)rows.size() - 1);
+                const auto& row = rows[cur];
+                if (row.kind == InvVisibleRow::Kind::Item) return true;
+                if (!row.expanded) {
+                    expandSet.insert(row.path);
+                } else if (cur + 1 < (int)rows.size()) {
+                    // Already expanded -> step cursor into the first
+                    // child of this header.
+                    leaf->config.cursor = cur + 1;
+                }
+                return true;
+            }
+            if (e == Event::ArrowLeft) {
+                auto [_tree, rows] = rebuildRows();
+                if (rows.empty()) return true;
+                const int cur = std::clamp(leaf->config.cursor,
+                                            0, (int)rows.size() - 1);
+                const auto& row = rows[cur];
+                // Item -> jump cursor to enclosing section header.
+                if (row.kind == InvVisibleRow::Kind::Item) {
+                    for (int i = cur - 1; i >= 0; --i) {
+                        if (rows[i].path == row.parentPath) {
+                            leaf->config.cursor = i;
+                            break;
+                        }
+                    }
+                    return true;
+                }
+                // Section header -> collapse if expanded; jump to
+                // enclosing top-level if already collapsed.
+                if (row.expanded) {
+                    expandSet.erase(row.path);
+                    return true;
+                }
+                if (!row.parentPath.empty()) {
+                    for (int i = cur - 1; i >= 0; --i) {
+                        if (rows[i].path == row.parentPath) {
+                            leaf->config.cursor = i;
+                            break;
+                        }
+                    }
+                    return true;
+                }
+                // Top-level, already collapsed -> collapse remains
+                // no-op (nothing above it in the tree).
+                return true;
+            }
+        }
+
         // Backups pane: Enter drills from summary into detail for the
         // filename at the cursor; Escape from detail returns to summary.
         // Both reset the cursor so the drill-in lands at the newest row.
@@ -4718,8 +5137,20 @@ int runDashboard(const std::filesystem::path& savePath,
             auto snap = currentSnapshot();
             if (leaf->config.type == PaneType::Chronicle)
                 return (int)filterForLeaf(leaf->config, *snap).size();
-            if (leaf->config.type == PaneType::Inventory)
-                return (int)filterInventory(leaf->config, *snap).size();
+            if (leaf->config.type == PaneType::Inventory) {
+                // Inventory renders a tree; visible rows include
+                // top-level and section headers plus items. Compute
+                // exactly what the render would show given the
+                // current expand set + search state so cursor bounds
+                // stay in sync.
+                const auto filtered = filterInventory(leaf->config, *snap);
+                const auto tree     = buildInventoryTree(filtered);
+                static const std::unordered_set<std::string> kEmpty;
+                const auto pit = ui.paneExpanded.find(leaf);
+                const auto& expanded = pit == ui.paneExpanded.end() ? kEmpty : pit->second;
+                const bool searchActive = !leaf->config.searchQuery.empty();
+                return (int)emitInventoryRows(tree, expanded, searchActive).size();
+            }
             if (leaf->config.type == PaneType::Reconcile) {
                 int n = 0;
                 for (const auto& e2 : snap->reconcile) {
