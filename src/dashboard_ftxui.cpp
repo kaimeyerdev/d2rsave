@@ -1155,12 +1155,20 @@ constexpr std::array<ItemQuality, 8> kInventoryQualities{{
 }};
 
 // Filter inventory items by the leaf's quality mask and search query.
+// Material-tab items (Gems / Materials / Runes) skip the quality mask:
+// the mask is a hide-junk-equipment knob, not a "hide my materials"
+// knob. Signalled by `hasStackSlot` -- the parser only sets that flag
+// on items parsed through the material-stash slot header, which
+// happens for every gem / rune / key / statue / shard / essence /
+// token / potion in the material tab and never for character gear
+// (grid stash Pages 1-5, personal .d2s stash, equipped, etc.). The
+// search query still applies to everything.
 std::vector<const InventoryItem*> filterInventory(const PaneConfig& c,
                                                     const DashboardSnapshot& s) {
     std::vector<const InventoryItem*> out;
     out.reserve(s.inventory.size());
     for (const auto& it : s.inventory) {
-        if (!inventoryQualityAllowed(c, it.quality)) continue;
+        if (!it.hasStackSlot && !inventoryQualityAllowed(c, it.quality)) continue;
         if (!c.searchQuery.empty() &&
             !containsCI(it.name,     c.searchQuery) &&
             !containsCI(it.baseName, c.searchQuery) &&
