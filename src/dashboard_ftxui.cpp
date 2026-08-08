@@ -1931,11 +1931,17 @@ Element renderInventoryLeaf(const PaneConfig& c, const DashboardSnapshot& s,
     body.push_back(separator());
     for (int i = 0; i < shown; ++i) {
         const auto* it = rows[static_cast<std::size_t>(i)];
+        // Runes are Normal quality but render in the orange rune-text
+        // hue in-game; special-case them so a stash-tab full of runes
+        // reads correctly instead of blending into normal whites.
+        const auto rowColor = isRuneCode(it->code)
+            ? item_colors::runewordFull()
+            : item_colors::forQuality(it->quality);
         Element row = hbox({
             cellText(it->name,     wName),
             cellText(it->baseName, wBase),
             cellText(it->location, wLoc),
-        }) | color(item_colors::forQuality(it->quality));
+        }) | color(rowColor);
         if (focused && i == clamped) row = row | inverted | ftxui::focus;
         body.push_back(row);
     }
