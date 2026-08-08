@@ -1230,7 +1230,8 @@ constexpr int kSortUnknown = 1'000'000;
             case 'c': quality = 0; break;   // Chipped
             case 'f': quality = 1; break;   // Flawed
             case 's': quality = 2; break;   // Normal
-            case 'l': quality = 3; break;   // Flawless
+            case 'l': quality = 3; break;   // Flawless (all gems except Amethyst)
+            case 'z': quality = 3; break;   // Flawless Amethyst (`gzv`)
             case 'p': quality = 4; break;   // Perfect
             default:  return kSortUnknown;
         }
@@ -1350,10 +1351,12 @@ constexpr std::array<InvCatalogEntry, 35> kGemCatalog{{
     {"gsr", "Ruby"},     {"gsy", "Topaz"},
     {"gsv", "Amethyst"}, {"gsb", "Sapphire"},
     {"sku", "Skull"},
-    // Flawless
+    // Flawless. Amethyst is the odd one out: D2 assigns it the
+    // code `gzv` (quality letter `z`), while every other coloured
+    // gem uses `l` for Flawless. `gemSortKey` accepts both letters.
     {"glw", "Flawless Diamond"},  {"glg", "Flawless Emerald"},
     {"glr", "Flawless Ruby"},     {"gly", "Flawless Topaz"},
-    {"glv", "Flawless Amethyst"}, {"glb", "Flawless Sapphire"},
+    {"gzv", "Flawless Amethyst"}, {"glb", "Flawless Sapphire"},
     {"skl", "Flawless Skull"},
     // Perfect
     {"gpw", "Perfect Diamond"},  {"gpg", "Perfect Emerald"},

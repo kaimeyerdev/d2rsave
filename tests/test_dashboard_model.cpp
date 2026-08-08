@@ -1029,3 +1029,50 @@ TEST_CASE("Full-account buildSnapshot fixture: stash + character runes appear "
         REQUIRE(state.runeStacks.at(code) >= count);
     }
 }
+
+TEST_CASE("buildSnapshot fixture: material-tab keys / statues / shards keep "
+          "their per-slot stack counts",
+          "[dashboard_model][materials][stash][fixtures]") {
+    // Regression guard for the "Materials show 0 except potions" report.
+    // The material tab stores every uber key / ancient statue /
+    // Worldstone shard / D-Clone essence / Pandemonium token as a
+    // single Item with `stacks = N` behind the RotW material-stash
+    // bit. Both the parser (setting `hasStackSlot = true` and
+    // `stacks = N`) and the aggregator (propagating both fields onto
+    // InventoryItem) have to keep them intact end-to-end; if either
+    // side drops the ball the Inventory pane's Materials section
+    // shows every row as zero.
+    const auto fixtureDir  = fixturePath("").parent_path();
+    const auto stashPath   = fixturePath("ModernSharedStashSoftCoreV2.d2i");
+    const auto snap        = d2r::buildSnapshot(sharedFixtureDb(),
+                                                 fixtureDir, stashPath);
+
+    // Codes we expect to see with hasStackSlot=true and a positive
+    // stack count in the material tab (fixture is known to hold at
+    // least these five categories).
+    static constexpr std::array<std::string_view, 5> kProbes{{
+        "pk1",  // Key of Terror
+        "pk2",  // Key of Hate
+        "ua1",  // Talic's Anguish
+        "xa1",  // Western Worldstone Shard
+        "tes",  // Twisted Essence of Suffering
+    }};
+
+    for (auto code : kProbes) {
+        const d2r::InventoryItem* found = nullptr;
+        for (const auto& it : snap.inventory) {
+            if (it.location.rfind("stash tab ", 0) != 0) continue;
+            if (it.code == code) { found = &it; break; }
+        }
+        INFO("material-tab code = " << code);
+        REQUIRE(found != nullptr);
+        REQUIRE(found->hasStackSlot);
+        // Positive stack count means the aggregator propagated it
+        // -- a broken aggregator would leave stacks=0 with
+        // hasStackSlot=true, which effectiveStackCount reads as
+        // "0 owned" and the pane would then render as zero.
+        REQUIRE(found->stacks > 0);
+        REQUIRE(d2r::effectiveStackCount(*found) == found->stacks);
+    }
+}
+
