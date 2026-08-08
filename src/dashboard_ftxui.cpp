@@ -42,6 +42,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <span>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -1290,14 +1291,112 @@ constexpr int kSortUnknown = 1'000'000;
 
 // Ordered sub-section labels. Sections not present in the item pool
 // are elided at build time; the arrays only fix the display order.
+// Shared Stash mirrors the in-game top-tab order: five grid pages
+// followed by Gems, Materials, and Runes (the material tab's three
+// UI sub-views).
 constexpr std::array<std::string_view, 8> kSharedSubOrder{{
-    "Tab 1", "Tab 2", "Tab 3", "Tab 4", "Tab 5",
-    "Gems",  "Runes", "Materials",
+    "Page 1", "Page 2", "Page 3", "Page 4", "Page 5",
+    "Gems",   "Materials", "Runes",
 }};
 constexpr std::array<std::string_view, 8> kCharSubOrder{{
     "Equipped",  "Inventory", "Stash",  "Belt", "Cube",
     "Merc",      "Corpse",    "Iron Golem",
 }};
+
+// Canonical catalogs for the three count sections. Each entry pairs a
+// base code with the display name we use when the account owns *zero*
+// of that variant (a placeholder row so the user sees "Cham Rune  0"
+// instead of Cham silently vanishing from the list). Present items
+// borrow the game's actual name string from the RefDb via the parsed
+// InventoryItem; only the missing rows fall back to these hard-coded
+// names.
+struct InvCatalogEntry {
+    std::string_view code;
+    std::string_view name;
+};
+
+// Runes r01 (El) .. r33 (Zod), in rarity order (the same order as
+// runeSortKey emits).
+constexpr std::array<InvCatalogEntry, 33> kRuneCatalog{{
+    {"r01", "El Rune"},   {"r02", "Eld Rune"},  {"r03", "Tir Rune"},
+    {"r04", "Nef Rune"},  {"r05", "Eth Rune"},  {"r06", "Ith Rune"},
+    {"r07", "Tal Rune"},  {"r08", "Ral Rune"},  {"r09", "Ort Rune"},
+    {"r10", "Thul Rune"}, {"r11", "Amn Rune"},  {"r12", "Sol Rune"},
+    {"r13", "Shael Rune"},{"r14", "Dol Rune"},  {"r15", "Hel Rune"},
+    {"r16", "Io Rune"},   {"r17", "Lum Rune"},  {"r18", "Ko Rune"},
+    {"r19", "Fal Rune"},  {"r20", "Lem Rune"},  {"r21", "Pul Rune"},
+    {"r22", "Um Rune"},   {"r23", "Mal Rune"},  {"r24", "Ist Rune"},
+    {"r25", "Gul Rune"},  {"r26", "Vex Rune"},  {"r27", "Ohm Rune"},
+    {"r28", "Lo Rune"},   {"r29", "Sur Rune"},  {"r30", "Ber Rune"},
+    {"r31", "Jah Rune"},  {"r32", "Cham Rune"}, {"r33", "Zod Rune"},
+}};
+
+// Gems: quality (Chipped..Perfect) x type (Diamond..Skull), matching
+// gemSortKey's ordering.
+constexpr std::array<InvCatalogEntry, 35> kGemCatalog{{
+    // Chipped
+    {"gcw", "Chipped Diamond"},  {"gcg", "Chipped Emerald"},
+    {"gcr", "Chipped Ruby"},     {"gcy", "Chipped Topaz"},
+    {"gcv", "Chipped Amethyst"}, {"gcb", "Chipped Sapphire"},
+    {"skc", "Chipped Skull"},
+    // Flawed
+    {"gfw", "Flawed Diamond"},  {"gfg", "Flawed Emerald"},
+    {"gfr", "Flawed Ruby"},     {"gfy", "Flawed Topaz"},
+    {"gfv", "Flawed Amethyst"}, {"gfb", "Flawed Sapphire"},
+    {"skf", "Flawed Skull"},
+    // Normal
+    {"gsw", "Diamond"},  {"gsg", "Emerald"},
+    {"gsr", "Ruby"},     {"gsy", "Topaz"},
+    {"gsv", "Amethyst"}, {"gsb", "Sapphire"},
+    {"sku", "Skull"},
+    // Flawless
+    {"glw", "Flawless Diamond"},  {"glg", "Flawless Emerald"},
+    {"glr", "Flawless Ruby"},     {"gly", "Flawless Topaz"},
+    {"glv", "Flawless Amethyst"}, {"glb", "Flawless Sapphire"},
+    {"skl", "Flawless Skull"},
+    // Perfect
+    {"gpw", "Perfect Diamond"},  {"gpg", "Perfect Emerald"},
+    {"gpr", "Perfect Ruby"},     {"gpy", "Perfect Topaz"},
+    {"gpv", "Perfect Amethyst"}, {"gpb", "Perfect Sapphire"},
+    {"skz", "Perfect Skull"},
+}};
+
+// Materials in the user-facing order (uber keys -> uber trophies ->
+// ancients statues -> Worldstone shards -> Pandemonium token ->
+// D-Clone essences -> potions), matching materialSortKey. `ceh` keeps
+// the game's actual "Essense" spelling so the placeholder label lines
+// up with the string a real item would carry.
+constexpr std::array<InvCatalogEntry, 23> kMaterialCatalog{{
+    {"pk1", "Key of Terror"},        {"pk2", "Key of Hate"},
+    {"pk3", "Key of Destruction"},
+    {"dhn", "Diablo's Horn"},        {"bey", "Baal's Eye"},
+    {"mbr", "Mephisto's Brain"},
+    {"ua1", "Talic's Anguish"},      {"ua2", "Korlic's Pain"},
+    {"ua3", "Madawc's Ire"},         {"ua4", "Bul-Kathos' Nightmare"},
+    {"ua5", "Worusk's End"},
+    {"xa1", "Western Worldstone Shard"},
+    {"xa2", "Eastern Worldstone Shard"},
+    {"xa3", "Southern Worldstone Shard"},
+    {"xa4", "Deep Worldstone Shard"},
+    {"xa5", "Northern Worldstone Shard"},
+    {"toa", "Token of Absolution"},
+    {"tes", "Twisted Essence of Suffering"},
+    {"ceh", "Charged Essense of Hatred"},
+    {"bet", "Burning Essence of Terror"},
+    {"fed", "Festering Essence of Destruction"},
+    {"rvs", "Rejuvenation Potion"},
+    {"rvl", "Full Rejuvenation Potion"},
+}};
+
+// Which catalog (if any) drives a given count-section subLevel label.
+// Returns an empty span for non-count sections.
+[[nodiscard]] inline std::span<const InvCatalogEntry>
+catalogForCountSection(std::string_view subLevel) noexcept {
+    if (subLevel == "Runes")     return kRuneCatalog;
+    if (subLevel == "Gems")      return kGemCatalog;
+    if (subLevel == "Materials") return kMaterialCatalog;
+    return {};
+}
 
 // Result of classifying one item into (top-level, sub-level).
 struct InvClassification {
@@ -1326,7 +1425,7 @@ struct InvClassification {
             tab = tab * 10 + (ch - '0');
         }
         if (tab >= 1 && tab <= 5) {
-            out.subLevel = "Tab " + std::to_string(tab);
+            out.subLevel = "Page " + std::to_string(tab);
         } else {
             if      (isRuneCode(it.code)) out.subLevel = "Runes";
             else if (isGemCode(it.code))  out.subLevel = "Gems";
@@ -1347,88 +1446,143 @@ struct InvClassification {
     return out;
 }
 
+// One entry inside a section's row list. Real snapshot items back
+// through the `item` pointer; count-section catalogs contribute
+// placeholder rows (item == nullptr, placeholderName/Code populated)
+// so a missing rune/gem/material still shows up with a count of 0.
+struct InvSectionEntry {
+    const InventoryItem* item = nullptr;    // nullptr => placeholder
+    std::string_view     placeholderName;   // valid only when item == nullptr
+    std::string_view     placeholderCode;
+};
+
 struct InvSection {
     std::string label;
-    std::string path;                    // "TopLevel/SubLabel"
-    std::vector<const InventoryItem*> items;
-    bool        isCountSection = false;
-    std::uint32_t stackSum = 0;          // sum of stacks (loose = 1)
+    std::string path;                       // "TopLevel/SubLabel"
+    std::vector<InvSectionEntry> entries;   // real items + placeholders
+    bool          isCountSection = false;
+    std::uint32_t stackSum       = 0;       // sum of stacks (loose = 1)
+    int           realItemCount  = 0;       // entries with item != nullptr
 };
 struct InvTopLevel {
     std::string label;
-    std::string path;                    // = label (top-level is flat)
+    std::string path;                       // = label (top-level is flat)
     std::vector<InvSection> sections;
-    int         totalItems = 0;
+    int         totalItems = 0;             // real items only
 };
 using InvTree = std::vector<InvTopLevel>;
 
 struct InvVisibleRow {
     enum class Kind : std::uint8_t { TopLevel, Section, Item };
     Kind        kind        = Kind::TopLevel;
-    int         depth       = 0;         // 0 top, 1 section, 2 item
-    std::string label;                   // header text (unused for items)
-    std::string path;                    // section/top-level path (empty for items)
-    std::string parentPath;              // path of enclosing header
-    const InventoryItem* item = nullptr; // only set for items
-    bool        expanded    = false;     // header only
-    int         itemCount   = 0;         // header only
-    std::uint32_t stackSum  = 0;         // count-section header only
+    int         depth       = 0;            // 0 top, 1 section, 2 item
+    std::string label;                      // header text (unused for items)
+    std::string path;                       // section/top-level path (empty for items)
+    std::string parentPath;                 // path of enclosing header
+    // Item rows: `item` points to a snapshot InventoryItem when the
+    // account owns one; nullptr indicates a catalog placeholder for a
+    // count section (see InvSectionEntry). The placeholder name and
+    // code come from a static catalog string_view so no allocation.
+    const InventoryItem* item = nullptr;
+    std::string_view     placeholderName;
+    std::string_view     placeholderCode;
+    bool        expanded    = false;        // header only
+    int         itemCount   = 0;            // header only
+    std::uint32_t stackSum  = 0;            // count-section header only
     bool        isCountSection = false;
 };
 
-// Bucket filtered items into the tree structure, applying the canonical
-// ordering and sorting items alphabetically within each section.
+// Bucket filtered items into the tree structure. Count-section
+// sub-nodes (Gems / Materials / Runes) walk their catalog in canonical
+// order and emit a placeholder row for every entry the account
+// doesn't own -- the user asked for missing runes to show up as `0`
+// instead of vanishing. Other sections sort alphabetically by name.
+//
+// `searchQuery` (may be empty) filters placeholder rows the same way
+// `filterInventory` already filtered real items, so a query of "Zod"
+// against a stash without a Zod Rune still surfaces the Zod
+// placeholder while suppressing every other rune placeholder.
 [[nodiscard]] InvTree buildInventoryTree(
-        const std::vector<const InventoryItem*>& items) {
+        const std::vector<const InventoryItem*>& items,
+        std::string_view searchQuery) {
     // Preserve ordering deterministically by using std::map for both
     // levels of the outer bucketing. The canonical sub-order arrays
     // then re-arrange sections into the final order below.
     std::map<std::string, std::map<std::string, std::vector<const InventoryItem*>>> bucket;
-    std::map<std::string, std::map<std::string, bool>> countFlag;
     for (auto* it : items) {
         auto c = classifyInventoryItem(*it);
         bucket[c.topLevel][c.subLevel].push_back(it);
-        if (c.isCountSection) countFlag[c.topLevel][c.subLevel] = true;
     }
-    for (auto& [top, subs] : bucket) {
-        const bool isShared = (top == "Shared Stash");
-        for (auto& [sub, sitems] : subs) {
-            // Count sections in the shared-stash tab 6 (Gems / Runes /
-            // Materials) each have their own natural ordering that
-            // beats an alphabetical-by-name sort. Everything else
-            // falls back to name asc so grep-by-eye stays predictable.
-            auto byName = [](const InventoryItem* a, const InventoryItem* b) {
-                return a->name < b->name;
-            };
-            if (isShared && sub == "Runes") {
-                std::sort(sitems.begin(), sitems.end(),
-                    [&](const InventoryItem* a, const InventoryItem* b) {
-                        const int ka = runeSortKey(a->code);
-                        const int kb = runeSortKey(b->code);
-                        if (ka != kb) return ka < kb;
-                        return byName(a, b);
-                    });
-            } else if (isShared && sub == "Gems") {
-                std::sort(sitems.begin(), sitems.end(),
-                    [&](const InventoryItem* a, const InventoryItem* b) {
-                        const int ka = gemSortKey(a->code);
-                        const int kb = gemSortKey(b->code);
-                        if (ka != kb) return ka < kb;
-                        return byName(a, b);
-                    });
-            } else if (isShared && sub == "Materials") {
-                std::sort(sitems.begin(), sitems.end(),
-                    [&](const InventoryItem* a, const InventoryItem* b) {
-                        const int ka = materialSortKey(a->code);
-                        const int kb = materialSortKey(b->code);
-                        if (ka != kb) return ka < kb;
-                        return byName(a, b);
-                    });
-            } else {
-                std::sort(sitems.begin(), sitems.end(), byName);
+
+    // Turn one raw item bucket into a section, walking the catalog for
+    // count sections (so missing entries show as placeholders) and
+    // sorting by name for everything else.
+    auto makeSection = [&](std::string label, std::string path,
+                          std::vector<const InventoryItem*>& raw,
+                          bool isCount) -> InvSection {
+        InvSection sec;
+        sec.label = std::move(label);
+        sec.path  = std::move(path);
+        sec.isCountSection = isCount;
+        if (!isCount) {
+            std::sort(raw.begin(), raw.end(),
+                      [](const InventoryItem* a, const InventoryItem* b) {
+                          return a->name < b->name;
+                      });
+            sec.entries.reserve(raw.size());
+            for (auto* it : raw) {
+                sec.entries.push_back(InvSectionEntry{it, {}, {}});
+                sec.stackSum += it->stacks > 0 ? it->stacks : 1u;
+                ++sec.realItemCount;
             }
+            return sec;
         }
-    }
+        // Count section: build a code -> InventoryItem* lookup, then
+        // walk the canonical catalog. Real ownership stamps the
+        // pointer; catalog entries the user doesn't own emit a
+        // placeholder row so the missing rune/gem/material still
+        // renders with a count of 0. Placeholder rows respect the
+        // search query so a targeted lookup ("Zod") only surfaces
+        // its match rather than every catalog entry.
+        std::unordered_map<std::string_view, const InventoryItem*> byCode;
+        byCode.reserve(raw.size() * 2);
+        for (auto* it : raw) byCode[it->code] = it;
+        const auto catalog = catalogForCountSection(sec.label);
+        std::unordered_set<std::string_view> seenCodes;
+        for (const auto& entry : catalog) {
+            seenCodes.insert(entry.code);
+            InvSectionEntry e;
+            auto found = byCode.find(entry.code);
+            if (found != byCode.end()) {
+                e.item = found->second;
+                sec.stackSum += e.item->stacks > 0 ? e.item->stacks : 1u;
+                ++sec.realItemCount;
+                sec.entries.push_back(e);
+                continue;
+            }
+            // Placeholder path: enforce the search query the same way
+            // `filterInventory` already handled real items.
+            if (!searchQuery.empty() && !containsCI(entry.name, searchQuery)) {
+                continue;
+            }
+            e.placeholderCode = entry.code;
+            e.placeholderName = entry.name;
+            sec.entries.push_back(e);
+        }
+        // Any owned items whose code isn't in the catalog (defensive:
+        // a future D2R patch adds Ral 2.0, an as-yet-uncatalogued
+        // essence, etc.) slot in after every catalog row so nothing
+        // silently disappears from the tree.
+        for (auto* it : raw) {
+            if (seenCodes.count(it->code)) continue;
+            InvSectionEntry e;
+            e.item = it;
+            sec.entries.push_back(e);
+            sec.stackSum += it->stacks > 0 ? it->stacks : 1u;
+            ++sec.realItemCount;
+        }
+        return sec;
+    };
 
     // Top-level order: Shared Stash first (if present), then characters
     // alphabetically (std::map iterates sorted, so we can just skip
@@ -1445,41 +1599,59 @@ struct InvVisibleRow {
         tl.label = top;
         tl.path  = top;
 
-        const auto& subs = bucket[top];
+        auto& subs = bucket[top];
         const bool isShared = (top == "Shared Stash");
         const auto& order = isShared ? kSharedSubOrder : kCharSubOrder;
 
         std::set<std::string> emitted;
+        // Whether a given sub-label is one of the three count sections
+        // (Runes / Gems / Materials). Catalog-driven: the same lookup
+        // makeSection uses to pick placeholder rows, so we don't have
+        // to remember which labels were count-typed at classify time.
+        auto isCountLabel = [](std::string_view label) {
+            return !catalogForCountSection(label).empty();
+        };
         auto pushSection = [&](std::string_view label) {
             const std::string key(label);
+            const bool isCount = isCountLabel(key);
             auto it = subs.find(key);
-            if (it == subs.end() || it->second.empty()) return;
-            InvSection sec;
-            sec.label = key;
-            sec.path  = top + "/" + key;
-            sec.items = it->second;
-            sec.isCountSection = countFlag[top].count(key) > 0;
-            for (auto* p : sec.items) sec.stackSum += p->stacks > 0 ? p->stacks : 1u;
+            std::vector<const InventoryItem*> empty;
+            auto& raw = it == subs.end() ? empty : it->second;
+            // Non-count sections need at least one raw item to appear.
+            // Count sections do too, unless a search query is active
+            // -- in which case matching placeholders may still be
+            // worth surfacing (e.g. querying "Zod" against a stash
+            // with zero Zod runes should still show the Zod row).
+            if (raw.empty()) {
+                if (!isCount)              return;
+                if (searchQuery.empty())   return;
+            }
+            InvSection sec = makeSection(key, top + "/" + key, raw, isCount);
+            if (sec.entries.empty()) return;
             tl.sections.push_back(std::move(sec));
             emitted.insert(key);
         };
+        // Only Shared Stash exposes the count-section catalog rows.
+        // Character sub-nodes iterate `kCharSubOrder`, which contains
+        // no catalog-backed labels, so `pushSection`'s no-raw-items
+        // guard still elides empty per-character sections.
         for (auto label : order) pushSection(label);
         // Any sub-labels we don't recognise (defensive; shouldn't
         // happen unless a future patch adds a new bucket) slide in
         // after the canonical order in alphabetical order.
-        for (const auto& [sub, sitems] : subs) {
+        for (auto& [sub, sitems] : subs) {
             if (emitted.count(sub)) continue;
             if (sitems.empty()) continue;
-            InvSection sec;
-            sec.label = sub;
-            sec.path  = top + "/" + sub;
-            sec.items = sitems;
-            sec.isCountSection = countFlag[top][sub];
-            for (auto* p : sec.items) sec.stackSum += p->stacks > 0 ? p->stacks : 1u;
-            tl.sections.push_back(std::move(sec));
+            const bool isCount = isCountLabel(sub);
+            tl.sections.push_back(
+                makeSection(sub, top + "/" + sub, sitems, isCount));
         }
-        for (const auto& sec : tl.sections) tl.totalItems += (int)sec.items.size();
-        if (tl.totalItems > 0) tree.push_back(std::move(tl));
+        // `totalItems` reports owned items only (drives the "Inventory
+        // N items" title). The top-level is kept whenever ANY section
+        // has entries -- placeholders count toward visibility even
+        // though they don't inflate the item count.
+        for (const auto& sec : tl.sections) tl.totalItems += sec.realItemCount;
+        if (!tl.sections.empty()) tree.push_back(std::move(tl));
     }
     return tree;
 }
@@ -1512,18 +1684,20 @@ struct InvVisibleRow {
             sr.path        = sec.path;
             sr.parentPath  = tl.path;
             sr.isCountSection = sec.isCountSection;
-            sr.itemCount   = (int)sec.items.size();
+            sr.itemCount   = sec.realItemCount;
             sr.stackSum    = sec.stackSum;
             sr.expanded    = searchActive || expandedPaths.count(sec.path) > 0;
             rows.push_back(sr);
             if (!sr.expanded) continue;
-            for (auto* it : sec.items) {
+            for (const auto& entry : sec.entries) {
                 InvVisibleRow ir;
-                ir.kind        = InvVisibleRow::Kind::Item;
-                ir.depth       = 2;
-                ir.item        = it;
-                ir.parentPath  = sec.path;
-                ir.isCountSection = sec.isCountSection;
+                ir.kind             = InvVisibleRow::Kind::Item;
+                ir.depth            = 2;
+                ir.item             = entry.item;
+                ir.placeholderName  = entry.placeholderName;
+                ir.placeholderCode  = entry.placeholderCode;
+                ir.parentPath       = sec.path;
+                ir.isCountSection   = sec.isCountSection;
                 rows.push_back(ir);
             }
         }
@@ -2139,7 +2313,7 @@ Element renderInventoryLeaf(const PaneConfig& c, const DashboardSnapshot& s,
                              const std::unordered_set<std::string>& expandedPaths,
                              bool focused, bool searchMode) {
     const auto filtered = filterInventory(c, s);
-    const InvTree tree  = buildInventoryTree(filtered);
+    const InvTree tree  = buildInventoryTree(filtered, c.searchQuery);
     const bool searchActive = !c.searchQuery.empty();
     const auto rows = emitInventoryRows(tree, expandedPaths, searchActive);
 
@@ -2153,11 +2327,15 @@ Element renderInventoryLeaf(const PaneConfig& c, const DashboardSnapshot& s,
     };
     for (const auto& r : rows) {
         if (r.kind != InvVisibleRow::Kind::Item) continue;
-        bump(wName, r.item->name.size(), 40);
+        const bool isPlaceholder = r.item == nullptr;
+        const std::string_view name = isPlaceholder
+            ? r.placeholderName : std::string_view(r.item->name);
+        bump(wName, name.size(), 40);
         if (r.isCountSection) {
-            const std::uint32_t q = r.item->stacks > 0 ? r.item->stacks : 1u;
+            const std::uint32_t q = isPlaceholder
+                ? 0u : (r.item->stacks > 0 ? r.item->stacks : 1u);
             bump(wSecond, std::to_string(q).size(), 8);
-        } else {
+        } else if (!isPlaceholder) {
             bump(wSecond, r.item->baseName.size(), 28);
         }
     }
@@ -2200,26 +2378,39 @@ Element renderInventoryLeaf(const PaneConfig& c, const DashboardSnapshot& s,
                 break;
             }
             case InvVisibleRow::Kind::Item: {
-                const auto* it = r.item;
-                const auto rowColor = isRuneCode(it->code)
+                // Placeholder row (item == nullptr) means the account
+                // owns zero of this canonical count-section entry; we
+                // still emit a row (with count 0, dimmed) so the user
+                // sees which runes / gems / materials are missing.
+                const bool          isPlaceholder = r.item == nullptr;
+                const std::string_view code = isPlaceholder
+                    ? r.placeholderCode : std::string_view(r.item->code);
+                const std::string_view name = isPlaceholder
+                    ? r.placeholderName : std::string_view(r.item->name);
+                const auto quality = isPlaceholder
+                    ? ItemQuality::Normal : r.item->quality;
+                const std::uint32_t count = isPlaceholder
+                    ? 0u : (r.item->stacks > 0 ? r.item->stacks : 1u);
+
+                auto rowColor = isRuneCode(std::string(code))
                     ? item_colors::runewordFull()
-                    : item_colors::forQuality(it->quality);
-                std::string secondText;
-                if (r.isCountSection) {
-                    const std::uint32_t q = it->stacks > 0 ? it->stacks : 1u;
-                    secondText = std::to_string(q);
-                } else {
-                    secondText = it->baseName;
-                }
+                    : item_colors::forQuality(quality);
+                std::string secondText = r.isCountSection
+                    ? std::to_string(count)
+                    : (isPlaceholder ? std::string{} : r.item->baseName);
                 Element second = r.isCountSection
                     ? (text(secondText) | align_right
                                         | size(WIDTH, EQUAL, wSecond + kCellPad))
                     : cellText(secondText, wSecond);
                 el = hbox({
                     text("      "),   // four-space indent + one cell pad
-                    cellText(it->name, wName),
+                    cellText(std::string(name), wName),
                     second,
                 }) | color(rowColor);
+                // Fade placeholder rows so the eye finds owned items
+                // first; the type-colour is preserved so category is
+                // still readable.
+                if (isPlaceholder) el = el | dim;
                 break;
             }
         }
@@ -4882,7 +5073,8 @@ int runDashboard(const std::filesystem::path& savePath,
             auto rebuildRows = [&]() {
                 auto snap = currentSnapshot();
                 const auto filtered = filterInventory(leaf->config, *snap);
-                const auto tree     = buildInventoryTree(filtered);
+                const auto tree     = buildInventoryTree(filtered,
+                                                          leaf->config.searchQuery);
                 static const std::unordered_set<std::string> kEmpty;
                 const auto pit = ui.paneExpanded.find(leaf);
                 const auto& expanded = pit == ui.paneExpanded.end() ? kEmpty : pit->second;
@@ -5105,7 +5297,8 @@ int runDashboard(const std::filesystem::path& savePath,
                 // current expand set + search state so cursor bounds
                 // stay in sync.
                 const auto filtered = filterInventory(leaf->config, *snap);
-                const auto tree     = buildInventoryTree(filtered);
+                const auto tree     = buildInventoryTree(filtered,
+                                                          leaf->config.searchQuery);
                 static const std::unordered_set<std::string> kEmpty;
                 const auto pit = ui.paneExpanded.find(leaf);
                 const auto& expanded = pit == ui.paneExpanded.end() ? kEmpty : pit->second;
