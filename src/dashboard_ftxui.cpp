@@ -1195,6 +1195,99 @@ std::vector<const InventoryItem*> filterInventory(const PaneConfig& c,
     return code[0] == 's' && code[1] == 'k';
 }
 
+// Sort keys for the three count-column stash sections (Gems / Runes /
+// Materials). Alphabetical-by-name is misleading here -- runes read
+// "Amn, Ber, Cham..." rather than "El, Eld, Tir..." -- so each count
+// section gets its own comparator driven by the base code (stable
+// across localisation; item names are database strings).
+//
+// Any code not in the table sorts after every known entry, then falls
+// through to alphabetical for cross-item stability.
+constexpr int kSortUnknown = 1'000'000;
+
+// Rune r01 (El) .. r33 (Zod). Codes past r33 sort after known runes
+// but before unknown-shape strays.
+[[nodiscard]] inline int runeSortKey(std::string_view code) noexcept {
+    if (code.size() != 3 || code[0] != 'r') return kSortUnknown;
+    if (code[1] < '0' || code[1] > '9')     return kSortUnknown;
+    if (code[2] < '0' || code[2] > '9')     return kSortUnknown;
+    return (code[1] - '0') * 10 + (code[2] - '0');
+}
+
+// Gem order: quality tier * 10 + gem type. Chipped (0) .. Perfect (4)
+// crossed with Diamond (0) .. Skull (6) matches the in-game upgrade
+// path (three chipped -> flawed, three flawed -> normal, etc.). The
+// 'g'-prefixed codes use one letter mapping for quality (c/f/s/l/p);
+// skull codes are 'sk' + a different quality letter (c/f/u/l/z) with
+// type implicitly Skull.
+[[nodiscard]] inline int gemSortKey(std::string_view code) noexcept {
+    if (code.size() != 3) return kSortUnknown;
+    int quality = -1, type = -1;
+    if (code[0] == 'g') {
+        switch (code[1]) {
+            case 'c': quality = 0; break;   // Chipped
+            case 'f': quality = 1; break;   // Flawed
+            case 's': quality = 2; break;   // Normal
+            case 'l': quality = 3; break;   // Flawless
+            case 'p': quality = 4; break;   // Perfect
+            default:  return kSortUnknown;
+        }
+        switch (code[2]) {
+            case 'w': type = 0; break;      // Diamond (white)
+            case 'g': type = 1; break;      // Emerald
+            case 'r': type = 2; break;      // Ruby
+            case 'y': type = 3; break;      // Topaz (yellow)
+            case 'v': type = 4; break;      // Amethyst (violet)
+            case 'b': type = 5; break;      // Sapphire (blue)
+            default:  return kSortUnknown;
+        }
+    } else if (code[0] == 's' && code[1] == 'k') {
+        type = 6;
+        switch (code[2]) {
+            case 'c': quality = 0; break;
+            case 'f': quality = 1; break;
+            case 'u': quality = 2; break;   // Skull's normal-tier letter
+            case 'l': quality = 3; break;
+            case 'z': quality = 4; break;   // Skull's perfect-tier letter
+            default:  return kSortUnknown;
+        }
+    } else {
+        return kSortUnknown;
+    }
+    return quality * 10 + type;
+}
+
+// Explicit ordering for the Materials section, driven by base code.
+// Groups by narrative theme: uber keys, uber-drop trophies, ancients
+// summon statues, terror-zone Worldstone shards, Pandemonium tokens,
+// D-Clone essences, then rejuvenation potions.
+[[nodiscard]] inline int materialSortKey(std::string_view code) noexcept {
+    if (code == "pk1") return  0;  // Key of Terror
+    if (code == "pk2") return  1;  // Key of Hate
+    if (code == "pk3") return  2;  // Key of Destruction
+    if (code == "dhn") return  3;  // Diablo's Horn
+    if (code == "bey") return  4;  // Baal's Eye
+    if (code == "mbr") return  5;  // Mephisto's Brain
+    if (code == "ua1") return  6;  // Talic's Anguish
+    if (code == "ua2") return  7;  // Korlic's Pain
+    if (code == "ua3") return  8;  // Madawc's Ire
+    if (code == "ua4") return  9;  // Bul-Kathos' Nightmare
+    if (code == "ua5") return 10;  // Worusk's End
+    if (code == "xa1") return 11;  // Western Worldstone Shard
+    if (code == "xa2") return 12;  // Eastern Worldstone Shard
+    if (code == "xa3") return 13;  // Southern Worldstone Shard
+    if (code == "xa4") return 14;  // Deep Worldstone Shard
+    if (code == "xa5") return 15;  // Northern Worldstone Shard
+    if (code == "toa") return 16;  // Token of Absolution
+    if (code == "tes") return 17;  // Twisted Essence of Suffering
+    if (code == "ceh") return 18;  // Charged Essense of Hatred (sic)
+    if (code == "bet") return 19;  // Burning Essence of Terror
+    if (code == "fed") return 20;  // Festering Essence of Destruction
+    if (code == "rvs") return 21;  // Rejuvenation Potion
+    if (code == "rvl") return 22;  // Full Rejuvenation Potion
+    return kSortUnknown;
+}
+
 // Ordered sub-section labels. Sections not present in the item pool
 // are elided at build time; the arrays only fix the display order.
 constexpr std::array<std::string_view, 8> kSharedSubOrder{{
@@ -1298,11 +1391,42 @@ struct InvVisibleRow {
         if (c.isCountSection) countFlag[c.topLevel][c.subLevel] = true;
     }
     for (auto& [top, subs] : bucket) {
+        const bool isShared = (top == "Shared Stash");
         for (auto& [sub, sitems] : subs) {
-            std::sort(sitems.begin(), sitems.end(),
-                      [](const InventoryItem* a, const InventoryItem* b) {
-                          return a->name < b->name;
-                      });
+            // Count sections in the shared-stash tab 6 (Gems / Runes /
+            // Materials) each have their own natural ordering that
+            // beats an alphabetical-by-name sort. Everything else
+            // falls back to name asc so grep-by-eye stays predictable.
+            auto byName = [](const InventoryItem* a, const InventoryItem* b) {
+                return a->name < b->name;
+            };
+            if (isShared && sub == "Runes") {
+                std::sort(sitems.begin(), sitems.end(),
+                    [&](const InventoryItem* a, const InventoryItem* b) {
+                        const int ka = runeSortKey(a->code);
+                        const int kb = runeSortKey(b->code);
+                        if (ka != kb) return ka < kb;
+                        return byName(a, b);
+                    });
+            } else if (isShared && sub == "Gems") {
+                std::sort(sitems.begin(), sitems.end(),
+                    [&](const InventoryItem* a, const InventoryItem* b) {
+                        const int ka = gemSortKey(a->code);
+                        const int kb = gemSortKey(b->code);
+                        if (ka != kb) return ka < kb;
+                        return byName(a, b);
+                    });
+            } else if (isShared && sub == "Materials") {
+                std::sort(sitems.begin(), sitems.end(),
+                    [&](const InventoryItem* a, const InventoryItem* b) {
+                        const int ka = materialSortKey(a->code);
+                        const int kb = materialSortKey(b->code);
+                        if (ka != kb) return ka < kb;
+                        return byName(a, b);
+                    });
+            } else {
+                std::sort(sitems.begin(), sitems.end(), byName);
+            }
         }
     }
 
