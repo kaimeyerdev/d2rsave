@@ -118,12 +118,17 @@ that is:
 
 - Reads-only (no `IN_CLOSE_WRITE | IN_MODIFY | IN_MOVED_TO |
   IN_CREATE` on any file), AND
-- Contains at least one read on a non-`.d2s`/`.d2i` file
-  (any `.ctl`, `.key`, `.ma*`, `.map`, or `Settings.json`).
+- Contains **at least three distinct** reads on non-`.d2s`/`.d2i`
+  files (any `.ctl`, `.key`, `.ma*`, `.map`, or `Settings.json`).
 
-The second clause distinguishes a real D2R launch from the
-dashboard's own `takeStartupSnapshot` (which only reads
-`.d2s`/`.d2i` per `isPersistedFile`).
+The threshold of three (rather than one) avoids false positives
+when the user opens the options menu mid-game or other
+single-file access patterns. A real D2R launch scans dozens of
+these auxiliary files across the save directory (Settings.json
+plus multiple `.ctl`, `.key`, `.ma*`, `.map` files), so the
+threshold has comfortable margin. This distinguishes a real D2R
+launch from the dashboard's own `takeStartupSnapshot` (which only
+reads `.d2s`/`.d2i` per `isPersistedFile`).
 
 On a match, `BackupScheduler` invokes the launch callback
 installed by `runDashboard`, which updates

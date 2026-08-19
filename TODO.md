@@ -160,42 +160,28 @@ Follow-ups worth adding as opt-in flags rather than default output:
   * **Character glob.** `--character "Amazon*"` or `--character
     "*Kai*"` for wildcarded selection instead of exact stems.
 
-### Runewords: name mapping is missing
+### Runewords: finish integration and exit WIP
 
+**Status: option (1) DONE.** The runewords string table has been extracted
+to [`data/sql/17_item_runes.sql`](data/sql/17_item_runes.sql) with full
+multilingual columns matching `item-names.json`. The feature is gated behind
+`D2R_ENABLE_RUNEWORDS_WIP` pending final testing.
 
-The runewords section in `cmdChronicle` is gated behind the
-`D2R_ENABLE_RUNEWORDS_WIP` CMake option because it can only tell you
-*how many* runewords the account has chronicled, not *which* ones.
+Remaining work:
 
-Root cause: chronicle entries store a numeric itemId (~20500-range) that
-indexes into D2R's `item-runes.json` string table. Our
-`item-names.json` snapshot (from `d2rsavegameparser-examples`) doesn't
-include the runewords table.
-
-Options, in decreasing order of preference:
-
-1. **Ship a runewords string table extract.** Get a fresh CASC extract
-   of `item-runes.json` from a current D2R install and add it as a
-   third table load (alongside `item-names.json`) in `data/sql`. Attribution and copyright story matches
-   `item-names.json`. Once loaded, we can join chronicle IDs against
-   both names + `runes.txt` metadata and print per-runeword found/missing
-   exactly like uniques and sets.
-2. **Reverse-engineer the ID scheme.** If the mapping turns out to be
-   simply `chronicleId - 20500 = runes.txt row index` (or similar), we
-   can derive names from `runes.txt` alone without shipping another
-   string table. Worth spending an hour comparing observed IDs against
-   `runes.txt` row order before pursuing option 1.
-3. **Drop runeword name mapping entirely and just print counts.** The
-   fallback we already have; keep it behind the WIP flag until (1) or
-   (2) lands.
+* Ensure the integrated feature (enabling the flag and running `cmdChronicle`
+  runeword queries) produces correct output against test fixtures.
+* Remove the `D2R_ENABLE_RUNEWORDS_WIP` CMake option once integration is
+  validated. The feature will then be enabled by default.
 
 ### Sunder charm names
 
 `item-names.json` predates Blizzard's rename of the six sunder charms
 (Latent / Renewed variants). The `SunderCharms.hpp` pair map is correct
 but the display names shown to users come from the string table and are
-stale. Fresh CASC extract fixes this at the same time as the runewords
-table -- track together with (1) above.
+stale. When doing a future CASC extract to update either table, refresh
+both `data/sql/16_item_names.sql` and `data/sql/17_item_runes.sql` at the
+same time for consistency.
 
 ### Chronicle output polish
 
