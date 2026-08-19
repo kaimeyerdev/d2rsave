@@ -1,4 +1,4 @@
-# d2rsavegameparser_cpp
+# d2rsave
 
 A C++20 parser, inspector, and toolbox for **Diablo II: Resurrected** save
 files (`.d2s` characters and `.d2i` shared stashes). Provides:
@@ -12,8 +12,6 @@ files (`.d2s` characters and `.d2i` shared stashes). Provides:
   a D2R CASC extract (unique-item names, set names, base types, etc.).
 - **`d2r_casc_dump`** — one-shot CASC dumper, mainly used to bootstrap
   the reference database.
-- **`d2r_tz_forecast`** — offline terror-zone forecaster (see the
-  TODO for the reverse-engineering write-up).
 - **`d2rsave_tests`** — Catch2 test binary exercising the parser
   against a committed fixture corpus.
 
@@ -41,6 +39,8 @@ files (`.d2s` characters and `.d2i` shared stashes). Provides:
   versus remaining. A `--print` mode renders the current view once
   as ANSI and exits, for pipes and screenshots.
 
+![Local Image](./d2rsave.png)
+
 - **Parser and query CLI.** The parser decodes `.d2s` characters and
   `.d2i` shared stashes — headers, attributes, skills, quest flags,
   waypoints, and the item bit-stream — into a structured in-memory
@@ -50,14 +50,13 @@ files (`.d2s` characters and `.d2i` shared stashes). Provides:
   and sets, and safe in-place edits (rename, map-seed change,
   checksum recompute) that preserve save-file invariants.
 
-The remaining executables (`d2r_refdb_gen`, `d2r_casc_dump`,
-`d2r_tz_forecast`) are supporting tools that seed the reference
-SQLite database from a D2R CASC install or run stand-alone
-terror-zone forecasting.
+The remaining executables (`d2r_refdb_gen`, `d2r_casc_dump`) are
+supporting tools that seed the reference SQLite database from a D2R
+CASC install or run stand-alone terror-zone forecasting.
 
 ## Attribution
 
-This project is a **C++ port of** [paladijn's Java
+This project started as a **C++ port of** [paladijn's Java
 `d2rsavegameparser`](https://github.com/paladijn/d2rsavegameparser),
 licensed under the **GNU Lesser General Public License v2.1**
 (LGPL-2.1). The upstream project provided:
@@ -159,8 +158,8 @@ authoritative list.
 **Build:**
 
 ```bash
-git clone https://github.com/<your-fork>/d2rsavegameparser_cpp.git
-cd d2rsavegameparser_cpp
+git clone https://github.com/<your-fork>/d2rsave.git
+cd d2rsave
 
 # One-time: clone microsoft/vcpkg into ./.vcpkg and compile the
 # vcpkg binary. Takes ~1 minute of git + a few seconds of C++.
@@ -193,7 +192,6 @@ After a successful build:
 ./build/Debug/d2rsave --help          # main tool
 ./build/Debug/d2r_casc_dump --help
 ./build/Debug/d2r_refdb_gen --help
-./build/Debug/d2r_tz_forecast --help
 ```
 
 The `d2rsave` binary is safe to run against any `.d2s` / `.d2i`
